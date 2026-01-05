@@ -2,11 +2,13 @@ using UnityEngine;
 using UnityEngine.AI;
 
 /// <summary>
-/// Responsible for instantiating / reusing agents and applying AgentProfile settings.
-/// This keeps SpawnerManager simpler.
+/// Responsible for instantiating agents and applying AgentProfile settings.
+/// This script calls AppearanceController.ApplyProfile and applies movement/behavior/navmesh settings.
+/// Updated to support AgentProfile.speedOptions (multipliers) so final per-agent speed = profile.speed * chosenMultiplier.
 /// </summary>
 public class AgentFactory : MonoBehaviour
 {
+    [Tooltip("Default prefab that contains SkinnedMeshRenderers, AppearanceController, NavMeshAgent, UncertainBehavior, etc.")]
     public GameObject agentPrefab; // contains PedestrianAgent, MoveToTarget, UncertainBehavior, AppearanceController, maybe NavMeshAgent
 
     /// <summary>
@@ -26,12 +28,20 @@ public class AgentFactory : MonoBehaviour
         var uncertain = go.GetComponent<UncertainBehavior>();
         var nav = go.GetComponent<NavMeshAgent>();
 
+        // Compute final speed: base profile.speed possibly multiplied by a chosen multiplier from speedOptions
+        float appliedSpeed = profile != null ? profile.speed : 0f;
+        if (profile != null && profile.speedOptions != null && profile.speedOptions.Length > 0)
+        {
+            float mult = profile.ChooseWeightedSpeedMultiplier();
+            appliedSpeed *= mult;
+        }
+
         if (nav != null && profile != null)
         {
             // set NavMeshAgent params for avoidance and shape
             nav.radius = profile.agentRadius;
             nav.height = profile.agentHeight;
-            nav.speed = profile.speed;
+            nav.speed = appliedSpeed;
             nav.acceleration = profile.acceleration;
             nav.angularSpeed = profile.angularSpeed;
             nav.avoidancePriority = Mathf.Clamp(profile.avoidancePriority, 0, 99);
@@ -39,7 +49,7 @@ public class AgentFactory : MonoBehaviour
         else if (move != null && profile != null)
         {
             // if MoveToTarget uses its own speed, set it (MoveToTarget API should expose speed)
-            move.SetMoveSpeed(profile.speed);
+            move.SetMoveSpeed(appliedSpeed);
         }
 
         // configure UncertainBehavior: either force, probabilistic, or off
@@ -70,18 +80,26 @@ public class AgentFactory : MonoBehaviour
         var move = go.GetComponent<MoveToTarget>();
         var uncertain = go.GetComponent<UncertainBehavior>();
 
+        // Compute final speed: base profile.speed possibly multiplied by a chosen multiplier from speedOptions
+        float appliedSpeed = profile.speed;
+        if (profile.speedOptions != null && profile.speedOptions.Length > 0)
+        {
+            float mult = profile.ChooseWeightedSpeedMultiplier();
+            appliedSpeed *= mult;
+        }
+
         if (nav != null)
         {
             nav.radius = profile.agentRadius;
             nav.height = profile.agentHeight;
-            nav.speed = profile.speed;
+            nav.speed = appliedSpeed;
             nav.acceleration = profile.acceleration;
             nav.angularSpeed = profile.angularSpeed;
             nav.avoidancePriority = Mathf.Clamp(profile.avoidancePriority, 0, 99);
         }
         else if (move != null)
         {
-            move.SetMoveSpeed(profile.speed);
+            move.SetMoveSpeed(appliedSpeed);
         }
 
         if (uncertain != null)

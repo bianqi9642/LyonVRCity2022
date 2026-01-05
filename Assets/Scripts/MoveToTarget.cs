@@ -1,8 +1,9 @@
 // MoveToTarget_NavMeshOnly.cs
 // NavMeshAgent-only mover that drives a GameObject from a start Transform/position to a target Transform/position.
-// - Requires NavMeshAgent and uses it exclusively (no transform-based fallback).
-// - Agent drives transform (agent.updatePosition = true). Script keeps control of rotation (agent.updateRotation = false)
-//   so we can smooth rotation separately.
+// - Uses NavMeshAgent exclusively for movement. The NavMeshAgent is the authoritative steering controller.
+// - MoveToTarget will NOT overwrite NavMeshAgent.speed by default. To allow MoveToTarget to set agent.speed,
+//   enable the 'autoSetAgentSpeed' flag on the component.
+// - Script keeps control of rotation (agent.updateRotation = false) so rotation smoothing is applied here.
 // - External pause API available (halt movement and/or freeze animator).
 // - Drives animator from measured translational speed (smoothed).
 // - Defensive NavMesh sampling / resample logic retained for robustness.
@@ -28,7 +29,8 @@ public class MoveToTarget : MonoBehaviour
     public Vector3 targetPosition = new Vector3(5f, 0f, 5f);
 
     [Header("Movement")]
-    // Movement speed is primarily driven through NavMeshAgent.speed (kept in sync).
+    // Local copy of desired speed; used for animator fallback and when agent is absent.
+    // NOTE: When a NavMeshAgent is present, that agent's speed is authoritative unless autoSetAgentSpeed == true.
     public float speed = 1.4f;
     public float arriveThreshold = 0.2f;
     public bool faceMovementDirection = true;
@@ -37,7 +39,11 @@ public class MoveToTarget : MonoBehaviour
     [Header("NavMeshAgent (required)")]
     // NavMeshAgent reference (RequireComponent ensures presence).
     public NavMeshAgent agent;
-    public bool autoSetAgentSpeed = true;
+
+    // If true, MoveToTarget will write agent.speed (control speed). Default is FALSE so NavMeshAgent (or AgentFactory) can control speed.
+    [Tooltip("If true, MoveToTarget will set NavMeshAgent.speed from this component's 'speed' value. " +
+             "If false, MoveToTarget will not change NavMeshAgent.speed (preferred when external systems set speed).")]
+    public bool autoSetAgentSpeed = false;
 
     [Header("Animator integration")]
     public Animator animator;
@@ -161,6 +167,7 @@ public class MoveToTarget : MonoBehaviour
             yield break;
         }
 
+        // Only set NavMeshAgent.speed from this component when autoSetAgentSpeed is enabled.
         if (autoSetAgentSpeed)
             agent.speed = speed;
 
@@ -261,7 +268,6 @@ public class MoveToTarget : MonoBehaviour
         }
         else
         {
-            // If we get here, AgentCanControl already prevented continuation; handled above.
             if (enableDebugLogs) Debug.LogError($"{LogPrefix()} Unexpected agent unavailability after SetDestination attempt. Disabling component.");
             enabled = false;
             yield break;
@@ -598,12 +604,14 @@ public class MoveToTarget : MonoBehaviour
     }
 
     /// <summary>
-    /// Public helper to set movement speed at runtime. Works with NavMeshAgent.
+    /// Public helper to set movement speed at runtime.
+    /// This updates the local 'speed' field. It will only set NavMeshAgent.speed if autoSetAgentSpeed == true.
+    /// That preserves AgentFactory/profile control over NavMeshAgent.speed in the typical workflow.
     /// </summary>
     public void SetMoveSpeed(float s)
     {
         speed = s;
-        if (agent != null)
+        if (agent != null && autoSetAgentSpeed)
         {
             agent.speed = s;
         }
@@ -624,7 +632,7 @@ public class MoveToTarget : MonoBehaviour
 
         // small sample at current position
         NavMeshHit initialHit;
-        if (NavMesh.SamplePosition(transform.position, out initialHit, 0.01f, NavMesh.AllAreas))
+        if (NavMesh.SamplePosition(transform.position, out initialHit, 0.1f, NavMesh.AllAreas))
         {
             if (agent.enabled)
             {
@@ -633,7 +641,15 @@ public class MoveToTarget : MonoBehaviour
                 {
                     // When using agent.updatePosition = true, Warp should place the transform as well.
                     transform.position = initialHit.position;
-                    if (enableDebugLogs) Debug.Log($"{LogPrefix()} Agent already on NavMesh (tiny sample).");
+                    if (enableDebugLogs)
+                    {
+                        Debug.Log(
+                            $"{LogPrefix()} Agent already on NavMesh (tiny sample). " +
+                            $"transformPos={transform.position}, " +
+                            $"agentNextPos={agent.nextPosition}, " +
+                            $"navHitPos={initialHit.position}"
+                        );
+                    }
                     yield break;
                 }
                 else

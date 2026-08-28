@@ -64,6 +64,16 @@ public class PedestrianAgent : MonoBehaviour
     // Cached reference to UncertainBehavior (if present) so we can notify it to resume after dwell or on reuse
     UncertainBehavior uncertainBehavior = null;
 
+    // NEW (fix for pooled-agent reactivation race): tracks the coroutine started by BeginMovementWhenReady()
+    // so a second call (e.g. rapid re-Initialize on quick pool reuse) can safely cancel the previous wait.
+    Coroutine startMovementCoroutine = null;
+
+    [Tooltip("NEW: maximum time (seconds, unscaled) to wait for MoveToTarget.IsReadyToMove() to report true " +
+             "before issuing the first MoveToCurrent() command anyway. This bounds how long a spawn can be " +
+             "delayed if the mover never becomes ready (e.g. genuinely off NavMesh), so an agent is never " +
+             "blocked forever - MoveToTarget's own defensive logging still applies if it truly cannot move.")]
+    public float moveReadyPollTimeout = 3f;
+
     void Awake()
     {
         // Assign unique ID if not already assigned (prewarm / pool instantiation will call Awake once)
@@ -129,8 +139,11 @@ public class PedestrianAgent : MonoBehaviour
         if (uncertainBehavior != null)
             uncertainBehavior.ResumeAfterArrival();
 
-        // Start moving to first waypoint (if any)
-        MoveToCurrent();
+        // NEW (fix for pooled-agent reactivation race): rather than calling MoveToCurrent() synchronously
+        // here (which could race with MoveToTarget's own pooled-reuse re-warp onto the NavMesh, see
+        // MoveToTarget.IsReadyToMove() docs), defer the first movement command until the mover reports
+        // it is actually ready, or a bounded timeout elapses.
+        BeginMovementWhenReady();
     }
 
     /// <summary>
@@ -163,7 +176,8 @@ public class PedestrianAgent : MonoBehaviour
         if (uncertainBehavior != null)
             uncertainBehavior.ResumeAfterArrival();
 
-        MoveToCurrent();
+        // NEW (fix for pooled-agent reactivation race): see Initialize() above for the full explanation.
+        BeginMovementWhenReady();
     }
 
     void Update()
@@ -245,6 +259,81 @@ public class PedestrianAgent : MonoBehaviour
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// NEW (fix for pooled-agent reactivation race): starts (or restarts) the coroutine that waits for
+    /// MoveToTarget to report readiness before issuing the first MoveToCurrent() command for this itinerary.
+    /// Cancels any previous pending wait first, in case Initialize()/InitializePositions() is called again
+    /// in quick succession (e.g. very fast pool reuse) before the previous wait finished.
+    /// </summary>
+    void BeginMovementWhenReady()
+    {
+        if (startMovementCoroutine != null)
+        {
+            StopCoroutine(startMovementCoroutine);
+            startMovementCoroutine = null;
+        }
+
+        if (!gameObject.activeInHierarchy)
+        {
+            // Cannot start a coroutine on an inactive GameObject. This is not an error: SpawnerManager
+            // always calls go.SetActive(true) before Initialize()/InitializePositions(), so this should
+            // not normally happen, but if it does, MoveToCurrent() will simply run the next time this
+            // agent is (re)activated and re-initialized.
+            return;
+        }
+
+        startMovementCoroutine = StartCoroutine(WaitUntilMoverReadyThenMove());
+    }
+
+    /// <summary>
+    /// NEW (fix for pooled-agent reactivation race).
+    ///
+    /// Problem this solves: MoveToTarget.OnEnable() -> ReinitializeAfterEnable() re-warps a pooled agent's
+    /// NavMeshAgent onto the NavMesh, but that re-warp is not guaranteed to have completed by the time
+    /// SpawnerManager.SpawnAgent() calls PedestrianAgent.Initialize()/InitializePositions() in the same
+    /// frame as go.SetActive(true). Previously, MoveToCurrent() (-> MoveToTarget.MoveTo(...)) was invoked
+    /// synchronously right there, so it could run before MoveToTarget.IsReadyToMove() was true; MoveTo(...)
+    /// would then silently skip calling agent.SetDestination(...) (only logging a warning), leaving the
+    /// agent internally marked as 'moving' but with no actual NavMesh destination - an intermittently
+    /// "frozen" NPC that is more likely to surface under load (many simultaneous pool reuses) and on Quest,
+    /// where coroutine scheduling latency is more variable than in the Editor.
+    ///
+    /// Fix: poll MoveToTarget.IsReadyToMove() once per frame and only call MoveToCurrent() once the mover
+    /// reports it can actually accept a destination, or once 'moveReadyPollTimeout' seconds have elapsed
+    /// (whichever comes first). The timeout ensures an agent is never blocked forever waiting - if the
+    /// mover genuinely cannot get onto the NavMesh, MoveToTarget's own existing defensive logging/disable
+    /// logic still applies exactly as before.
+    /// </summary>
+    IEnumerator WaitUntilMoverReadyThenMove()
+    {
+        if (moveToTarget == null)
+        {
+            // No MoveToTarget on this prefab: nothing to wait for. Preserve the original fallback
+            // behaviour described in Awake() (agent relies on external movement logic).
+            MoveToCurrent();
+            startMovementCoroutine = null;
+            yield break;
+        }
+
+        float waitStartTime = Time.unscaledTime;
+
+        while (!moveToTarget.IsReadyToMove())
+        {
+            if (Time.unscaledTime - waitStartTime >= moveReadyPollTimeout)
+            {
+                Debug.LogWarning($"[PedestrianAgent][{agentID}] MoveToTarget was not ready after " +
+                    $"{moveReadyPollTimeout:F1}s (NavMeshAgent not enabled / not on NavMesh yet). " +
+                    "Proceeding with MoveToCurrent() anyway; MoveToTarget will log its own warning if the " +
+                    "command cannot be applied.");
+                break;
+            }
+            yield return null;
+        }
+
+        MoveToCurrent();
+        startMovementCoroutine = null;
     }
 
     /// <summary>
@@ -625,6 +714,12 @@ public class PedestrianAgent : MonoBehaviour
 
         if (moveToTarget != null)
             moveToTarget.Stop();
+
+        // NEW (fix for pooled-agent reactivation race): Unity automatically stops any coroutines started
+        // on this component when the GameObject is deactivated, so WaitUntilMoverReadyThenMove() (if still
+        // pending) is already halted at this point - we just clear the stale reference here so the next
+        // BeginMovementWhenReady() call doesn't attempt to StopCoroutine() a handle that's already dead.
+        startMovementCoroutine = null;
     }
 
     void OnDestroy()

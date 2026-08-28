@@ -82,6 +82,27 @@ public class MoveToTarget : MonoBehaviour
     public bool IsMoving => moving;
     public bool IsArrived => arrived;
 
+    /// <summary>
+    /// NEW (fix for pooled-agent reactivation race): public, read-only readiness check for external callers
+    /// (e.g. PedestrianAgent) that need to know whether this mover's NavMeshAgent is currently enabled and
+    /// placed on the NavMesh, and therefore able to actually act on a MoveTo(...) call.
+    ///
+    /// Background: on pooled reuse, MoveToTarget.OnEnable() -> ReinitializeAfterEnable() re-warps the
+    /// NavMeshAgent onto the NavMesh asynchronously (it needs at least one frame after SetActive(true)/
+    /// OnEnable before agent.isOnNavMesh becomes true again). A caller that invokes MoveTo(...) synchronously
+    /// in the same frame as activation - as SpawnerManager.SpawnAgent() -> PedestrianAgent.Initialize() ->
+    /// MoveToCurrent() previously did - could have its MoveTo(...) call silently ignored (only a warning log),
+    /// because AgentCanControl() was still false at that instant.
+    ///
+    /// Exposing this as a public wrapper around the existing internal AgentCanControl() check lets callers
+    /// poll for real readiness instead of assuming a fixed number of frames, which is unreliable especially
+    /// on Quest where coroutine scheduling latency can vary under load.
+    /// </summary>
+    public bool IsReadyToMove()
+    {
+        return AgentCanControl();
+    }
+
     // Internal state
     bool moving = false;
     bool arrived = false;

@@ -9,6 +9,27 @@
 // public 'useNavMeshAgent' field. All references to mt.useNavMeshAgent have been removed and
 // logging/decisions now rely on the actual NavMeshAgent state (nav != null && nav.enabled && nav.isOnNavMesh).
 //
+// NEW (trial-state gating): SpawnLoop() previously ran continuously for the lifetime of the scene,
+// independent of ExperimentManager.OnTrialStart/OnTrialEnd. This meant pedestrian presence before a
+// trial officially started (or after it ended) was not delineated from "in-trial" pedestrian presence,
+// which could confound the recorded trial window with a continuous, ungated pedestrian stimulus.
+// SpawnerManager now optionally subscribes to ExperimentManager.OnTrialStart/OnTrialEnd and:
+//   - only spawns NEW agents while a trial is active (gates SpawnLoop/SpawnAgent), and
+//   - optionally pauses/resumes movement of agents that are already alive when a trial ends/starts,
+//     and/or force-finishes them, so that "trial recording window" and "pedestrian stimulus window"
+//     can be made to coincide exactly.
+// This is opt-in via 'gateSpawningByTrialState' (default true) so it fixes the confound by default,
+// but can be switched off to restore the previous continuous-spawning behaviour if that is intentional
+// (e.g. for ambient background population that is not meant to be the manipulated stimulus).
+//
+// NEW (Quest logging fix): SpawnerManager previously logged unconditionally and verbosely on every
+// spawn/despawn (LogAgentItinerary/LogAgentItineraryPositions build a multi-line StringBuilder per spawn),
+// with no build-time or runtime gate - unlike MoveToTarget, which already has an 'enableDebugLogs' toggle.
+// On Quest, this string-heavy per-spawn logging is a known performance drain that scales with
+// maxAgents/spawnInterval. SpawnerManager now has its own 'enableDebugLogs' flag (mirroring MoveToTarget's),
+// defaulting to true so existing Editor workflows are unaffected, and every Debug.Log/LogWarning/LogError
+// call in this script is gated behind it so it can be switched off for Quest builds.
+//
 // All comments in English.
 
 using System.Collections;
@@ -77,17 +98,177 @@ public class SpawnerManager : MonoBehaviour
     // time to wait for NavMesh availability before giving up (seconds)
     public float navmeshWaitTimeout = 5f;
 
+    [Header("Trial State Gating (NEW)")]
+    [Tooltip("Optional: assign the scene's ExperimentManager. If left empty, it will be auto-found via " +
+             "FindObjectOfType at Start() (same pattern used elsewhere in this project, e.g. TargetSelectable).")]
+    public ExperimentManager experimentManager;
+
+    [Tooltip("If true, SpawnLoop() only spawns new agents while a trial is active (between " +
+             "ExperimentManager.OnTrialStart and OnTrialEnd). If false, spawning is continuous for the " +
+             "lifetime of the scene, matching the previous (ungated) behaviour.")]
+    public bool gateSpawningByTrialState = true;
+
+    [Tooltip("If true, agents that are already alive when a trial ends are paused (frozen in place, " +
+             "animator frozen) via MoveToTarget.PauseExternal(...), and resumed via ResumeExternal() " +
+             "when the next trial starts. If false, already-spawned agents keep moving/finishing their " +
+             "current itinerary even outside the trial window.")]
+    public bool pauseLiveAgentsOutsideTrial = true;
+
+    [Tooltip("If true, in addition to pausing, agents that are still alive when a trial ends are " +
+             "force-finished (PedestrianAgent.ForceFinish()) and returned to the pool / destroyed, so " +
+             "the scene is fully clear of pedestrians outside the trial window. If false, paused agents " +
+             "simply wait, frozen, until the next trial resumes them.")]
+    public bool despawnLiveAgentsOnTrialEnd = false;
+
+    [Header("Debug")]
+    [Tooltip("NEW: mirrors MoveToTarget.enableDebugLogs. When true (default), SpawnerManager logs " +
+             "per-spawn/per-despawn itinerary details and warnings/errors via Debug.Log(...). Disable this " +
+             "for Quest/device builds to avoid the string-building + logging cost scaling with " +
+             "maxAgents/spawnInterval - it is purely a diagnostic aid and has no effect on spawn behaviour.")]
+    public bool enableDebugLogs = true;
+
     // internal
     private List<GameObject> pool = new List<GameObject>();
     private int liveAgents = 0;
+
+    // NEW: tracks currently-alive (spawned, not yet finished) agent GameObjects so they can be
+    // paused/resumed/force-finished as a group when trial state changes.
+    private List<GameObject> activeAgents = new List<GameObject>();
+
+    // NEW: whether a trial is currently active. When gateSpawningByTrialState == false this flag
+    // is ignored entirely (SpawnLoop behaves exactly as it did before this change).
+    private bool trialActive = false;
 
     // state to ensure we don't spawn before prewarm/initialization finished
     bool poolInitializationComplete = false;
 
     void Start()
     {
+        // NEW: resolve ExperimentManager and subscribe to trial start/end events if gating is enabled.
+        if (gateSpawningByTrialState)
+        {
+            if (experimentManager == null)
+            {
+                experimentManager = FindObjectOfType<ExperimentManager>();
+            }
+
+            if (experimentManager != null)
+            {
+                experimentManager.OnTrialStart += HandleTrialStart;
+                experimentManager.OnTrialEnd += HandleTrialEnd;
+            }
+            else
+            {
+                // No ExperimentManager found: fail safe by disabling gating rather than blocking all
+                // spawning forever (which would silently break scenes that don't use ExperimentManager).
+                if (enableDebugLogs) Debug.LogWarning("[SpawnerManager] gateSpawningByTrialState is true but no ExperimentManager " +
+                    "was found in the scene. Falling back to continuous spawning (gating disabled).");
+                gateSpawningByTrialState = false;
+            }
+        }
+
         // Start sequence that waits/attempts NavMesh prewarm and only then starts spawn loop.
         StartCoroutine(InitializePoolThenSpawn());
+    }
+
+    void OnDestroy()
+    {
+        // NEW: unsubscribe to avoid referencing a destroyed SpawnerManager from ExperimentManager's event.
+        if (experimentManager != null)
+        {
+            experimentManager.OnTrialStart -= HandleTrialStart;
+            experimentManager.OnTrialEnd -= HandleTrialEnd;
+        }
+    }
+
+    /// <summary>
+    /// NEW: called when ExperimentManager fires OnTrialStart. Opens the spawning gate and, if configured,
+    /// resumes any agents that were paused when the previous trial ended.
+    /// </summary>
+    private void HandleTrialStart()
+    {
+        trialActive = true;
+        if (enableDebugLogs) Debug.Log("[SpawnerManager] Trial started -> NPC spawning enabled.");
+
+        if (pauseLiveAgentsOutsideTrial)
+        {
+            ResumeAllActiveAgents();
+        }
+    }
+
+    /// <summary>
+    /// NEW: called when ExperimentManager fires OnTrialEnd. Closes the spawning gate so no new agents
+    /// are created outside the trial window, and optionally pauses and/or clears agents that are still
+    /// alive from the trial that just ended.
+    /// </summary>
+    private void HandleTrialEnd()
+    {
+        trialActive = false;
+        if (enableDebugLogs) Debug.Log("[SpawnerManager] Trial ended -> NPC spawning disabled.");
+
+        if (despawnLiveAgentsOnTrialEnd)
+        {
+            ForceFinishAllActiveAgents();
+        }
+        else if (pauseLiveAgentsOutsideTrial)
+        {
+            PauseAllActiveAgents();
+        }
+    }
+
+    /// <summary>
+    /// NEW: freezes movement (and animator) of every currently-alive agent via MoveToTarget.PauseExternal,
+    /// without changing their itinerary state, so they can be resumed exactly where they left off.
+    /// </summary>
+    private void PauseAllActiveAgents()
+    {
+        for (int i = 0; i < activeAgents.Count; i++)
+        {
+            GameObject go = activeAgents[i];
+            if (go == null) continue;
+            MoveToTarget mt = go.GetComponent<MoveToTarget>();
+            if (mt != null)
+            {
+                mt.PauseExternal(true, true); // haltMovement=true, freezeAnimator=true
+            }
+        }
+    }
+
+    /// <summary>
+    /// NEW: resumes movement of every currently-alive agent previously paused by PauseAllActiveAgents.
+    /// </summary>
+    private void ResumeAllActiveAgents()
+    {
+        for (int i = 0; i < activeAgents.Count; i++)
+        {
+            GameObject go = activeAgents[i];
+            if (go == null) continue;
+            MoveToTarget mt = go.GetComponent<MoveToTarget>();
+            if (mt != null)
+            {
+                mt.ResumeExternal();
+            }
+        }
+    }
+
+    /// <summary>
+    /// NEW: immediately terminates every currently-alive agent's itinerary (PedestrianAgent.ForceFinish()),
+    /// which triggers the normal onAgentFinished -> OnAgentFinished(...) pooling/destroy pathway. Iterates
+    /// over a copy of the list because OnAgentFinished mutates activeAgents while we iterate.
+    /// </summary>
+    private void ForceFinishAllActiveAgents()
+    {
+        List<GameObject> snapshot = new List<GameObject>(activeAgents);
+        for (int i = 0; i < snapshot.Count; i++)
+        {
+            GameObject go = snapshot[i];
+            if (go == null) continue;
+            PedestrianAgent pa = go.GetComponent<PedestrianAgent>();
+            if (pa != null)
+            {
+                pa.ForceFinish();
+            }
+        }
     }
 
     IEnumerator InitializePoolThenSpawn()
@@ -147,7 +328,7 @@ public class SpawnerManager : MonoBehaviour
         }
 
         if (!navAvailable)
-            Debug.LogWarning($"SpawnerManager: NavMesh not found near entrances/startTransform within {navmeshWaitTimeout}s. Spawning will proceed but agents may be fallback to transform mode.");
+            if (enableDebugLogs) Debug.LogWarning($"SpawnerManager: NavMesh not found near entrances/startTransform within {navmeshWaitTimeout}s. Spawning will proceed but agents may be fallback to transform mode.");
         yield break;
     }
 
@@ -192,7 +373,7 @@ public class SpawnerManager : MonoBehaviour
         }
 
         if (!navAvailable)
-            Debug.LogWarning($"SpawnerManager: NavMesh not found near sample origin within {navmeshWaitTimeout}s. Prewarm will still run but any prewarmed agents that cannot find NavMesh will have their NavMeshAgent disabled as a fallback.");
+            if (enableDebugLogs) Debug.LogWarning($"SpawnerManager: NavMesh not found near sample origin within {navmeshWaitTimeout}s. Prewarm will still run but any prewarmed agents that cannot find NavMesh will have their NavMeshAgent disabled as a fallback.");
 
         // now prewarm (coroutine)
         yield return StartCoroutine(PrewarmPoolCoroutine());
@@ -275,7 +456,7 @@ public class SpawnerManager : MonoBehaviour
 
             // Logging: prewarm instance info (include unique AgentID for traceability)
             string navState = (nav != null) ? $"nav.enabled={nav.enabled} nav.isOnNavMesh={nav.isOnNavMesh}" : "no NavMeshAgent";
-            Debug.Log($"[SpawnerManager][Prewarm] idx={i} placedOnNav={placedOnNav} {navState} pos={go.transform.position} prefab={agentPrefab.name} AgentID={agentIdStr}");
+            if (enableDebugLogs) Debug.Log($"[SpawnerManager][Prewarm] idx={i} placedOnNav={placedOnNav} {navState} pos={go.transform.position} prefab={agentPrefab.name} AgentID={agentIdStr}");
 
             // Deactivate and add to pool
             go.SetActive(false);
@@ -299,7 +480,12 @@ public class SpawnerManager : MonoBehaviour
                 continue;
             }
 
-            if (liveAgents < maxAgents)
+            // NEW: when gating is enabled, only spawn new agents while a trial is active. The loop keeps
+            // running (so it re-checks every 'spawnInterval') rather than stopping, so spawning resumes
+            // automatically as soon as the next OnTrialStart fires.
+            bool allowedToSpawn = (!gateSpawningByTrialState) || trialActive;
+
+            if (allowedToSpawn && liveAgents < maxAgents)
             {
                 SpawnAgent();
             }
@@ -337,7 +523,7 @@ public class SpawnerManager : MonoBehaviour
         {
             // defensive fallback: place at samplingOrigin rather than return and leave a stray prefab instanced later
             spawnPos = samplingOrigin;
-            Debug.LogWarning("SpawnerManager: failed to sample NavMesh near spawn origin. Using sampling origin position as fallback for spawn position.");
+            if (enableDebugLogs) Debug.LogWarning("SpawnerManager: failed to sample NavMesh near spawn origin. Using sampling origin position as fallback for spawn position.");
         }
 
         GameObject go = null;
@@ -388,7 +574,7 @@ public class SpawnerManager : MonoBehaviour
                     nav.enabled = false;
                 }
                 placedOnNavMesh = false;
-                Debug.LogWarning("SpawnerManager: pooled agent couldn't be sampled on NavMesh at spawnPos; NavMeshAgent disabled as fallback.");
+                if (enableDebugLogs) Debug.LogWarning("SpawnerManager: pooled agent couldn't be sampled on NavMesh at spawnPos; NavMeshAgent disabled as fallback.");
             }
 
             // Apply profile to pooled instance if factory/profile available
@@ -424,7 +610,7 @@ public class SpawnerManager : MonoBehaviour
 
             if (agentScript == null)
             {
-                Debug.LogError("Agent prefab missing PedestrianAgent script");
+                if (enableDebugLogs) Debug.LogError("Agent prefab missing PedestrianAgent script");
                 Destroy(go);
                 return;
             }
@@ -460,7 +646,7 @@ public class SpawnerManager : MonoBehaviour
 
                 // Log
                 LogAgentItineraryPositions(go, entranceIndex, chosenEntrance, posItin, mt, go.GetComponent<NavMeshAgent>(), dwell);
-                Debug.Log($"[SpawnerManager] Spawned pooled agent AgentID={aid} (pooled reuse) at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}");
+                if (enableDebugLogs) Debug.Log($"[SpawnerManager] Spawned pooled agent AgentID={aid} (pooled reuse) at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}");
                 // Initialize agent with positions + optional attractor infos
                 agentScript.InitializePositions(posItin, posAttractorInfos, this, dwell);
             }
@@ -494,12 +680,13 @@ public class SpawnerManager : MonoBehaviour
 
                 // Also log AgentID explicitly
                 string aid = agentScript != null ? agentScript.AgentID : "n/a";
-                Debug.Log($"[SpawnerManager] Spawned pooled agent AgentID={aid} (pooled reuse) at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}");
+                if (enableDebugLogs) Debug.Log($"[SpawnerManager] Spawned pooled agent AgentID={aid} (pooled reuse) at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}");
 
                 agentScript.Initialize(itinerary, this, dwell);
             }
 
             liveAgents++;
+            activeAgents.Add(go); // NEW: track for trial-state pause/resume/despawn
             agentScript.onAgentFinished += OnAgentFinished;
         }
         else
@@ -511,7 +698,7 @@ public class SpawnerManager : MonoBehaviour
             PedestrianAgent agentScript = go.GetComponent<PedestrianAgent>();
             if (agentScript == null)
             {
-                Debug.LogError("Agent prefab missing PedestrianAgent script");
+                if (enableDebugLogs) Debug.LogError("Agent prefab missing PedestrianAgent script");
                 Destroy(go);
                 return;
             }
@@ -539,7 +726,7 @@ public class SpawnerManager : MonoBehaviour
                         // Warp failed defensively: keep nav disabled to avoid later exceptions
                         nav.enabled = false;
                         go.transform.position = spawnPos;
-                        Debug.LogWarning("SpawnerManager: Instantiated agent but warp to sampled NavMesh position failed; disabling NavMeshAgent as fallback.");
+                        if (enableDebugLogs) Debug.LogWarning("SpawnerManager: Instantiated agent but warp to sampled NavMesh position failed; disabling NavMeshAgent as fallback.");
                     }
                 }
                 else
@@ -547,7 +734,7 @@ public class SpawnerManager : MonoBehaviour
                     // Could not sample NavMesh near spawnPos: disable agent to avoid exceptions
                     nav.enabled = false;
                     go.transform.position = spawnPos;
-                    Debug.LogWarning("SpawnerManager: Instantiated agent but could not sample NavMesh near spawnPos; NavMeshAgent disabled on this instance as fallback.");
+                    if (enableDebugLogs) Debug.LogWarning("SpawnerManager: Instantiated agent but could not sample NavMesh near spawnPos; NavMeshAgent disabled on this instance as fallback.");
                 }
             }
             else
@@ -607,7 +794,7 @@ public class SpawnerManager : MonoBehaviour
                 // Log with AgentID
                 string aid = agentScript != null ? agentScript.AgentID : "n/a";
                 LogAgentItineraryPositions(go, entranceIndex, chosenEntrance, posItin, mt, nav, dwell);
-                Debug.Log($"[SpawnerManager] Spawned new agent AgentID={aid} at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}");
+                if (enableDebugLogs) Debug.Log($"[SpawnerManager] Spawned new agent AgentID={aid} at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}");
 
                 agentScript.InitializePositions(posItin, posAttractorInfos, this, dwell);
             }
@@ -636,12 +823,13 @@ public class SpawnerManager : MonoBehaviour
                 // Log itinerary and AgentID
                 string aid = agentScript != null ? agentScript.AgentID : "n/a";
                 LogAgentItinerary(go, entranceIndex, chosenEntrance, itinerary, mt, nav, dwell);
-                Debug.Log($"[SpawnerManager] Spawned new agent AgentID={aid} at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}");
+                if (enableDebugLogs) Debug.Log($"[SpawnerManager] Spawned new agent AgentID={aid} at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}");
 
                 agentScript.Initialize(itinerary, this, dwell);
             }
 
             liveAgents++;
+            activeAgents.Add(go); // NEW: track for trial-state pause/resume/despawn
             agentScript.onAgentFinished += OnAgentFinished;
         }
     }
@@ -651,6 +839,11 @@ public class SpawnerManager : MonoBehaviour
     /// </summary>
     void LogAgentItineraryPositions(GameObject go, int entranceIndex, Transform entrance, List<Vector3> positions, MoveToTarget mt, NavMeshAgent nav, float dwell)
     {
+        // NEW: bail out before doing any string work if logging is disabled - this is the actual
+        // performance-relevant fix, since building the StringBuilder below is the expensive part,
+        // not just the Debug.Log(...) call at the end.
+        if (!enableDebugLogs) return;
+
         // Try to include the unique AgentID in logs if present
         PedestrianAgent pa = go.GetComponent<PedestrianAgent>();
         string agentId = pa != null ? pa.AgentID : "n/a";
@@ -714,7 +907,7 @@ public class SpawnerManager : MonoBehaviour
         string mtInfo = mt != null ? $"MoveToTarget(start={(mt.startTransform!=null?mt.startTransform.name:"null")}, agentAssigned={(mt.agent!=null? "yes":"no")}, targetPos={(positions!=null && positions.Count>0?positions[0].ToString():"null")})" : "MoveToTarget=null";
 
         sb.AppendLine($"  Runtime: {navInfo} | {mtInfo} | prefab={agentPrefab.name}");
-        Debug.Log(sb.ToString());
+        if (enableDebugLogs) Debug.Log(sb.ToString());
     }
 
     /// <summary>
@@ -722,6 +915,11 @@ public class SpawnerManager : MonoBehaviour
     /// </summary>
     void LogAgentItinerary(GameObject go, int entranceIndex, Transform entrance, List<Transform> itinerary, MoveToTarget mt, NavMeshAgent nav, float dwell)
     {
+        // NEW: bail out before doing any string work if logging is disabled - see the matching comment
+        // in LogAgentItineraryPositions() above for why this early-return (not just gating Debug.Log)
+        // is the part that actually matters for performance.
+        if (!enableDebugLogs) return;
+
         // Try to include the unique AgentID in logs if present
         PedestrianAgent pa = go.GetComponent<PedestrianAgent>();
         string agentId = pa != null ? pa.AgentID : "n/a";
@@ -805,7 +1003,7 @@ public class SpawnerManager : MonoBehaviour
         sb.AppendLine($"  Runtime: {navInfo} | {mtInfo} | prefab={agentPrefab.name}");
 
         // Output the composed log
-        Debug.Log(sb.ToString());
+        if (enableDebugLogs) Debug.Log(sb.ToString());
     }
 
     /// <summary>
@@ -822,7 +1020,7 @@ public class SpawnerManager : MonoBehaviour
         if (area != null)
         {
             Vector3 p = area.SamplePointOnNavMesh();
-            Debug.Log($"[AttractorArea] SamplePointOnNavMesh() returning {p} (caller: {Time.frameCount})");
+            if (enableDebugLogs) Debug.Log($"[AttractorArea] SamplePointOnNavMesh() returning {p} (caller: {Time.frameCount})");
             if (p != Vector3.zero) return p;
         }
 
@@ -931,6 +1129,7 @@ public class SpawnerManager : MonoBehaviour
         agent.onAgentFinished -= OnAgentFinished;
 
         liveAgents--;
+        activeAgents.Remove(agent.gameObject); // NEW: stop tracking this agent for trial-state pause/despawn
 
         if (usePooling)
         {
@@ -959,7 +1158,7 @@ public class SpawnerManager : MonoBehaviour
             string agentId = agent != null ? agent.AgentID : "n/a";
             string goId = $"{go.name} AgentID={agentId}";
             string navState = nav != null ? $"nav.enabled={nav.enabled} nav.isOnNavMesh={nav.isOnNavMesh}" : "no NavMeshAgent";
-            Debug.Log($"[SpawnerManager][OnAgentFinished] {goId} returning to pool. liveAgents={liveAgents} {navState}");
+            if (enableDebugLogs) Debug.Log($"[SpawnerManager][OnAgentFinished] {goId} returning to pool. liveAgents={liveAgents} {navState}");
 
             go.SetActive(false);
             pool.Add(go);

@@ -17,6 +17,18 @@
 // - If MoveToTarget is not present, the agent will still use simple distance checks to consider arrival,
 //   but will not attempt to move itself (so in practice you should attach MoveToTarget to the prefab).
 // - Attractor capacity semantics are preserved: when arriving at an attractor the agent requests entry from SpawnerManager.
+//
+// -------------------------------------------------------------------------------------------------------
+// ADDITIVE CHANGE (Attractor stop position + dwell facing) - does NOT touch route generation:
+//   * When the current itinerary waypoint is an Attractor Plane carrying an AttractorDwell component,
+//     the PHYSICAL movement destination for that leg is overridden with an independent random point
+//     inside that Plane (vertically projected onto the NavMesh, X/Z preserved). The itinerary list, the
+//     waypoint Transforms, currentIndex progression, entrance/attractor/exit selection and order are all
+//     unchanged - only where the agent physically stops for this one Attractor visit differs.
+//   * While dwelling, the agent turns yaw-only to face AttractorDwell.facingTarget (if assigned).
+//   * All random sampling happens in AttractorDwell via a private System.Random, so the global
+//     UnityEngine.Random sequence used by SpawnerManager route generation is never perturbed.
+// -------------------------------------------------------------------------------------------------------
 
 using System;
 using System.Collections;
@@ -49,6 +61,19 @@ public class PedestrianAgent : MonoBehaviour
 
     // tuning
     public float arriveTolerance = 0.6f; // consider arrived if within this distance
+
+    // -----------------------------------------------------------------------------------------------
+    // Attractor stop override + dwell facing (additive; does NOT change route generation)
+    // -----------------------------------------------------------------------------------------------
+    // Physical movement destination for the CURRENT leg when that leg targets an Attractor Plane that
+    // carries an AttractorDwell component. null for every other leg (entrance, exit, plain waypoint), in
+    // which case all movement behaviour is exactly as before. The itinerary list itself is never modified
+    // - this only overrides where the agent physically stops for this one Attractor visit.
+    Vector3? currentLegStopOverride = null;
+
+    // Handle to the running "turn to face the Attractor's Facing Target" coroutine, so a new dwell can
+    // cancel a stale one on fast pool reuse.
+    Coroutine facingCoroutine = null;
 
     // -----------------------------
     // Unique ID implementation
@@ -124,6 +149,10 @@ public class PedestrianAgent : MonoBehaviour
         this.currentIndex = 0;
         this.state = State.Moving;
 
+        // Additive: a pooled instance may still hold a stop override from its previous life. Clear it so
+        // the first leg (always the entrance) starts on the unchanged code path.
+        this.currentLegStopOverride = null;
+
         // Configure MoveToTarget runtime parameters if available
         if (moveToTarget != null)
         {
@@ -163,6 +192,9 @@ public class PedestrianAgent : MonoBehaviour
         this.dwellTime = dwellSeconds;
         this.currentIndex = 0;
         this.state = State.Moving;
+
+        // Additive: clear any stale per-leg override (unused on the position path, cleared for safety).
+        this.currentLegStopOverride = null;
 
         if (moveToTarget != null)
         {
@@ -233,6 +265,12 @@ public class PedestrianAgent : MonoBehaviour
                 return;
             }
 
+            // When a per-leg physical stop override is active (a random point inside an Attractor Plane),
+            // the distance fallback must measure to THAT point, not to the Plane pivot 't.position' -
+            // otherwise it could fire early as the agent passes near the pivot on the way to the random
+            // point. For every non-attractor leg 'currentLegStopOverride' is null and this is unchanged.
+            Vector3 transformFallbackTarget = currentLegStopOverride ?? t.position;
+
             if (moveToTarget != null)
             {
                 if (moveToTarget.IsArrived)
@@ -242,7 +280,7 @@ public class PedestrianAgent : MonoBehaviour
                 }
 
                 // Additional distance fallback
-                float d = Vector3.Distance(transform.position, t.position);
+                float d = Vector3.Distance(transform.position, transformFallbackTarget);
                 if (d <= arriveTolerance)
                 {
                     OnReachedWaypoint();
@@ -251,7 +289,7 @@ public class PedestrianAgent : MonoBehaviour
             }
             else
             {
-                float d = Vector3.Distance(transform.position, t.position);
+                float d = Vector3.Distance(transform.position, transformFallbackTarget);
                 if (d <= arriveTolerance)
                 {
                     OnReachedWaypoint();
@@ -346,6 +384,10 @@ public class PedestrianAgent : MonoBehaviour
         // Unsubscribe previous subscription if any (defensive).
         UnsubscribeFromMoveToArrived();
 
+        // Clear any per-leg physical-destination override left over from the previous waypoint. It is
+        // re-set below ONLY when the new waypoint is an Attractor Plane with an AttractorDwell component.
+        currentLegStopOverride = null;
+
         if (usingPositionItinerary)
         {
             if (itineraryPositions == null || currentIndex >= itineraryPositions.Count)
@@ -395,13 +437,40 @@ public class PedestrianAgent : MonoBehaviour
             {
                 moveToTarget.startTransform = null;
                 moveToTarget.startPosition = transform.position;
-                moveToTarget.targetTransform = target;
 
-                // Subscribe to OnArrived for immediate reaction
-                SubscribeToMoveToArrived();
+                // ROUTE-PRESERVING STOP OVERRIDE.
+                // 'target' remains the itinerary waypoint (the Attractor Plane Transform) and is still the
+                // value used by OnReachedWaypoint() / FindAttractorInfo() / the exit test / AdvanceItinerary().
+                // Only the PHYSICAL destination handed to MoveToTarget is swapped for an independent random
+                // point inside that same Plane, so NPCs dwelling at one Attractor spread out instead of all
+                // stacking on Plane.transform.position. For entrances, exits, or Planes without an
+                // AttractorDwell component this falls through to the original code path unchanged.
+                Vector3 attractorStop;
+                if (TryGetAttractorDwellStop(target, out attractorStop))
+                {
+                    currentLegStopOverride = attractorStop;
 
-                // MoveToTarget will handle movement and arrival
-                moveToTarget.MoveTo(target);
+                    // Vector3 target: MoveToTarget reads targetPosition (targetTransform must be null).
+                    moveToTarget.targetTransform = null;
+                    moveToTarget.targetPosition = attractorStop;
+
+                    // Subscribe to OnArrived for immediate reaction
+                    SubscribeToMoveToArrived();
+
+                    // Existing public overload - MoveToTarget's movement implementation is NOT modified.
+                    moveToTarget.MoveTo(attractorStop);
+                }
+                else
+                {
+                    // Original behaviour: move to the waypoint Transform itself.
+                    moveToTarget.targetTransform = target;
+
+                    // Subscribe to OnArrived for immediate reaction
+                    SubscribeToMoveToArrived();
+
+                    // MoveToTarget will handle movement and arrival
+                    moveToTarget.MoveTo(target);
+                }
             }
             else
             {
@@ -563,6 +632,10 @@ public class PedestrianAgent : MonoBehaviour
         if (moveToTarget != null)
             moveToTarget.PauseExternal(haltMovement: true, freezeAnimator: true);
 
+        // Additive: yaw-only turn toward this Attractor's configured Facing Target (if any) for the dwell.
+        // No-op when the Plane has no AttractorDwell or no facingTarget (existing rotation is preserved).
+        FaceDwellTargetIfConfigured(info);
+
         yield return new WaitForSeconds(dwellTime);
 
         // release slot in attractor
@@ -587,6 +660,9 @@ public class PedestrianAgent : MonoBehaviour
         // Pause movement and freeze animator while polling for capacity (don't step in place)
         if (moveToTarget != null)
             moveToTarget.PauseExternal(haltMovement: true, freezeAnimator: true);
+
+        // Additive: the agent is already standing at its random stop point, so face the target while it waits.
+        FaceDwellTargetIfConfigured(info);
 
         float timeout = 30f;
         float start = Time.time;
@@ -637,6 +713,86 @@ public class PedestrianAgent : MonoBehaviour
 
         state = State.Moving;
         MoveToCurrent();
+    }
+
+    /// <summary>
+    /// Additive helper. Returns true and outputs an independent random NavMesh stop position INSIDE the
+    /// given Attractor Plane when 'waypoint' carries an AttractorDwell component and a valid point was
+    /// found. Returns false for entrances/exits, Planes without AttractorDwell, when random stopping is
+    /// disabled on that component, or when AttractorDwell exhausted its bounded attempts - in every false
+    /// case the caller keeps its original destination (the waypoint Transform).
+    ///
+    /// AttractorDwell samples with a PRIVATE System.Random, so this never advances UnityEngine.Random and
+    /// the existing entrance/attractor/exit selection, attractor count/order and dwell timing are unchanged.
+    /// </summary>
+    bool TryGetAttractorDwellStop(Transform waypoint, out Vector3 stop)
+    {
+        stop = default;
+        if (waypoint == null) return false;
+
+        AttractorDwell dwell = waypoint.GetComponent<AttractorDwell>();
+        if (dwell == null) return false;
+
+        return dwell.TryGetRandomStandingPoint(out stop);
+    }
+
+    /// <summary>
+    /// Additive helper. Starts a yaw-only rotation toward the Attractor's configured Facing Target for the
+    /// duration of the dwell. The Facing Target lives on the AttractorDwell component of the Attractor
+    /// Plane (info.transform) and is NEVER added to the itinerary - it only affects orientation while
+    /// dwelling. No-op (existing rotation behaviour preserved) when there is no AttractorDwell or no
+    /// Facing Target.
+    /// </summary>
+    void FaceDwellTargetIfConfigured(AttractorInfo info)
+    {
+        if (info == null || info.transform == null) return;
+
+        AttractorDwell dwell = info.transform.GetComponent<AttractorDwell>();
+        if (dwell == null || dwell.facingTarget == null) return;
+
+        if (facingCoroutine != null) StopCoroutine(facingCoroutine);
+        facingCoroutine = StartCoroutine(FaceYawCoroutine(dwell.facingTarget, dwell.facingTurnSpeedDeg));
+    }
+
+    /// <summary>
+    /// Additive helper. Rotates this agent about the world Y axis only (never pitch/roll) toward 'lookAt'
+    /// while the agent is dwelling (State.WaitingAtAttractor). This is safe because during the dwell:
+    ///  - MoveToTarget.Update() early-returns (the mover is externally paused + halted) and never touches
+    ///    transform.rotation;
+    ///  - UncertainBehavior has suspended itself on arrival at the main target.
+    /// Once the goal orientation is reached the coroutine stops updating rotation. When the dwell ends
+    /// (state leaves WaitingAtAttractor) the loop exits and normal movement-facing resumes on the next leg.
+    /// </summary>
+    IEnumerator FaceYawCoroutine(Transform lookAt, float degreesPerSecond)
+    {
+        while (state == State.WaitingAtAttractor && lookAt != null)
+        {
+            Vector3 dir = lookAt.position - transform.position;
+            dir.y = 0f; // horizontal / yaw only - do not tilt the agent up or down
+            if (dir.sqrMagnitude < 1e-6f)
+                break; // Facing Target is directly above/below the agent: nothing meaningful to face
+
+            Quaternion goal = Quaternion.LookRotation(dir.normalized, Vector3.up);
+
+            if (degreesPerSecond <= 0f)
+            {
+                transform.rotation = goal; // instant snap
+                break;
+            }
+
+            transform.rotation = Quaternion.RotateTowards(
+                transform.rotation, goal, degreesPerSecond * Time.deltaTime);
+
+            if (Quaternion.Angle(transform.rotation, goal) <= 0.1f)
+            {
+                transform.rotation = goal; // reached - stop changing orientation
+                break;
+            }
+
+            yield return null;
+        }
+
+        facingCoroutine = null;
     }
 
     /// <summary>
@@ -720,6 +876,11 @@ public class PedestrianAgent : MonoBehaviour
         // pending) is already halted at this point - we just clear the stale reference here so the next
         // BeginMovementWhenReady() call doesn't attempt to StopCoroutine() a handle that's already dead.
         startMovementCoroutine = null;
+
+        // Additive: same reasoning for the dwell-facing coroutine; also drop the per-leg stop override so
+        // a pooled reuse starts on the unchanged code path.
+        facingCoroutine = null;
+        currentLegStopOverride = null;
     }
 
     void OnDestroy()

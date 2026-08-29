@@ -20155,6 +20155,7 @@ GameObject:
   - component: {fileID: 199432979}
   - component: {fileID: 199432978}
   - component: {fileID: 199432977}
+  - component: {fileID: 199432980}
   m_Layer: 0
   m_Name: Plane
   m_TagString: Untagged
@@ -20249,6 +20250,29 @@ MeshFilter:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 199432975}
   m_Mesh: {fileID: 10209, guid: 0000000000000000e000000000000000, type: 0}
+--- !u!114 &199432980
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 199432975}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4c6d2968fb18247c598381ffedbb09b2, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  enableRandomStop: 1
+  areaCollider: {fileID: 199432977}
+  maxAttempts: 24
+  verticalSearchUp: 30
+  verticalSearchDown: 30
+  verticalStep: 0.3
+  navMeshSampleRadius: 0.5
+  horizontalTolerance: 0.25
+  facingTarget: {fileID: 295374276}
+  facingTurnSpeedDeg: 360
+  enableDebugLogs: 0
 --- !u!1 &200584958
 GameObject:
   m_ObjectHideFlags: 0
@@ -66360,6 +66384,7 @@ GameObject:
   - component: {fileID: 655573395}
   - component: {fileID: 655573394}
   - component: {fileID: 655573393}
+  - component: {fileID: 655573396}
   m_Layer: 0
   m_Name: Plane (3)
   m_TagString: Untagged
@@ -66454,6 +66479,29 @@ MeshFilter:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 655573391}
   m_Mesh: {fileID: 10209, guid: 0000000000000000e000000000000000, type: 0}
+--- !u!114 &655573396
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 655573391}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4c6d2968fb18247c598381ffedbb09b2, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  enableRandomStop: 1
+  areaCollider: {fileID: 655573393}
+  maxAttempts: 24
+  verticalSearchUp: 30
+  verticalSearchDown: 30
+  verticalStep: 0.3
+  navMeshSampleRadius: 0.5
+  horizontalTolerance: 0.25
+  facingTarget: {fileID: 732594098}
+  facingTurnSpeedDeg: 360
+  enableDebugLogs: 0
 --- !u!1001 &655705423
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -75435,6 +75483,7 @@ GameObject:
   - component: {fileID: 756803752}
   - component: {fileID: 756803751}
   - component: {fileID: 756803750}
+  - component: {fileID: 756803753}
   m_Layer: 0
   m_Name: Plane (6)
   m_TagString: Untagged
@@ -75529,6 +75578,29 @@ MeshFilter:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 756803748}
   m_Mesh: {fileID: 10209, guid: 0000000000000000e000000000000000, type: 0}
+--- !u!114 &756803753
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 756803748}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4c6d2968fb18247c598381ffedbb09b2, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  enableRandomStop: 1
+  areaCollider: {fileID: 756803750}
+  maxAttempts: 24
+  verticalSearchUp: 30
+  verticalSearchDown: 30
+  verticalStep: 0.3
+  navMeshSampleRadius: 0.5
+  horizontalTolerance: 0.25
+  facingTarget: {fileID: 1682974054}
+  facingTurnSpeedDeg: 360
+  enableDebugLogs: 0
 --- !u!1001 &757954526
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -132691,6 +132763,7 @@ GameObject:
   - component: {fileID: 1352480506}
   - component: {fileID: 1352480505}
   - component: {fileID: 1352480504}
+  - component: {fileID: 1352480507}
   m_Layer: 0
   m_Name: Plane (5)
   m_TagString: Untagged
@@ -132785,6 +132858,29 @@ MeshFilter:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1352480502}
   m_Mesh: {fileID: 10209, guid: 0000000000000000e000000000000000, type: 0}
+--- !u!114 &1352480507
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1352480502}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4c6d2968fb18247c598381ffedbb09b2, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  enableRandomStop: 1
+  areaCollider: {fileID: 1352480504}
+  maxAttempts: 24
+  verticalSearchUp: 30
+  verticalSearchDown: 30
+  verticalStep: 0.3
+  navMeshSampleRadius: 0.5
+  horizontalTolerance: 0.25
+  facingTarget: {fileID: 16688691}
+  facingTurnSpeedDeg: 360
+  enableDebugLogs: 0
 --- !u!1001 &1352637308
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -140091,6 +140187,7 @@ GameObject:
   - component: {fileID: 1430246149}
   - component: {fileID: 1430246148}
   - component: {fileID: 1430246147}
+  - component: {fileID: 1430246150}
   m_Layer: 0
   m_Name: Plane (2)
   m_TagString: Untagged
@@ -140185,6 +140282,29 @@ MeshFilter:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1430246145}
   m_Mesh: {fileID: 10209, guid: 0000000000000000e000000000000000, type: 0}
+--- !u!114 &1430246150
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1430246145}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4c6d2968fb18247c598381ffedbb09b2, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  enableRandomStop: 1
+  areaCollider: {fileID: 1430246147}
+  maxAttempts: 24
+  verticalSearchUp: 30
+  verticalSearchDown: 30
+  verticalStep: 0.3
+  navMeshSampleRadius: 0.5
+  horizontalTolerance: 0.25
+  facingTarget: {fileID: 1022418824}
+  facingTurnSpeedDeg: 360
+  enableDebugLogs: 0
 --- !u!1001 &1431355041
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -176660,6 +176780,7 @@ GameObject:
   - component: {fileID: 1823241690}
   - component: {fileID: 1823241689}
   - component: {fileID: 1823241688}
+  - component: {fileID: 1823241691}
   m_Layer: 0
   m_Name: Plane (1)
   m_TagString: Untagged
@@ -176754,6 +176875,29 @@ MeshFilter:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1823241686}
   m_Mesh: {fileID: 10209, guid: 0000000000000000e000000000000000, type: 0}
+--- !u!114 &1823241691
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1823241686}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4c6d2968fb18247c598381ffedbb09b2, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  enableRandomStop: 1
+  areaCollider: {fileID: 1823241688}
+  maxAttempts: 24
+  verticalSearchUp: 30
+  verticalSearchDown: 30
+  verticalStep: 0.3
+  navMeshSampleRadius: 0.5
+  horizontalTolerance: 0.25
+  facingTarget: {fileID: 1236513978}
+  facingTurnSpeedDeg: 360
+  enableDebugLogs: 0
 --- !u!1001 &1825796164
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -200905,6 +201049,7 @@ GameObject:
   - component: {fileID: 2043020301}
   - component: {fileID: 2043020300}
   - component: {fileID: 2043020299}
+  - component: {fileID: 2043020302}
   m_Layer: 0
   m_Name: Plane (4)
   m_TagString: Untagged
@@ -200999,6 +201144,29 @@ MeshFilter:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 2043020297}
   m_Mesh: {fileID: 10209, guid: 0000000000000000e000000000000000, type: 0}
+--- !u!114 &2043020302
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 2043020297}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4c6d2968fb18247c598381ffedbb09b2, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  enableRandomStop: 1
+  areaCollider: {fileID: 2043020299}
+  maxAttempts: 24
+  verticalSearchUp: 30
+  verticalSearchDown: 30
+  verticalStep: 0.3
+  navMeshSampleRadius: 0.5
+  horizontalTolerance: 0.25
+  facingTarget: {fileID: 991351406}
+  facingTurnSpeedDeg: 360
+  enableDebugLogs: 0
 --- !u!1001 &2043416847
 PrefabInstance:
   m_ObjectHideFlags: 0

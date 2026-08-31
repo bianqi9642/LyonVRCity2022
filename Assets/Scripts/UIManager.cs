@@ -8,10 +8,15 @@ using UnityEngine;
 /// - ShowPart3Destination1Panel / ShowPart3Destination2Panel simply show the full panel and return the PanelController.
 ///   They do NOT auto-create shrunk panels anymore.
 /// - Use CreateAndAnchorShrunkPanel(...) to create a shrunk/corner widget (returns the instantiated GameObject).
-///   This method parents the shrunk instance to the camera with worldPositionStays = false and sets local transform
-///   so the size/position are stable and predictable.
+///   This method parents the shrunk instance to the head/camera with worldPositionStays = false and sets local
+///   transform so the size/position are stable and predictable. The shrunk corner widget is INTENTIONALLY
+///   head-locked (it follows the participant) - this is a HUD reminder, not a full instruction panel.
 /// - When instantiating a template, the manager finds PanelController on the clone or its children and passes either
 ///   a fallback message or null to preserve template text (existing behavior).
+/// - Full instruction panels are positioned ONCE, in world space, in front of the participant's CURRENT tracked
+///   head pose at the moment they are shown (see PositionPanelInFront). They are NOT parented to the head and do
+///   NOT follow the participant while visible. The head transform is resolved live per show (ResolveHeadTransform),
+///   never cached, so each show/hide/show cycle re-anchors to the participant's new viewpoint.
 /// </summary>
 public class UIManager : MonoBehaviour
 {
@@ -41,15 +46,21 @@ public class UIManager : MonoBehaviour
     public float panelDistance = 1.2f;
     public Vector3 panelLocalOffset = new Vector3(0f, -0.2f, 0f);
 
+    [Header("Head-anchored placement (all instruction canvases)")]
+    [Tooltip("Explicit tracked-HMD transform used as the placement reference for every instruction panel. " +
+             "Leave empty to fall back to 'hmdCamera', then Camera.main, then any active Camera.")]
+    public Transform headTransformOverride;
+
+    [Tooltip("Place panels using only the participant's horizontal facing (head yaw). " +
+             "Pitch and roll are ignored so the panel remains level.")]
+    public bool placeUsingHeadYawOnly = true;
+
     [Header("Corner (shrunk) placement settings")]
     [Tooltip("Local position relative to camera for the TopRight corner (camera local space).")]
     public Vector3 topRightLocalPos = new Vector3(0.4f, 0.2f, 1.0f);
 
     [Tooltip("Local scale to apply to shrunk (corner) panel instances.")]
     public Vector3 shrunkLocalScale = new Vector3(0.22f, 0.22f, 0.22f);
-
-    // cached transform of the camera (CenterEye)
-    private Transform cameraTransform;
 
     private void Awake()
     {
@@ -58,11 +69,47 @@ public class UIManager : MonoBehaviour
             hmdCamera = Camera.main;
             if (hmdCamera == null)
             {
-                Debug.LogWarning("UIManager: HMD camera not assigned and Camera.main is null. Panels will not position correctly.");
+                Debug.LogWarning("UIManager: HMD camera not assigned and Camera.main is null at Awake. " +
+                                 "A head transform will be resolved on demand when a panel is shown.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Resolve the participant's CURRENT tracked head transform at the moment a panel is shown.
+    /// Priority: explicit headTransformOverride -> hmdCamera -> Camera.main -> first active Camera in the scene.
+    /// Resolved live (never cached) so a late-spawned or re-wired rig is still picked up, and so each
+    /// show/hide/show cycle re-anchors to wherever the participant is actually looking.
+    /// Returns null if nothing usable exists (callers must handle this without breaking the experiment).
+    /// </summary>
+    private Transform ResolveHeadTransform()
+    {
+        if (headTransformOverride != null) return headTransformOverride;
+        if (hmdCamera != null) return hmdCamera.transform;
+
+        Camera cam = Camera.main;
+        if (cam == null)
+        {
+            Camera[] all = Camera.allCameras;
+            for (int i = 0; i < all.Length; i++)
+            {
+                if (all[i] != null && all[i].isActiveAndEnabled)
+                {
+                    cam = all[i];
+                    break;
+                }
             }
         }
 
-        if (hmdCamera != null) cameraTransform = hmdCamera.transform;
+        if (cam != null)
+        {
+            hmdCamera = cam; // remember for next time; does not overwrite an explicit inspector assignment
+            return cam.transform;
+        }
+
+        Debug.LogWarning("UIManager.ResolveHeadTransform: no head/camera transform available. " +
+                         "Panel will be left at its instantiated pose.");
+        return null;
     }
 
     #region Part 1 APIs
@@ -230,8 +277,10 @@ public class UIManager : MonoBehaviour
     }
 
     /// <summary>
-    /// Create a shrunk/corner panel from a shrunk template, anchor it to the camera and return the instance.
-    /// The returned GameObject is parented to the camera and must be destroyed by the caller when no longer needed.
+    /// Create a shrunk/corner panel from a shrunk template, anchor it to the participant's head/camera and return
+    /// the instance. The returned GameObject is parented to the head transform and must be destroyed by the caller
+    /// when no longer needed. This corner widget INTENTIONALLY follows the head (HUD reminder) - unlike the full
+    /// instruction panels, which are world-stationary.
     /// Note: we parent with worldPositionStays=false so we can set localPosition/localScale reliably.
     /// </summary>
     public GameObject CreateAndAnchorShrunkPanel(GameObject shrunkTemplate, Corner corner)
@@ -241,18 +290,20 @@ public class UIManager : MonoBehaviour
             Debug.LogWarning("UIManager.CreateAndAnchorShrunkPanel: shrunkTemplate is null.");
             return null;
         }
-        if (cameraTransform == null)
+
+        Transform head = ResolveHeadTransform();
+        if (head == null)
         {
-            Debug.LogWarning("UIManager.CreateAndAnchorShrunkPanel: cameraTransform is null.");
+            Debug.LogWarning("UIManager.CreateAndAnchorShrunkPanel: no head transform resolved. Shrunk panel not created.");
             return null;
         }
 
-        // Instantiate under UIManager for organization, then parent to camera with worldPositionStays=false so we control local transform.
+        // Instantiate under UIManager for organization, then parent to the head with worldPositionStays=false so we control local transform.
         GameObject instance = Instantiate(shrunkTemplate, this.transform);
         instance.SetActive(true);
 
-        // Parent to camera but set worldPositionStays = false so local transform can be set deterministically.
-        instance.transform.SetParent(cameraTransform, worldPositionStays: false);
+        // Parent to the head but set worldPositionStays = false so local transform can be set deterministically.
+        instance.transform.SetParent(head, worldPositionStays: false);
 
         // Set local position/rotation/scale according to chosen corner
         switch (corner)
@@ -278,8 +329,12 @@ public class UIManager : MonoBehaviour
     }
 
     /// <summary>
-    /// Position a panel transform in front of the camera using panelDistance and a camera-space local offset.
-    /// The panel's rotation is set to face the camera.
+    /// Position a full instruction panel ONCE, in world space, in front of the participant's CURRENT head pose.
+    /// The panel is NOT parented to the head, so it stays fixed in the world for as long as it is visible.
+    /// Every call recomputes from the live head transform, so each show/hide/show cycle re-anchors to the
+    /// participant's new viewpoint. Distance is configurable via 'panelDistance'; 'localOffset' (panelLocalOffset)
+    /// is applied in the facing frame. When 'placeUsingHeadYawOnly' is true the panel is kept level (pitch/roll
+    /// ignored); otherwise the full head forward direction is used, matching the previous behaviour.
     /// </summary>
     private void PositionPanelInFront(Transform panelTransform, Vector3 localOffset)
     {
@@ -288,17 +343,46 @@ public class UIManager : MonoBehaviour
             Debug.LogWarning("UIManager.PositionPanelInFront: panelTransform is null.");
             return;
         }
-        if (cameraTransform == null)
+
+        Transform head = ResolveHeadTransform();
+        if (head == null)
         {
-            Debug.LogWarning("UIManager.PositionPanelInFront: cameraTransform is null. Assign HMD camera.");
+            Debug.LogWarning("UIManager.PositionPanelInFront: no head transform resolved. " +
+                             "Panel left at its instantiated pose.");
             return;
         }
 
-        Vector3 worldPos = cameraTransform.position + cameraTransform.forward * panelDistance + cameraTransform.TransformVector(localOffset);
-        panelTransform.position = worldPos;
+        if (placeUsingHeadYawOnly)
+        {
+            // Level placement: use only the horizontal component of the head forward.
+            Vector3 forward = head.forward;
+            forward.y = 0f;
+            if (forward.sqrMagnitude < 1e-6f)
+            {
+                // Participant looking straight up/down - fall back to head-space forward projected to horizontal.
+                forward = Vector3.ProjectOnPlane(head.up, Vector3.up);
+                if (forward.sqrMagnitude < 1e-6f) forward = Vector3.forward;
+            }
+            forward.Normalize();
 
-        // rotate to face the camera so the front of the panel faces the user
-        panelTransform.rotation = Quaternion.LookRotation(panelTransform.position - cameraTransform.position);
+            Quaternion facing = Quaternion.LookRotation(forward, Vector3.up);
+
+            Vector3 worldPos = head.position + forward * panelDistance + facing * localOffset;
+            panelTransform.position = worldPos;
+
+            // Face the participant, kept perfectly level (project convention: canvas +Z points away from the viewer
+            // along the view direction, which makes the UI readable).
+            panelTransform.rotation = facing;
+        }
+        else
+        {
+            // Full head-forward placement - preserves the original behaviour, now using the live head transform.
+            Vector3 worldPos = head.position + head.forward * panelDistance + head.TransformVector(localOffset);
+            panelTransform.position = worldPos;
+
+            // Rotate to face the camera so the front of the panel faces the user (existing project convention).
+            panelTransform.rotation = Quaternion.LookRotation(panelTransform.position - head.position);
+        }
     }
 
     #endregion

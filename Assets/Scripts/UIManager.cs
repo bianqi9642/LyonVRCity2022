@@ -1,9 +1,10 @@
 using System;
 using UnityEngine;
+using UnityEngine.UI;
 
 /// <summary>
 /// UIManager specialized for the experiment with explicit slots per panel type.
-/// 
+///
 /// IMPORTANT CHANGES:
 /// - ShowPart3Destination1Panel / ShowPart3Destination2Panel simply show the full panel and return the PanelController.
 ///   They do NOT auto-create shrunk panels anymore.
@@ -17,6 +18,10 @@ using UnityEngine;
 ///   head pose at the moment they are shown (see PositionPanelInFront). They are NOT parented to the head and do
 ///   NOT follow the participant while visible. The head transform is resolved live per show (ResolveHeadTransform),
 ///   never cached, so each show/hide/show cycle re-anchors to the participant's new viewpoint.
+/// - PHASE 3 TARGET IMAGE: ExperimentManager calls PrepareDestinationImages(d1Building, d2Building) once, at
+///   Phase 3 start, passing the exact GameObjects it randomly selected. UIManager asks TargetBuildingPreviewGenerator
+///   to render each one to a Texture2D and then displays that texture on a RawImage inside the matching
+///   Destination full panel AND its shrunk panel. UIManager never selects or randomizes a destination.
 /// </summary>
 public class UIManager : MonoBehaviour
 {
@@ -62,6 +67,15 @@ public class UIManager : MonoBehaviour
     [Tooltip("Local scale to apply to shrunk (corner) panel instances.")]
     public Vector3 shrunkLocalScale = new Vector3(0.22f, 0.22f, 0.22f);
 
+    [Header("Phase 3 target-building preview")]
+    [Tooltip("Generator that renders an isolated image of the selected destination building. " +
+             "If left empty it is located with FindObjectOfType at Awake.")]
+    public TargetBuildingPreviewGenerator targetPreviewGenerator;
+
+    // Runtime images for the current Phase 3 session. Owned by this component; destroyed on regeneration and OnDestroy.
+    private Texture2D destination1Image;
+    private Texture2D destination2Image;
+
     private void Awake()
     {
         if (hmdCamera == null)
@@ -73,6 +87,16 @@ public class UIManager : MonoBehaviour
                                  "A head transform will be resolved on demand when a panel is shown.");
             }
         }
+
+        if (targetPreviewGenerator == null)
+        {
+            targetPreviewGenerator = FindObjectOfType<TargetBuildingPreviewGenerator>();
+        }
+    }
+
+    private void OnDestroy()
+    {
+        DestroyDestinationImages();
     }
 
     /// <summary>
@@ -111,6 +135,71 @@ public class UIManager : MonoBehaviour
                          "Panel will be left at its instantiated pose.");
         return null;
     }
+
+    #region Phase 3 target-image API
+
+    /// <summary>
+    /// Called ONCE by ExperimentManager at Phase 3 start, with the exact GameObjects it randomly selected
+    /// for Destination 1 and Destination 2 (both still inactive / off-screen at this point). UIManager
+    /// renders a clean isolated image of each and holds them for the D1/D2 full + shrunk panels.
+    /// UIManager performs NO selection or randomization of its own.
+    /// </summary>
+    public void PrepareDestinationImages(GameObject destination1Building, GameObject destination2Building)
+    {
+        DestroyDestinationImages();
+
+        if (targetPreviewGenerator == null)
+        {
+            targetPreviewGenerator = FindObjectOfType<TargetBuildingPreviewGenerator>();
+        }
+
+        if (targetPreviewGenerator == null)
+        {
+            Debug.LogWarning("UIManager.PrepareDestinationImages: no TargetBuildingPreviewGenerator found. " +
+                             "Destination panels will show text only.");
+            return;
+        }
+
+        destination1Image = (destination1Building != null) ? targetPreviewGenerator.CapturePreview(destination1Building) : null;
+        destination2Image = (destination2Building != null) ? targetPreviewGenerator.CapturePreview(destination2Building) : null;
+    }
+
+    private void DestroyDestinationImages()
+    {
+        if (destination1Image != null) { Destroy(destination1Image); destination1Image = null; }
+        if (destination2Image != null) { Destroy(destination2Image); destination2Image = null; }
+    }
+
+    /// <summary>
+    /// Find the first RawImage in the instantiated panel (the one added to the destination templates) and
+    /// show 'tex' on it. If 'tex' is null the RawImage GameObject is hidden so no broken white box appears.
+    /// </summary>
+    private void ApplyDestinationImage(GameObject panelInstance, Texture2D tex)
+    {
+        if (panelInstance == null) return;
+
+        RawImage raw = panelInstance.GetComponentInChildren<RawImage>(true);
+        if (raw == null)
+        {
+            if (tex != null)
+                Debug.LogWarning("UIManager.ApplyDestinationImage: panel '" + panelInstance.name +
+                                 "' has no RawImage child; add one to the destination panel template.");
+            return;
+        }
+
+        if (tex != null)
+        {
+            raw.texture = tex;
+            raw.color = Color.white;
+            if (!raw.gameObject.activeSelf) raw.gameObject.SetActive(true);
+        }
+        else
+        {
+            raw.gameObject.SetActive(false);
+        }
+    }
+
+    #endregion
 
     #region Part 1 APIs
 
@@ -158,20 +247,20 @@ public class UIManager : MonoBehaviour
     }
 
     /// <summary>
-    /// Show the Destination 1 full panel and return its PanelController for the caller to provide callback.
-    /// Note: UIManager will NOT auto-create the shrunk panel now. Caller should call CreateAndAnchorShrunkPanel when needed.
+    /// Show the Destination 1 full panel (with the prepared D1 building image) and return its PanelController.
+    /// UIManager will NOT auto-create the shrunk panel. Caller calls CreateAndAnchorShrunkPanel when needed.
     /// </summary>
     public PanelController ShowPart3Destination1Panel(Action onConfirm)
     {
-        return ShowFullPanelAndReturnController(part3Dest1FullTemplate, "Destination 1", onConfirm);
+        return ShowFullPanelAndReturnController(part3Dest1FullTemplate, "Destination 1", onConfirm, destination1Image);
     }
 
     /// <summary>
-    /// Show the Destination 2 full panel and return its PanelController for the caller to provide callback.
+    /// Show the Destination 2 full panel (with the prepared D2 building image) and return its PanelController.
     /// </summary>
     public PanelController ShowPart3Destination2Panel(Action onConfirm)
     {
-        return ShowFullPanelAndReturnController(part3Dest2FullTemplate, "Destination 2", onConfirm);
+        return ShowFullPanelAndReturnController(part3Dest2FullTemplate, "Destination 2", onConfirm, destination2Image);
     }
 
     public void ShowPart3EndPanel(Action onConfirm)
@@ -226,9 +315,10 @@ public class UIManager : MonoBehaviour
 
     /// <summary>
     /// Instantiate the provided template and return the PanelController so the caller can handle the confirm callback.
-    /// The created full panel is positioned in front of the camera.
+    /// The created full panel is positioned in front of the camera. If 'destinationImage' is non-null it is applied
+    /// to the first RawImage in the instantiated panel (used by the Phase 3 destination panels).
     /// </summary>
-    private PanelController ShowFullPanelAndReturnController(GameObject template, string fallbackMessage, Action onConfirm)
+    private PanelController ShowFullPanelAndReturnController(GameObject template, string fallbackMessage, Action onConfirm, Texture2D destinationImage = null)
     {
         if (template == null)
         {
@@ -247,6 +337,7 @@ public class UIManager : MonoBehaviour
         {
             Debug.LogWarning("UIManager.ShowFullPanelAndReturnController: no PanelController found.");
             PositionPanelInFront(instance.transform, panelLocalOffset);
+            ApplyDestinationImage(instance, destinationImage);
             onConfirm?.Invoke();
             return null;
         }
@@ -259,6 +350,7 @@ public class UIManager : MonoBehaviour
 
         pc.Setup(textToPass, onConfirm, showCancel: false);
         PositionPanelInFront(instance.transform, panelLocalOffset);
+        ApplyDestinationImage(instance, destinationImage);
         return pc;
     }
 
@@ -281,6 +373,8 @@ public class UIManager : MonoBehaviour
     /// the instance. The returned GameObject is parented to the head transform and must be destroyed by the caller
     /// when no longer needed. This corner widget INTENTIONALLY follows the head (HUD reminder) - unlike the full
     /// instruction panels, which are world-stationary.
+    /// If the shrunk template is one of the Phase 3 destination-shrunk templates, the matching prepared destination
+    /// image is applied to the first RawImage in the instance so the shrunk HUD shows the same picture as the full panel.
     /// Note: we parent with worldPositionStays=false so we can set localPosition/localScale reliably.
     /// </summary>
     public GameObject CreateAndAnchorShrunkPanel(GameObject shrunkTemplate, Corner corner)
@@ -324,6 +418,10 @@ public class UIManager : MonoBehaviour
 
         instance.transform.localRotation = Quaternion.identity;
         instance.transform.localScale = shrunkLocalScale;
+
+        // Show the matching destination image on the shrunk HUD (same texture as the full panel).
+        if (shrunkTemplate == part3Dest1ShrunkTemplate) ApplyDestinationImage(instance, destination1Image);
+        else if (shrunkTemplate == part3Dest2ShrunkTemplate) ApplyDestinationImage(instance, destination2Image);
 
         return instance;
     }

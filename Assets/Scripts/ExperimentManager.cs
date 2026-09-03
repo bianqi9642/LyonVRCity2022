@@ -1,7 +1,5 @@
 using System;
 using System.Collections;
-using System.Globalization;
-using System.IO;
 using UnityEngine;
 
 /// <summary>
@@ -9,51 +7,46 @@ using UnityEngine;
 ///
 /// Part 1 / Part 2: unchanged.
 ///
-/// Part 3 (15-minute Main Experimental Phase) - redesigned:
+/// Part 3 (15-minute Main Experimental Phase):
 ///  - The participant's assigned group (1..12, from ExternalSessionController.part3GroupIndex, 0-based)
-///    is looked up in a fixed table that yields (StartZone, Destination1Zone, Destination2Zone),
-///    where each zone is one of GE / GU / OE / OU.
-///  - StartZone selects one of four FIXED start Transforms (part3StartGE/GU/OE/OU). The participant is
-///    explicitly teleported there via the existing TeleportPlayerTo(...) mechanism. Phase 3 never leaves
-///    the participant at a previous position.
-///  - Destination1Zone / Destination2Zone each have exactly two candidate buildings
-///    (part3ZoneXX.buildingA / buildingB). Exactly ONE building per destination is chosen RANDOMLY and
-///    INDEPENDENTLY per session (UnityEngine.Random), then kept fixed for the whole session (stored in
-///    coroutine locals; never re-rolled).
-///  - VISIBILITY vs INTERACTABILITY vs TARGET ASSIGNMENT are three separate concepts:
-///      * Visibility: candidate buildings are permanent, always-visible scene objects. This script NEVER
-///        calls SetActive / disables a Renderer / changes a Layer on them. Both A and B stay visible at
-///        all times.
-///      * Interactability: at any moment ONLY the currently-assigned destination building has its
-///        TargetSelectable AND InteractableHoverFeedback components enabled. Every other candidate - and
-///        both candidates outside their sub-phase, and every candidate before/after Phase 3 - has those
-///        two components disabled, so it behaves EXACTLY like an ordinary building: visible, the ray
-///        passes over it, no target hover feedback, and clicking it calls nothing.
-///      * Target assignment: the random pick decides which building becomes interactable. It does NOT
-///        decide which building is visible.
-///  - A Destination sub-phase ends when the participant clicks the assigned building. As a defensive
-///    check the clicked targetId is also compared against the assignment, and every click is logged.
-///  - Timing: Destination 1 search is capped at part3Destination1MaxSeconds (protocol: 600 s / 10 min),
-///    measured from the moment its instruction panel is confirmed; if it is found earlier the phase
-///    proceeds immediately. The whole phase is capped at part3TotalMaxSeconds (protocol: 900 s / 15 min),
-///    measured from the moment the Start panel is confirmed. Destination 2 never runs past that ceiling.
-///  - A self-contained per-session CSV (subject_Part3_Session_UTC.csv in persistentDataPath) records the
-///    group, zones, chosen buildings and outcomes. It does NOT touch GazeRecorder / TrajectoryRecorder.
+///    is looked up in a fixed table that yields (StartZone, Destination1Zone, Destination2Zone).
+///  - StartZone selects one of four FIXED start Transforms. The participant is teleported there.
+///  - Destination1Zone / Destination2Zone each have exactly two candidate buildings; exactly ONE per
+///    destination is chosen RANDOMLY and INDEPENDENTLY per session and kept fixed (coroutine locals).
+///  - VISIBILITY vs INTERACTABILITY vs TARGET ASSIGNMENT remain three separate concepts (unchanged).
+///  - Timing: D1 search capped at part3Destination1MaxSeconds; whole phase capped at part3TotalMaxSeconds.
 ///
-/// OnTrialStart / OnTrialEnd still fire exactly once each (after the Start panel is confirmed, and once
-/// the timed phase ends), so the recorders are unaffected.
+/// DATA CAPTURE (Revision 2):
+///  - The old standalone Part 3 CSV ({subj}_Part3_Session_{UTC}.csv) has been REMOVED. AppendPart3Log(...)
+///    no longer performs any file I/O; it now only raises OnExperimentEvent, which DataCaptureManager
+///    records into the single authoritative events.csv.
+///  - New OnExperimentEvent + a small set of additive RaiseEvt(...) hooks let the pure-observer
+///    DataCaptureManager reconstruct part/phase structure, panels, teleports, target assignment,
+///    candidate interactability and Part 3 outcomes.
+///  - NONE of the Part 3 scoring/control logic changed: target assignment, random selection, D1/D2
+///    logic, 'correct', d1Found, d2Found, timeout handling, the 10-minute D1 cap, the 15-minute total
+///    cap, d2Ran, endReason, candidate interactability windows, panel gating, OnTrialStart/OnTrialEnd
+///    and the coroutine yield structure are all identical to before.
+///
+/// OnTrialStart / OnTrialEnd still fire exactly once each.
 /// </summary>
 public class ExperimentManager : MonoBehaviour
 {
     public event Action OnTrialStart;
     public event Action OnTrialEnd;
 
+    /// <summary>Additive observer event for the data-capture layer (Revision 2). Never affects control flow.</summary>
+    public event Action<ExperimentEventInfo> OnExperimentEvent;
+
+    /// <summary>Coarse Part 3 sub-phase label ("idle" / "d1_pending" / "d1_search" / "d2_pending" / "d2_search" / "ended").</summary>
+    public string CurrentPhase { get; private set; } = "idle";
+
     [Header("References")]
-    public UIManager uiManager;                        // assign in inspector (explicit-slot UIManager)
-    public ExternalSessionController sessionController;// session config (participant ID, groups, selected part)
-    public Transform playerRig;                        // XR Rig / XR Origin that we teleport
-    public SpawnerManager spawner;                     // optional - assign your spawner
-    public AgentProfile currentProfile;                // your profile object
+    public UIManager uiManager;
+    public ExternalSessionController sessionController;
+    public Transform playerRig;
+    public SpawnerManager spawner;
+    public AgentProfile currentProfile;
 
     [Header("Part durations (seconds)")]
     public float part1Duration = 60f;
@@ -70,10 +63,6 @@ public class ExperimentManager : MonoBehaviour
     [Header("Part2 - group configuration")]
     public Part2Group[] part2Groups;
 
-    // ---------------------------------------------------------------------------------------------
-    // Part 3 configuration (15-minute Main Experimental Phase)
-    // ---------------------------------------------------------------------------------------------
-
     /// <summary>The four Phase 3 zones. GE = Grid Explored, GU = Grid Unexplored, OE = Organic Explored, OU = Organic Unexplored.</summary>
     public enum Part3Zone { GE, GU, OE, OU }
 
@@ -89,13 +78,9 @@ public class ExperimentManager : MonoBehaviour
     }
 
     [Header("Part3 - fixed start points (one per zone)")]
-    [Tooltip("Fixed Transform for a participant starting in the Grid Explored zone (scene object 'StartPointGE').")]
     public Transform part3StartGE;
-    [Tooltip("Fixed Transform for a participant starting in the Grid Unexplored zone (scene object 'StartPointGU').")]
     public Transform part3StartGU;
-    [Tooltip("Fixed Transform for a participant starting in the Organic Explored zone (scene object 'StartPointOE').")]
     public Transform part3StartOE;
-    [Tooltip("Fixed Transform for a participant starting in the Organic Unexplored zone (scene object 'StartPointOU').")]
     public Transform part3StartOU;
 
     [Header("Part3 - candidate destination buildings (exactly 2 per zone)")]
@@ -105,14 +90,10 @@ public class ExperimentManager : MonoBehaviour
     public Part3ZoneTargets part3ZoneOU = new Part3ZoneTargets();
 
     [Header("Part3 - timing")]
-    [Tooltip("Maximum time (seconds) to search for Destination 1, measured from when its instruction panel is confirmed. Protocol: 600 (10 minutes). If found earlier, Destination 2 starts immediately.")]
+    [Tooltip("Maximum time (seconds) to search for Destination 1, measured from when its instruction panel is confirmed. Protocol: 600 (10 minutes).")]
     public float part3Destination1MaxSeconds = 600f;
-    [Tooltip("Maximum total Phase 3 duration (seconds), measured from when the Start panel is confirmed. Protocol: 900 (15 minutes). Destination 2 never runs past this ceiling.")]
+    [Tooltip("Maximum total Phase 3 duration (seconds), measured from when the Start panel is confirmed. Protocol: 900 (15 minutes).")]
     public float part3TotalMaxSeconds = 900f;
-
-    [Header("Part3 - logging")]
-    [Tooltip("If true, write a per-session Phase 3 assignment/outcome CSV to Application.persistentDataPath.")]
-    public bool part3WriteSessionLog = true;
 
     [Serializable]
     public class Part2Group
@@ -137,7 +118,6 @@ public class ExperimentManager : MonoBehaviour
     }
 
     // Fixed group -> (start zone, destination 1 zone, destination 2 zone). Index 0 == Group 1.
-    // Taken verbatim from the study protocol - do not reorder or alter.
     private static readonly Part3GroupDef[] Part3GroupTable =
     {
         new Part3GroupDef(Part3Zone.GE, Part3Zone.GU, Part3Zone.OE), // Group 1
@@ -158,7 +138,6 @@ public class ExperimentManager : MonoBehaviour
     private Coroutine runningCoroutine;
     private bool targetWasSelected;
     private object lastSelectedTargetData;
-    private string part3LogPath;
 
     private enum RunningPart { None, Part1, Part2, Part3 }
     private RunningPart currentRunningPart = RunningPart.None;
@@ -173,8 +152,7 @@ public class ExperimentManager : MonoBehaviour
     private void Start()
     {
         // Baseline: every Phase 3 candidate building must behave as an ordinary (non-interactable) building
-        // until Phase 3 assigns it as a destination. This is unconditional so Part 1 / Part 2 / Practice /
-        // Exploration interaction is never affected by these buildings. Visibility is NOT touched here.
+        // until Phase 3 assigns it as a destination. Visibility is NOT touched here.
         SetAllPart3CandidatesInteractable(false);
 
         if (sessionController != null && sessionController.autoStart)
@@ -193,15 +171,9 @@ public class ExperimentManager : MonoBehaviour
 
         switch (sessionController.selectedPart)
         {
-            case ExternalSessionController.ExperimentPart.Part1:
-                StartPart1();
-                break;
-            case ExternalSessionController.ExperimentPart.Part2:
-                StartPart2();
-                break;
-            case ExternalSessionController.ExperimentPart.Part3:
-                StartPart3();
-                break;
+            case ExternalSessionController.ExperimentPart.Part1: StartPart1(); break;
+            case ExternalSessionController.ExperimentPart.Part2: StartPart2(); break;
+            case ExternalSessionController.ExperimentPart.Part3: StartPart3(); break;
         }
     }
 
@@ -248,12 +220,14 @@ public class ExperimentManager : MonoBehaviour
     private IEnumerator RunPart1()
     {
         currentRunningPart = RunningPart.Part1;
+        RaiseEvt("part_start", "Part1");
 
         ConfigureTargetsForPart1();
         TeleportPlayerTo(part1StartPosition);
 
         bool started = false;
-        uiManager.ShowPart1StartPanel(() => started = true);
+        RaiseEvt("panel_shown", "Part1", label: "part1_start");
+        uiManager.ShowPart1StartPanel(() => { started = true; RaiseEvt("panel_confirmed", "Part1", label: "part1_start"); });
         yield return new WaitUntil(() => started);
 
         if (spawner != null) spawner.defaultProfile = currentProfile;
@@ -269,15 +243,18 @@ public class ExperimentManager : MonoBehaviour
 
         OnTrialEnd?.Invoke();
         bool confirmed = false;
-        uiManager.ShowPart1EndPanel(() => confirmed = true);
+        RaiseEvt("panel_shown", "Part1", label: "part1_end");
+        uiManager.ShowPart1EndPanel(() => { confirmed = true; RaiseEvt("panel_confirmed", "Part1", label: "part1_end"); });
         yield return new WaitUntil(() => confirmed);
 
+        RaiseEvt("part_end", "Part1");
         currentRunningPart = RunningPart.None;
     }
 
     private IEnumerator RunPart2()
     {
         currentRunningPart = RunningPart.Part2;
+        RaiseEvt("part_start", "Part2");
 
         int gIdx = (sessionController != null) ? sessionController.part2GroupIndex : 0;
         if (part2Groups == null || part2Groups.Length == 0)
@@ -294,7 +271,8 @@ public class ExperimentManager : MonoBehaviour
         TeleportPlayerTo(chosenStart);
 
         bool started = false;
-        uiManager.ShowPart2StartPanel(() => started = true);
+        RaiseEvt("panel_shown", "Part2", label: "part2_start");
+        uiManager.ShowPart2StartPanel(() => { started = true; RaiseEvt("panel_confirmed", "Part2", label: "part2_start"); });
         yield return new WaitUntil(() => started);
 
         if (spawner != null) spawner.defaultProfile = currentProfile;
@@ -309,8 +287,10 @@ public class ExperimentManager : MonoBehaviour
         }
 
         bool teleported = false;
+        RaiseEvt("panel_shown", "Part2", label: "part2_continue");
         uiManager.ShowPart2ContinuePanel(() =>
         {
+            RaiseEvt("panel_confirmed", "Part2", label: "part2_continue");
             TeleportPlayerTo(chosenTeleport ?? (group.teleportPositions != null && group.teleportPositions.Length > 0 ? group.teleportPositions[0] : null));
             teleported = true;
         });
@@ -326,18 +306,21 @@ public class ExperimentManager : MonoBehaviour
 
         OnTrialEnd?.Invoke();
         bool confirmed = false;
-        uiManager.ShowPart2EndPanel(() => confirmed = true);
+        RaiseEvt("panel_shown", "Part2", label: "part2_end");
+        uiManager.ShowPart2EndPanel(() => { confirmed = true; RaiseEvt("panel_confirmed", "Part2", label: "part2_end"); });
         yield return new WaitUntil(() => confirmed);
 
+        RaiseEvt("part_end", "Part2");
         currentRunningPart = RunningPart.None;
     }
 
     private IEnumerator RunPart3()
     {
         currentRunningPart = RunningPart.Part3;
+        RaiseEvt("part_start", "Part3");
+        SetPhase("idle");
 
         // Clean slate: no candidate is interactable (covers a re-run after an interrupted previous Phase 3).
-        // Visibility is never touched.
         SetAllPart3CandidatesInteractable(false);
 
         // --- 1. Resolve the participant's group (index 0..11 -> Group 1..12). ---
@@ -363,10 +346,7 @@ public class ExperimentManager : MonoBehaviour
             Debug.LogError($"[ExperimentManager] Part3 start point for zone {def.StartZone} is not assigned in the inspector. The participant will NOT be moved for this session.");
         }
 
-        // --- 3. Independently pick ONE building from each destination zone. Fixed for the whole session.
-        //        NOTE: candidate buildings are NEVER activated/deactivated/re-layered by this script - they
-        //        are permanent, always-visible scene objects. Selection only assigns which one is the
-        //        interactable target for its sub-phase. ---
+        // --- 3. Independently pick ONE building from each destination zone. Fixed for the whole session. ---
         GameObject destination1Building = ChoosePart3Building(d1ZoneTargets);
         GameObject destination2Building = ChoosePart3Building(d2ZoneTargets);
 
@@ -384,18 +364,13 @@ public class ExperimentManager : MonoBehaviour
         if (!d2RequireCorrect)
             Debug.LogError("[ExperimentManager] Part3 Destination 2 building has no TargetSelectable.targetId; any building click will end Destination 2.");
 
-        // --- 3b. Generate the target-building preview images for BOTH destinations. UIManager ->
-        //         TargetBuildingPreviewGenerator renders each of these exact GameObjects (no second
-        //         randomization) to a static Texture2D for the Destination full + shrunk panels.
-        //         Synchronous; restores all state; independent of interactability; does not affect the
-        //         VR view and does not make any building disappear. ---
+        // --- 3b. Generate the target-building preview images for BOTH destinations. ---
         if (uiManager != null)
         {
             uiManager.PrepareDestinationImages(destination1Building, destination2Building);
         }
 
-        // --- 4. Hide the Part 1 test targets only (they must not be clickable during Phase 3).
-        //        Phase 3 candidate buildings are left exactly as authored - always visible. ---
+        // --- 4. Hide the Part 1 test targets only (they must not be clickable during Phase 3). ---
         if (part1TargetBuildings != null)
         {
             foreach (var go in part1TargetBuildings)
@@ -405,33 +380,39 @@ public class ExperimentManager : MonoBehaviour
         // --- 5. Move the participant to the fixed start point (existing mechanism). ---
         TeleportPlayerTo(startPoint);
 
-        // --- 6. Persist the assignment immediately (crash-safe). ---
-        if (part3WriteSessionLog)
-        {
-            part3LogPath = BuildPart3LogPath();
-            AppendPart3Log("assigned", groupNumber, def, startPoint, destination1Building, destination2Building,
-                selectedId: "", found: false, elapsedSeconds: 0.0, notes: "");
-        }
+        // --- 6. Persist the assignment immediately via the capture event (legacy CSV removed). ---
+        AppendPart3Log("assigned", groupNumber, def, startPoint, destination1Building, destination2Building,
+            selectedId: "", found: false, elapsedSeconds: 0.0, notes: "");
 
         // --- 7. Phase 3 Start panel. (All candidates are still non-interactable ordinary buildings.) ---
         bool started = false;
-        uiManager.ShowPart3StartPanel(() => started = true);
+        RaiseEvt("panel_shown", "Part3", label: "part3_start");
+        uiManager.ShowPart3StartPanel(() => { started = true; RaiseEvt("panel_confirmed", "Part3", label: "part3_start"); });
         yield return new WaitUntil(() => started);
 
         if (spawner != null) spawner.defaultProfile = currentProfile;
         OnTrialStart?.Invoke();
+        SetPhase("d1_pending");
 
         double phaseStartRealtime = Time.realtimeSinceStartupAsDouble;
 
         // ============================ DESTINATION 1 ============================
         bool dest1Confirmed = false;
-        uiManager.ShowPart3Destination1Panel(() => dest1Confirmed = true);
+        RaiseEvt("destination_shown", "Part3", label: "D1");
+        RaiseEvt("panel_shown", "Part3", label: "part3_dest1");
+        uiManager.ShowPart3Destination1Panel(() =>
+        {
+            dest1Confirmed = true;
+            RaiseEvt("panel_confirmed", "Part3", label: "part3_dest1");
+            RaiseEvt("destination_confirmed", "Part3", label: "D1");
+        });
         yield return new WaitUntil(() => dest1Confirmed);
+        SetPhase("d1_search");
 
         // Destination 1 assigned: make ONLY destination1Building interactable (TargetSelectable + hover).
-        // Everything else stays a plain visible building.
         SetAllPart3CandidatesInteractable(false);
         SetCandidateInteractable(destination1Building, true);
+        RaiseEvt("candidate_interactable_on", "Part3", label: "D1", building: destination1Building);
 
         GameObject dest1ShrunkInstance = null;
         if (uiManager != null && uiManagerHasShrunkTemplate())
@@ -451,18 +432,14 @@ public class ExperimentManager : MonoBehaviour
                 string clickedId = lastSelectedTargetData != null ? lastSelectedTargetData.ToString() : "";
                 bool correct = d1RequireCorrect ? (clickedId == d1AssignedId) : true;
 
-                if (part3WriteSessionLog)
-                {
-                    AppendPart3Log("d1_click", groupNumber, def, startPoint, destination1Building, destination2Building,
-                        selectedId: clickedId, found: correct,
-                        elapsedSeconds: Time.realtimeSinceStartupAsDouble - d1StartRealtime,
-                        notes: correct ? "correct" : "wrong_building");
-                }
+                AppendPart3Log("d1_click", groupNumber, def, startPoint, destination1Building, destination2Building,
+                    selectedId: clickedId, found: correct,
+                    elapsedSeconds: Time.realtimeSinceStartupAsDouble - d1StartRealtime,
+                    notes: correct ? "correct" : "wrong_building");
 
                 if (correct) d1Found = true;
 
                 // Consume the click. A wrong-building click does NOT end the sub-phase and shows no feedback.
-                // (With only destination1Building interactable, this defensive branch should never be hit.)
                 targetWasSelected = false;
                 lastSelectedTargetData = null;
             }
@@ -477,13 +454,11 @@ public class ExperimentManager : MonoBehaviour
 
         // Destination 1 finished: the D1 target is a plain non-interactable building again.
         SetCandidateInteractable(destination1Building, false);
+        RaiseEvt("candidate_interactable_off", "Part3", label: "D1", building: destination1Building);
 
-        if (part3WriteSessionLog)
-        {
-            AppendPart3Log("d1_result", groupNumber, def, startPoint, destination1Building, destination2Building,
-                selectedId: d1SelectedId, found: d1Found, elapsedSeconds: d1Elapsed,
-                notes: d1Found ? "found" : (totalTimeUpAfterD1 ? "total_time_reached" : "d1_timeout_10min"));
-        }
+        AppendPart3Log("d1_result", groupNumber, def, startPoint, destination1Building, destination2Building,
+            selectedId: d1SelectedId, found: d1Found, elapsedSeconds: d1Elapsed,
+            notes: d1Found ? "found" : (totalTimeUpAfterD1 ? "total_time_reached" : "d1_timeout_10min"));
 
         // ============================ DESTINATION 2 ============================
         bool d2Ran = false;
@@ -494,14 +469,24 @@ public class ExperimentManager : MonoBehaviour
         if ((Time.realtimeSinceStartupAsDouble - phaseStartRealtime) < part3TotalMaxSeconds)
         {
             d2Ran = true;
+            SetPhase("d2_pending");
 
             bool dest2Confirmed = false;
-            uiManager.ShowPart3Destination2Panel(() => dest2Confirmed = true);
+            RaiseEvt("destination_shown", "Part3", label: "D2");
+            RaiseEvt("panel_shown", "Part3", label: "part3_dest2");
+            uiManager.ShowPart3Destination2Panel(() =>
+            {
+                dest2Confirmed = true;
+                RaiseEvt("panel_confirmed", "Part3", label: "part3_dest2");
+                RaiseEvt("destination_confirmed", "Part3", label: "D2");
+            });
             yield return new WaitUntil(() => dest2Confirmed);
+            SetPhase("d2_search");
 
             // Destination 2 assigned: make ONLY destination2Building interactable.
             SetAllPart3CandidatesInteractable(false);
             SetCandidateInteractable(destination2Building, true);
+            RaiseEvt("candidate_interactable_on", "Part3", label: "D2", building: destination2Building);
 
             GameObject dest2ShrunkInstance = null;
             if (uiManager != null && uiManagerHasShrunkTemplatePart2())
@@ -519,13 +504,10 @@ public class ExperimentManager : MonoBehaviour
                     string clickedId = lastSelectedTargetData != null ? lastSelectedTargetData.ToString() : "";
                     bool correct = d2RequireCorrect ? (clickedId == d2AssignedId) : true;
 
-                    if (part3WriteSessionLog)
-                    {
-                        AppendPart3Log("d2_click", groupNumber, def, startPoint, destination1Building, destination2Building,
-                            selectedId: clickedId, found: correct,
-                            elapsedSeconds: Time.realtimeSinceStartupAsDouble - d2StartRealtime,
-                            notes: correct ? "correct" : "wrong_building");
-                    }
+                    AppendPart3Log("d2_click", groupNumber, def, startPoint, destination1Building, destination2Building,
+                        selectedId: clickedId, found: correct,
+                        elapsedSeconds: Time.realtimeSinceStartupAsDouble - d2StartRealtime,
+                        notes: correct ? "correct" : "wrong_building");
 
                     if (correct) d2Found = true;
 
@@ -542,6 +524,7 @@ public class ExperimentManager : MonoBehaviour
 
             // Destination 2 finished: the D2 target is a plain non-interactable building again.
             SetCandidateInteractable(destination2Building, false);
+            RaiseEvt("candidate_interactable_off", "Part3", label: "D2", building: destination2Building);
         }
         else
         {
@@ -557,24 +540,23 @@ public class ExperimentManager : MonoBehaviour
             (d2Found) ? "d2_found_d1_missed" :
             "d2_not_found";
 
-        if (part3WriteSessionLog)
-        {
-            AppendPart3Log(d2Ran ? "d2_result" : "d2_skipped", groupNumber, def, startPoint, destination1Building, destination2Building,
-                selectedId: d2SelectedId, found: d2Found, elapsedSeconds: d2Elapsed, notes: endReason);
-            AppendPart3Log("phase_end", groupNumber, def, startPoint, destination1Building, destination2Building,
-                selectedId: "", found: (d1Found && d2Found), elapsedSeconds: phaseTotalElapsed, notes: endReason);
-        }
+        AppendPart3Log(d2Ran ? "d2_result" : "d2_skipped", groupNumber, def, startPoint, destination1Building, destination2Building,
+            selectedId: d2SelectedId, found: d2Found, elapsedSeconds: d2Elapsed, notes: endReason);
+        AppendPart3Log("phase_end", groupNumber, def, startPoint, destination1Building, destination2Building,
+            selectedId: "", found: (d1Found && d2Found), elapsedSeconds: phaseTotalElapsed, notes: endReason);
 
         OnTrialEnd?.Invoke();
+        SetPhase("ended");
 
-        // Phase 3 is over: no Phase 3 target-specific interaction remains anywhere. Every candidate is a
-        // plain visible building again.
+        // Phase 3 is over: no Phase 3 target-specific interaction remains anywhere.
         SetAllPart3CandidatesInteractable(false);
 
         bool confirmed = false;
-        uiManager.ShowPart3EndPanel(() => confirmed = true);
+        RaiseEvt("panel_shown", "Part3", label: "part3_end");
+        uiManager.ShowPart3EndPanel(() => { confirmed = true; RaiseEvt("panel_confirmed", "Part3", label: "part3_end"); });
         yield return new WaitUntil(() => confirmed);
 
+        RaiseEvt("part_end", "Part3");
         currentRunningPart = RunningPart.None;
     }
     #endregion
@@ -583,8 +565,6 @@ public class ExperimentManager : MonoBehaviour
 
     private void ConfigureTargetsForPart1()
     {
-        // Phase 3 candidate buildings are permanent, always-visible scene objects and are NOT touched here.
-        // Enable all Part 1 target buildings.
         if (part1TargetBuildings != null)
         {
             foreach (var go in part1TargetBuildings)
@@ -597,6 +577,12 @@ public class ExperimentManager : MonoBehaviour
     private void TeleportPlayerTo(Transform dest)
     {
         if (dest == null || playerRig == null) return;
+
+        // Data-capture observer hook (Revision 2): announce the teleport with the raw pre/post positions
+        // BEFORE the assignment, so trajectory analysis can preserve the discontinuity. Mechanics unchanged.
+        Vector3 fromPos = playerRig.position;
+        RaiseEvt("teleport", stringValue: dest.name, fromPos: fromPos, toPos: dest.position);
+
         playerRig.position = dest.position;
         playerRig.rotation = dest.rotation;
     }
@@ -651,8 +637,7 @@ public class ExperimentManager : MonoBehaviour
 
     /// <summary>
     /// Return the TargetSelectable.targetId of the given building (checked on the object itself and its
-    /// children), or null if there is no TargetSelectable. Used only as a defensive check that the clicked
-    /// building is the assigned one - this method never modifies TargetSelectable or any building state.
+    /// children), or null if there is no TargetSelectable. Never modifies TargetSelectable or building state.
     /// </summary>
     private string GetAssignedTargetId(GameObject building)
     {
@@ -665,21 +650,7 @@ public class ExperimentManager : MonoBehaviour
     }
 
     /// <summary>
-    /// Enable or disable the two interaction components on ONE candidate building. Visibility is NEVER
-    /// touched: the GameObject stays active, the Renderer stays enabled, the Collider stays enabled, and
-    /// the Layer is unchanged.
-    ///
-    /// interactable == true  : TargetSelectable.enabled = true  (EventSystem delivers OnPointerClick ->
-    ///                         Select() -> RegisterTargetSelection), InteractableHoverFeedback.enabled =
-    ///                         true (subtle hover brightness on the controller ray).
-    /// interactable == false : both components disabled. The EventSystem skips any component whose
-    ///                         isActiveAndEnabled is false, so the building fires no target-selection
-    ///                         event and shows no target hover feedback - it behaves exactly like an
-    ///                         ordinary building. InteractableHoverFeedback.OnDisable restores its
-    ///                         original appearance if it was mid-hover.
-    ///
-    /// TargetSelectable has no OnEnable/OnDisable and no event registration; its Start() (which resolves
-    /// experimentManager) runs on first enable and is never re-run, so toggling 'enabled' is safe.
+    /// Enable or disable the two interaction components on ONE candidate building. Visibility is NEVER touched.
     /// </summary>
     private void SetCandidateInteractable(GameObject building, bool interactable)
     {
@@ -711,7 +682,6 @@ public class ExperimentManager : MonoBehaviour
         SetZoneCandidatesInteractable(part3ZoneOU, interactable);
     }
 
-    // small helpers to avoid compile error in this file (we rely on uiManager's public fields)
     private bool uiManagerHasShrunkTemplate()
     {
         return uiManager != null && uiManager.part3Dest1ShrunkTemplate != null;
@@ -722,81 +692,119 @@ public class ExperimentManager : MonoBehaviour
         return uiManager != null && uiManager.part3Dest2ShrunkTemplate != null;
     }
 
-    // ---- Part 3 per-session log --------------------------------------------------------------
+    // ---- Part 3 outcome sink (Revision 2: raises OnExperimentEvent, NO file I/O) ------------------
 
-    private string BuildPart3LogPath()
-    {
-        string subject = (sessionController != null && !string.IsNullOrEmpty(sessionController.participantId))
-            ? sessionController.participantId
-            : "UNKNOWN_SUBJECT";
-
-        foreach (char c in Path.GetInvalidFileNameChars())
-            subject = subject.Replace(c, '_');
-
-        string timestamp = DateTime.UtcNow.ToString("yyyyMMddTHHmmssZ");
-        return Path.Combine(Application.persistentDataPath, $"{subject}_Part3_Session_{timestamp}.csv");
-    }
-
+    /// <summary>
+    /// Revision 2: the standalone Part 3 CSV has been removed. This method performs NO file I/O.
+    /// It only raises the structured OnExperimentEvent that DataCaptureManager records into events.csv.
+    /// Every argument is a value already computed by the (unchanged) Part 3 scoring logic - this method
+    /// only observes them.
+    /// </summary>
     private void AppendPart3Log(string eventName, int groupNumber, Part3GroupDef def,
         Transform startPoint, GameObject d1Building, GameObject d2Building,
         string selectedId, bool found, double elapsedSeconds, string notes)
     {
-        if (string.IsNullOrEmpty(part3LogPath)) return;
-
-        try
+        ExperimentEventInfo info = new ExperimentEventInfo
         {
-            bool writeHeader = !File.Exists(part3LogPath);
+            type = "part3_log",
+            part3Event = eventName,
+            part = "Part3",
+            phase = CurrentPhase,
+            label = "",
+            stringValue = selectedId ?? "",
+            numValue = elapsedSeconds,
+            boolValue = found,
+            notes = notes ?? "",
+            groupNumber = groupNumber,
+            startZone = def.StartZone.ToString(),
+            d1Zone = def.Destination1Zone.ToString(),
+            d2Zone = def.Destination2Zone.ToString(),
+            startPointName = startPoint != null ? startPoint.name : "",
+            d1Building = d1Building,
+            d2Building = d2Building,
+            d1TargetId = GetAssignedTargetId(d1Building) ?? "",
+            d2TargetId = GetAssignedTargetId(d2Building) ?? ""
+        };
 
-            // Open / write / close per row for crash safety, mirroring the recorders.
-            using (var writer = new StreamWriter(part3LogPath, append: true))
-            {
-                if (writeHeader)
-                {
-                    writer.WriteLine(string.Join(",", new string[]
-                    {
-                        "event", "utc_time", "time_since_startup_s", "subject_id", "trial_id",
-                        "part3_group_number", "start_zone", "start_point",
-                        "d1_zone", "d1_building", "d2_zone", "d2_building",
-                        "selected_id", "found", "elapsed_s", "notes"
-                    }));
-                }
-
-                string subject = (sessionController != null) ? sessionController.participantId : "UNKNOWN_SUBJECT";
-
-                string[] fields =
-                {
-                    Csv(eventName),
-                    Csv(DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")),
-                    Time.realtimeSinceStartupAsDouble.ToString("F3", CultureInfo.InvariantCulture),
-                    Csv(subject),
-                    "Part3",
-                    groupNumber.ToString(CultureInfo.InvariantCulture),
-                    Csv(def.StartZone.ToString()),
-                    Csv(startPoint != null ? startPoint.name : ""),
-                    Csv(def.Destination1Zone.ToString()),
-                    Csv(d1Building != null ? d1Building.name : ""),
-                    Csv(def.Destination2Zone.ToString()),
-                    Csv(d2Building != null ? d2Building.name : ""),
-                    Csv(selectedId),
-                    found ? "1" : "0",
-                    elapsedSeconds.ToString("F3", CultureInfo.InvariantCulture),
-                    Csv(notes)
-                };
-                writer.WriteLine(string.Join(",", fields));
-            }
-        }
-        catch (Exception ex)
-        {
-            Debug.LogWarning("[ExperimentManager] Failed to write Part3 session log: " + ex.Message);
-        }
+        try { OnExperimentEvent?.Invoke(info); }
+        catch (Exception ex) { Debug.LogWarning("[ExperimentManager] OnExperimentEvent (part3_log) handler threw: " + ex.Message); }
     }
 
-    /// <summary>Lightweight CSV field sanitiser: strip separators/newlines (same idea as GazeRecorder.SafeCsvField).</summary>
-    private static string Csv(string s)
+    // ---- Data-capture event helpers -------------------------------------------------------------
+
+    private void RaiseEvt(string type, string part = null, string label = "", string stringValue = "",
+        double numValue = 0.0, bool boolValue = false, GameObject building = null,
+        Vector3 fromPos = default, Vector3 toPos = default)
     {
-        if (string.IsNullOrEmpty(s)) return "";
-        return s.Replace(',', ' ').Replace('\n', ' ').Replace('\r', ' ');
+        ExperimentEventInfo info = new ExperimentEventInfo
+        {
+            type = type,
+            part3Event = "",
+            part = string.IsNullOrEmpty(part) ? CurrentRunningPartString() : part,
+            phase = CurrentPhase,
+            label = label,
+            stringValue = stringValue,
+            numValue = numValue,
+            boolValue = boolValue,
+            notes = "",
+            building = building,
+            fromPos = fromPos,
+            toPos = toPos
+        };
+
+        try { OnExperimentEvent?.Invoke(info); }
+        catch (Exception ex) { Debug.LogWarning("[ExperimentManager] OnExperimentEvent (" + type + ") handler threw: " + ex.Message); }
+    }
+
+    private void SetPhase(string phase)
+    {
+        CurrentPhase = phase;
+        RaiseEvt("phase_start", "Part3", label: phase);
+    }
+
+    private string CurrentRunningPartString()
+    {
+        switch (currentRunningPart)
+        {
+            case RunningPart.Part1: return "Part1";
+            case RunningPart.Part2: return "Part2";
+            case RunningPart.Part3: return "Part3";
+            default: return "";
+        }
     }
 
     #endregion
+}
+
+/// <summary>
+/// Payload for ExperimentManager.OnExperimentEvent (Revision 2 data capture). Plain value type; carries
+/// everything DataCaptureManager needs to write one or more events.csv rows without holding coroutine-local
+/// state. Populated by ExperimentManager only.
+/// </summary>
+[Serializable]
+public struct ExperimentEventInfo
+{
+    public string type;         // e.g. "part_start", "panel_shown", "teleport", "part3_log", ...
+    public string part3Event;   // raw legacy Part 3 log event name when type == "part3_log", else ""
+    public string part;         // "Part1" / "Part2" / "Part3" / ""
+    public string phase;        // ExperimentManager.CurrentPhase at raise time
+    public string label;        // "D1" / "D2" / a panel key / a phase name / ""
+    public string stringValue;  // clicked targetId / teleport destination name / free string
+    public double numValue;     // elapsed seconds / phase total elapsed / 0
+    public bool boolValue;      // correct / found
+    public string notes;        // legacy Part 3 "notes" / endReason string
+
+    public int groupNumber;         // Part 3 group (1..12), else 0
+    public string startZone;        // Part 3 start zone label
+    public string d1Zone;           // Part 3 destination 1 zone label
+    public string d2Zone;           // Part 3 destination 2 zone label
+    public string startPointName;   // Part 3 start Transform name
+    public GameObject d1Building;    // Part 3 assigned destination-1 building (coroutine local, captured here)
+    public GameObject d2Building;    // Part 3 assigned destination-2 building
+    public string d1TargetId;       // TargetSelectable.targetId of d1Building (provenance only)
+    public string d2TargetId;       // TargetSelectable.targetId of d2Building (provenance only)
+
+    public GameObject building;      // building referenced by candidate_interactable_on/off
+    public Vector3 fromPos;          // teleport: player position before
+    public Vector3 toPos;            // teleport: destination position
 }

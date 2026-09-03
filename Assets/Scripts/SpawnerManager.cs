@@ -135,6 +135,33 @@ public class SpawnerManager : MonoBehaviour
     // paused/resumed/force-finished as a group when trial state changes.
     private List<GameObject> activeAgents = new List<GameObject>();
 
+    // ---------------------------------------------------------------------------------------------
+    // Data-capture (Revision 2) - OBSERVER hooks. These do NOT change spawning, pooling, itinerary,
+    // movement, timing, or randomisation. They only expose the currently-alive agent list and fire
+    // spawn/despawn notifications AFTER the internal list has already been mutated.
+    // ---------------------------------------------------------------------------------------------
+
+    /// <summary>Read-only view of the currently-alive (spawned, not finished) agent GameObjects.</summary>
+    public IReadOnlyList<GameObject> ActiveAgents => activeAgents;
+
+    /// <summary>Raised right after an agent has been added to the active list (spawn / pooled reuse).</summary>
+    public event System.Action<PedestrianAgent> AgentSpawned;
+
+    /// <summary>Raised right after an agent has been removed from the active list (finished / force-finished).</summary>
+    public event System.Action<PedestrianAgent> AgentDespawned;
+
+    private void RaiseAgentSpawned(PedestrianAgent pa)
+    {
+        try { AgentSpawned?.Invoke(pa); }
+        catch (System.Exception e) { if (enableDebugLogs) Debug.LogWarning("[SpawnerManager] AgentSpawned observer threw: " + e.Message); }
+    }
+
+    private void RaiseAgentDespawned(PedestrianAgent pa)
+    {
+        try { AgentDespawned?.Invoke(pa); }
+        catch (System.Exception e) { if (enableDebugLogs) Debug.LogWarning("[SpawnerManager] AgentDespawned observer threw: " + e.Message); }
+    }
+
     // NEW: whether a trial is currently active. When gateSpawningByTrialState == false this flag
     // is ignored entirely (SpawnLoop behaves exactly as it did before this change).
     private bool trialActive = false;
@@ -688,6 +715,7 @@ public class SpawnerManager : MonoBehaviour
             liveAgents++;
             activeAgents.Add(go); // NEW: track for trial-state pause/resume/despawn
             agentScript.onAgentFinished += OnAgentFinished;
+            RaiseAgentSpawned(agentScript); // data-capture observer (after list mutation)
         }
         else
         {
@@ -831,6 +859,7 @@ public class SpawnerManager : MonoBehaviour
             liveAgents++;
             activeAgents.Add(go); // NEW: track for trial-state pause/resume/despawn
             agentScript.onAgentFinished += OnAgentFinished;
+            RaiseAgentSpawned(agentScript); // data-capture observer (after list mutation)
         }
     }
 
@@ -1130,7 +1159,8 @@ public class SpawnerManager : MonoBehaviour
 
         liveAgents--;
         activeAgents.Remove(agent.gameObject); // NEW: stop tracking this agent for trial-state pause/despawn
-
+        RaiseAgentDespawned(agent); // data-capture observer (after list mutation)
+        
         if (usePooling)
         {
             GameObject go = agent.gameObject;

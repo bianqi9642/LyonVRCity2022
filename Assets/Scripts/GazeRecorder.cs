@@ -1,36 +1,25 @@
 // GazeRecorder.cs
 //
-// Eye-tracking data recorder for Meta Quest Pro, built to plug into the existing experiment
-// architecture the same way TrajectoryRecorder.cs already does: it subscribes to
-// ExperimentManager.OnTrialStart/OnTrialEnd, writes one CSV row per sample to
-// Application.persistentDataPath, and uses the same crash-safe "open/write/close per row"
-// pattern already established by TrajectoryRecorder, so eye-tracking files use the same
-// subject/trial naming convention and the same Time.realtimeSinceStartupAsDouble clock basis,
-// making post-hoc alignment between behavioural trajectories and gaze data straightforward.
+// Eye-tracking data recorder for Meta Quest Pro.
 //
-// REQUIREMENTS (see the accompanying setup instructions for full detail):
-// - Meta XR Core SDK (or Meta XR All-in-One SDK) imported via Package Manager - this is what
-//   provides the 'OVREyeGaze' and 'OVRManager' components referenced below. If your project only
-//   has the older "Oculus Integration" asset, OVREyeGaze may not exist yet; update to a current
-//   Meta XR Core SDK package first.
-// - An OVRManager component in the scene with "Eye Tracking Support" set to Supported/Required
-//   (Quest Features > General), which is what causes Unity to inject the required Android
-//   manifest entries (com.oculus.permission.EYE_TRACKING permission + oculus.software.eye_tracking
-//   feature) at build time.
-// - Two OVREyeGaze components in the scene (one set to Eye = Left, one set to Eye = Right),
-//   typically placed as children of the HMD camera transform (CenterEyeAnchor). See setup notes.
-// - Only Meta Quest Pro currently exposes hardware eye tracking via this API; on Quest 2/3 or in
-//   the Editor without a connected Quest Pro (or the Meta XR Simulator, if your SDK version
-//   supports simulated eye tracking), gaze samples will simply report as not valid.
+// Revision 2 (data-capture Architecture C) changes - all ADDITIVE, existing columns unchanged:
+//  - Writes into the shared session folder as "gaze.csv" ({session_id}/gaze.csv) when a
+//    DataCaptureManager is present. File + header are created LAZILY on the first written row.
+//  - Per-sample scope gate: rows are written only while DataCaptureManager.ParticipantCaptureActive is
+//    true (Part 2 + Part 3). A Part 1 session therefore produces NO gaze.csv.
+//  - The ROI raycast now runs whenever enableROIRaycast is true - it is NO LONGER gated on
+//    combined_valid. When eye tracking is invalid the ray is cast from the head-forward fallback and
+//    gaze_ray_source is recorded as "head_fallback". combined_valid remains a TRUE eye-tracking
+//    validity indicator and is never set to 1 for a fallback ray.
+//  - New appended columns (after roi_hit_distance): t_abs, session_id, frame_index, gaze_ray_source,
+//    ray_did_hit, hit_point_x/y/z, hit_collider_name, hit_object_name, hit_instance_id, hit_layer,
+//    hit_tag, hit_semantic_class, hit_building_id, hit_npc_id, hit_npc_spawn_instance_id,
+//    hit_is_interactable  (via AoiClassifier).
+//  - Legacy columns roi_hit_name / roi_hit_distance keep their EXACT previous semantics: populated only
+//    when combined_valid == 1 and the ray hit something.
+//  - Android eye-tracking permission is requested via OVRPermissionsRequester (Meta XR SDK 201).
 //
-// IMPORTANT NOTE ON API SURFACE: Meta has renamed and reorganized its XR packages several times
-// (Oculus Integration -> Meta XR Core SDK / Movement SDK). The properties used below
-// (OVREyeGaze.Eye, OVREyeGaze.Confidence, OVRManager.instance.requestEyeTrackingPermission()) are
-// the stable, documented surface as of recent Meta XR Core SDK releases, but please verify these
-// exact names against the specific SDK version installed in this project before relying on this
-// in a live study - if a name has changed, the compiler will point you directly at the line to fix.
-//
-// All comments in English.
+// All comments in English per project convention.
 
 using System;
 using System.Collections;
@@ -60,7 +49,7 @@ public class GazeRecorder : MonoBehaviour
 
     [Header("Session / Trial linkage")]
     [Tooltip("Optional: assign the scene's ExperimentManager. If left empty, auto-found via " +
-             "FindObjectOfType at Start() (same pattern used by TrajectoryRecorder/TargetSelectable).")]
+             "FindObjectOfType at Start().")]
     public ExperimentManager experimentManager;
 
     [Tooltip("Optional: assign the scene's ExternalSessionController (source of participantId). " +
@@ -68,8 +57,7 @@ public class GazeRecorder : MonoBehaviour
     public ExternalSessionController sessionController;
 
     [Tooltip("If true, StartRecording()/StopRecording() are called automatically from " +
-             "ExperimentManager.OnTrialStart/OnTrialEnd, exactly like TrajectoryRecorder. This keeps the " +
-             "gaze-recording window aligned with the same trial boundaries as the trajectory data.")]
+             "ExperimentManager.OnTrialStart/OnTrialEnd.")]
     public bool subscribeToExperimentEvents = true;
 
     [Tooltip("If true and no ExperimentManager is found in the scene, recording starts immediately on " +
@@ -77,37 +65,29 @@ public class GazeRecorder : MonoBehaviour
     public bool autoStartIfNoExperimentManager = false;
 
     [Header("Identification (used in filename + CSV columns)")]
-    [Tooltip("Participant/subject identifier. If empty, resolved from ExternalSessionController.participantId " +
-             "at recording start.")]
+    [Tooltip("Participant/subject identifier. If empty, resolved from ExternalSessionController.participantId.")]
     public string subjectId = "";
 
-    [Tooltip("Trial/phase identifier. If empty, resolved from ExternalSessionController.selectedPart " +
-             "at recording start (matches TrajectoryRecorder's convention, e.g. 'Part2').")]
+    [Tooltip("Trial/phase identifier. If empty, resolved from ExternalSessionController.selectedPart.")]
     public string trialId = "";
 
     [Header("Sampling")]
-    [Tooltip("Samples per second. Meta Quest Pro eye tracking updates well above typical VR frame rates, " +
-             "but recording faster than your analysis needs just inflates file size - 30-60Hz is a " +
-             "reasonable default; match TrajectoryRecorder's sampleRate if you want 1:1 aligned rows.")]
+    [Tooltip("Samples per second. 30 Hz is the approved default.")]
     public float sampleRate = 30f;
 
     [Header("ROI / AOI raycasting")]
-    [Tooltip("If true, each sample also raycasts from the combined gaze origin along the combined gaze " +
-             "direction and records what it hit (e.g. a target building or an NPC), enabling ROI/AOI " +
-             "analysis without needing a separate offline gaze-to-scene reprojection step.")]
+    [Tooltip("If true, each sample raycasts from the combined gaze origin (or the head-forward fallback " +
+             "when eye tracking is invalid) and records what it hit, plus a light semantic class.")]
     public bool enableROIRaycast = true;
 
-    [Tooltip("Layers considered for ROI/AOI raycasting. Set this to only the layers your target " +
-             "buildings/NPCs/points-of-interest are on, to avoid the raycast hitting incidental geometry.")]
+    [Tooltip("Layers considered for ROI/AOI raycasting. Recommended: Default + Ground + Water + UI only.")]
     public LayerMask roiLayerMask = ~0;
 
     [Tooltip("Maximum raycast distance (metres) for ROI/AOI detection.")]
     public float roiMaxDistance = 50f;
 
     [Header("Debug")]
-    [Tooltip("Mirrors the enableDebugLogs convention used elsewhere in this project (see SpawnerManager, " +
-             "MoveToTarget). Gates start/stop/warning logs; per-sample data is never logged regardless, " +
-             "since that alone would be a bigger performance cost than anything this flag guards.")]
+    [Tooltip("Gates start/stop/warning logs; per-sample data is never logged regardless.")]
     public bool enableDebugLogs = true;
 
     // Internal recording state
@@ -117,6 +97,9 @@ public class GazeRecorder : MonoBehaviour
     Coroutine samplingCoroutine = null;
     double recordingStartRealtime = 0.0;
 
+    // Revision 2: shared capture context (may be null - the recorder still works, fail-open).
+    DataCaptureManager dataCapture;
+
     void Awake()
     {
         if (headTransform == null && Camera.main != null)
@@ -124,56 +107,41 @@ public class GazeRecorder : MonoBehaviour
             headTransform = Camera.main.transform;
         }
 
-        // Best-effort runtime permission request. On Quest, eye tracking requires the Android runtime
-        // permission 'com.oculus.permission.EYE_TRACKING' to be granted in addition to the manifest
-        // entries injected by OVRManager's "Eye Tracking Support" build setting. This has no effect
-        // (and is skipped) outside of an on-device Android build.
+        // Android runtime eye-tracking permission. Meta XR SDK 201: OVRPermissionsRequester is a static
+        // requester that does NOT require an OVRManager in the scene. No effect outside an Android build.
 #if UNITY_ANDROID && !UNITY_EDITOR
         try
         {
-            if (OVRManager.instance != null)
+            if (!OVRPermissionsRequester.IsPermissionGranted(OVRPermissionsRequester.Permission.EyeTracking))
             {
-                OVRManager.instance.requestEyeTrackingPermission();
-            }
-            else if (enableDebugLogs)
-            {
-                Debug.LogWarning("[GazeRecorder] OVRManager.instance is null - cannot request eye tracking " +
-                    "permission. Ensure an OVRManager component exists in the scene with Eye Tracking " +
-                    "Support enabled.");
+                OVRPermissionsRequester.Request(new[] { OVRPermissionsRequester.Permission.EyeTracking });
             }
         }
         catch (Exception e)
         {
             if (enableDebugLogs)
-                Debug.LogWarning($"[GazeRecorder] requestEyeTrackingPermission() threw: {e.Message}. " +
-                    "Verify this method exists on your installed Meta XR Core SDK version.");
+                Debug.LogWarning($"[GazeRecorder] Eye-tracking permission request failed: {e.Message}. " +
+                    "Verify OVRPermissionsRequester exists in the installed Meta XR SDK version.");
         }
 #endif
 
         if (enableDebugLogs && (leftEyeGaze == null || rightEyeGaze == null))
         {
             Debug.LogWarning("[GazeRecorder] leftEyeGaze and/or rightEyeGaze is not assigned. This recorder " +
-                "will still run but will record all-invalid samples until both are assigned. See setup notes " +
-                "for how to add OVREyeGaze components to the XR rig.");
+                "will still run but will record all-invalid samples until both are assigned.");
         }
     }
 
     void Start()
     {
-        if (experimentManager == null)
-        {
-            experimentManager = FindObjectOfType<ExperimentManager>();
-        }
-
-        if (sessionController == null)
-        {
-            sessionController = FindObjectOfType<ExternalSessionController>();
-        }
+        if (experimentManager == null) experimentManager = FindObjectOfType<ExperimentManager>();
+        if (sessionController == null)  sessionController  = FindObjectOfType<ExternalSessionController>();
+        if (dataCapture == null)        dataCapture        = FindObjectOfType<DataCaptureManager>();
 
         if (subscribeToExperimentEvents && experimentManager != null)
         {
             experimentManager.OnTrialStart += OnExperimentTrialStart;
-            experimentManager.OnTrialEnd += OnExperimentTrialEnd;
+            experimentManager.OnTrialEnd   += OnExperimentTrialEnd;
         }
         else if (subscribeToExperimentEvents && experimentManager == null && autoStartIfNoExperimentManager)
         {
@@ -189,17 +157,11 @@ public class GazeRecorder : MonoBehaviour
         if (experimentManager != null)
         {
             experimentManager.OnTrialStart -= OnExperimentTrialStart;
-            experimentManager.OnTrialEnd -= OnExperimentTrialEnd;
+            experimentManager.OnTrialEnd   -= OnExperimentTrialEnd;
         }
-
-        // Defensive: make sure we don't leave a dangling coroutine reference or an unflushed state.
         StopRecording();
     }
 
-    // Crash-safety net: if the app is paused (e.g. the user removes the headset, or the OS backgrounds
-    // the app) or is quitting, make sure recording is cleanly stopped rather than relying only on
-    // OnTrialEnd firing. Each row is already flushed-and-closed individually (see SamplingLoop), so this
-    // mainly ensures the sampling coroutine itself doesn't keep running in the background.
     void OnApplicationPause(bool pauseStatus)
     {
         if (pauseStatus && isRecording)
@@ -213,25 +175,15 @@ public class GazeRecorder : MonoBehaviour
 
     void OnApplicationQuit()
     {
-        if (isRecording)
-        {
-            StopRecording();
-        }
+        if (isRecording) StopRecording();
     }
 
-    void OnExperimentTrialStart()
-    {
-        StartRecording();
-    }
-
-    void OnExperimentTrialEnd()
-    {
-        StopRecording();
-    }
+    void OnExperimentTrialStart() { StartRecording(); }
+    void OnExperimentTrialEnd()   { StopRecording(); }
 
     /// <summary>
-    /// Begins a new gaze-recording session: resolves subject/trial IDs if not explicitly set, builds a
-    /// fresh timestamped CSV path, and starts the per-sample coroutine.
+    /// Begins a new gaze-recording session. Whether any row is actually WRITTEN is decided per-sample by
+    /// the capture scope (Part 2 + Part 3 only).
     /// </summary>
     public void StartRecording()
     {
@@ -241,23 +193,11 @@ public class GazeRecorder : MonoBehaviour
             return;
         }
 
-        if (string.IsNullOrEmpty(subjectId) && sessionController != null)
-        {
-            subjectId = sessionController.participantId;
-        }
-        if (string.IsNullOrEmpty(subjectId))
-        {
-            subjectId = "UNKNOWN_SUBJECT";
-        }
+        if (string.IsNullOrEmpty(subjectId) && sessionController != null) subjectId = sessionController.participantId;
+        if (string.IsNullOrEmpty(subjectId)) subjectId = "UNKNOWN_SUBJECT";
 
-        if (string.IsNullOrEmpty(trialId) && sessionController != null)
-        {
-            trialId = sessionController.selectedPart.ToString();
-        }
-        if (string.IsNullOrEmpty(trialId))
-        {
-            trialId = "UNKNOWN_TRIAL";
-        }
+        if (string.IsNullOrEmpty(trialId) && sessionController != null) trialId = sessionController.selectedPart.ToString();
+        if (string.IsNullOrEmpty(trialId)) trialId = "UNKNOWN_TRIAL";
 
         fullPath = BuildFullPath();
         headerWritten = false;
@@ -270,13 +210,10 @@ public class GazeRecorder : MonoBehaviour
         samplingCoroutine = StartCoroutine(SamplingLoop());
     }
 
-    /// <summary>
-    /// Stops the current gaze-recording session, if any. Safe to call multiple times.
-    /// </summary>
+    /// <summary>Stops the current gaze-recording session, if any. Safe to call multiple times.</summary>
     public void StopRecording()
     {
-        if (!isRecording && samplingCoroutine == null)
-            return;
+        if (!isRecording && samplingCoroutine == null) return;
 
         if (samplingCoroutine != null)
         {
@@ -292,22 +229,22 @@ public class GazeRecorder : MonoBehaviour
 
     string BuildFullPath()
     {
-        // Filename convention mirrors TrajectoryRecorder.cs so files from the same trial can be matched
-        // by their {subjectId}_{trialId}_... prefix during offline analysis.
+        if (dataCapture == null) dataCapture = FindObjectOfType<DataCaptureManager>();
+
+        if (dataCapture != null && !string.IsNullOrEmpty(dataCapture.SessionFolder))
+            return Path.Combine(dataCapture.SessionFolder, "gaze.csv");
+
+        // Fail-open fallback (no DataCaptureManager): keep the legacy standalone naming so gaze data is
+        // never silently lost if the capture layer failed to initialise.
         string timestamp = DateTime.UtcNow.ToString("yyyyMMddTHHmmssZ");
-        string safeSubject = SanitizeForFilename(subjectId);
-        string safeTrial = SanitizeForFilename(trialId);
-        string fileName = $"{safeSubject}_{safeTrial}_Gaze_{timestamp}.csv";
+        string fileName = $"{SanitizeForFilename(subjectId)}_{SanitizeForFilename(trialId)}_Gaze_{timestamp}.csv";
         return Path.Combine(Application.persistentDataPath, fileName);
     }
 
     string SanitizeForFilename(string s)
     {
         if (string.IsNullOrEmpty(s)) return "unknown";
-        foreach (char c in Path.GetInvalidFileNameChars())
-        {
-            s = s.Replace(c, '_');
-        }
+        foreach (char c in Path.GetInvalidFileNameChars()) s = s.Replace(c, '_');
         return s;
     }
 
@@ -315,6 +252,7 @@ public class GazeRecorder : MonoBehaviour
     {
         return string.Join(",", new string[]
         {
+            // ----- existing columns (DO NOT reorder / rename) -----
             "time_since_start_s",
             "unix_time_ms",
             "subject_id",
@@ -334,14 +272,27 @@ public class GazeRecorder : MonoBehaviour
             "head_pos_x", "head_pos_y", "head_pos_z",
             "head_rot_x", "head_rot_y", "head_rot_z", "head_rot_w",
             "roi_hit_name",
-            "roi_hit_distance"
+            "roi_hit_distance",
+            // ----- Revision 2 appended columns -----
+            "t_abs",
+            "session_id",
+            "frame_index",
+            "gaze_ray_source",
+            "ray_did_hit",
+            "hit_point_x", "hit_point_y", "hit_point_z",
+            "hit_collider_name",
+            "hit_object_name",
+            "hit_instance_id",
+            "hit_layer",
+            "hit_tag",
+            "hit_semantic_class",
+            "hit_building_id",
+            "hit_npc_id",
+            "hit_npc_spawn_instance_id",
+            "hit_is_interactable"
         });
     }
 
-    /// <summary>
-    /// Per-eye sample snapshot, read directly from an OVREyeGaze component. Kept as a small local struct
-    /// (rather than reading fields inline everywhere) so the "is this eye valid" logic lives in one place.
-    /// </summary>
     struct EyeSample
     {
         public bool valid;
@@ -360,42 +311,38 @@ public class GazeRecorder : MonoBehaviour
             direction = Vector3.forward
         };
 
-        if (eyeGaze == null || !eyeGaze.isActiveAndEnabled)
-            return sample;
+        if (eyeGaze == null || !eyeGaze.isActiveAndEnabled) return sample;
 
-        // OVREyeGaze drives its own transform to represent the eye's current gaze pose; position is the
-        // gaze origin (approx. eye location) and forward is the gaze direction. Confidence (0..1) is the
-        // documented signal for sample quality - there is no separate boolean validity flag in the
-        // Meta XR Core SDK's OVREyeGaze API, so we derive 'valid' from a configurable confidence threshold.
         sample.confidence = eyeGaze.Confidence;
         sample.origin = eyeGaze.transform.position;
         sample.direction = eyeGaze.transform.forward;
         sample.valid = sample.confidence >= minConfidenceForValid;
-
         return sample;
     }
 
     IEnumerator SamplingLoop()
     {
-        // Write the header once per file, the first time we're about to write a row.
-        if (!headerWritten)
-        {
-            WriteHeaderIfNeeded();
-        }
-
         float interval = (sampleRate > 0f) ? (1f / sampleRate) : (1f / 30f);
 
         while (true)
         {
+            // Revision 2 scope gate: only Part 2 + Part 3 are captured. Part 1 -> no file, no rows.
+            if (dataCapture != null && !dataCapture.ParticipantCaptureActive)
+            {
+                yield return new WaitForSecondsRealtime(interval);
+                continue;
+            }
+
+            if (!headerWritten) WriteHeaderIfNeeded();
+
             EyeSample left = ReadEye(leftEyeGaze);
             EyeSample right = ReadEye(rightEyeGaze);
 
-            // Combined gaze: average the two eyes when both are valid, fall back to whichever single eye
-            // is valid, or mark combined invalid if neither eye currently meets the confidence threshold.
             bool combinedValid;
             float combinedConfidence;
             Vector3 combinedOrigin;
             Vector3 combinedDirection;
+            string gazeRaySource;
 
             if (left.valid && right.valid)
             {
@@ -404,6 +351,7 @@ public class GazeRecorder : MonoBehaviour
                 combinedOrigin = (left.origin + right.origin) * 0.5f;
                 Vector3 dirSum = left.direction + right.direction;
                 combinedDirection = (dirSum.sqrMagnitude > 1e-6f) ? dirSum.normalized : left.direction;
+                gazeRaySource = "both";
             }
             else if (left.valid)
             {
@@ -411,6 +359,7 @@ public class GazeRecorder : MonoBehaviour
                 combinedConfidence = left.confidence;
                 combinedOrigin = left.origin;
                 combinedDirection = left.direction;
+                gazeRaySource = "left";
             }
             else if (right.valid)
             {
@@ -418,40 +367,53 @@ public class GazeRecorder : MonoBehaviour
                 combinedConfidence = right.confidence;
                 combinedOrigin = right.origin;
                 combinedDirection = right.direction;
+                gazeRaySource = "right";
             }
             else
             {
                 combinedValid = false;
                 combinedConfidence = 0f;
-                // Fall back to head-forward so downstream analysis at least has a plausible ray to work
-                // with for this sample, rather than a zero vector; 'combined_valid' still correctly flags
-                // it as not real eye-tracking data.
                 combinedOrigin = headTransform != null ? headTransform.position : transform.position;
                 combinedDirection = headTransform != null ? headTransform.forward : transform.forward;
+                gazeRaySource = "head_fallback";
             }
 
+            // ROI raycast: ALWAYS performed (subject to enableROIRaycast). Uses the head-forward fallback
+            // ray when eye tracking is invalid. combined_valid is NOT affected by this.
+            bool didHit = false;
+            RaycastHit hit = default;
+            if (enableROIRaycast)
+            {
+                didHit = Physics.Raycast(combinedOrigin, combinedDirection, out hit, roiMaxDistance, roiLayerMask);
+            }
+
+            // Legacy columns keep their EXACT previous meaning: only filled when eye gaze was valid.
             string roiName = "";
             float roiDistance = float.NaN;
-
-            if (enableROIRaycast && combinedValid)
+            if (didHit && combinedValid)
             {
-                RaycastHit hit;
-                if (Physics.Raycast(combinedOrigin, combinedDirection, out hit, roiMaxDistance, roiLayerMask))
-                {
-                    roiName = SafeCsvField(hit.collider != null ? hit.collider.name : hit.transform.name);
-                    roiDistance = hit.distance;
-                }
+                roiName = SafeCsvField(hit.collider != null ? hit.collider.name : hit.transform.name);
+                roiDistance = hit.distance;
             }
+
+            AoiClassifier.HitInfo aoi = AoiClassifier.Classify(
+                didHit, didHit ? hit.collider : null, experimentManager, dataCapture);
 
             Vector3 headPos = headTransform != null ? headTransform.position : Vector3.zero;
             Quaternion headRot = headTransform != null ? headTransform.rotation : Quaternion.identity;
 
-            double t = Time.realtimeSinceStartupAsDouble - recordingStartRealtime;
+            double tRel = Time.realtimeSinceStartupAsDouble - recordingStartRealtime;
+            double tAbs = Time.realtimeSinceStartupAsDouble;
             long unixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            string sessionId = (dataCapture != null && !string.IsNullOrEmpty(dataCapture.SessionId))
+                ? dataCapture.SessionId : (SafeCsvField(subjectId) + "_" + SafeCsvField(trialId));
+
+            Vector3 hp = didHit ? hit.point : Vector3.zero;
 
             string row = string.Join(",", new string[]
             {
-                t.ToString("F4"),
+                // ----- existing columns -----
+                tRel.ToString("F4"),
                 unixMs.ToString(),
                 SafeCsvField(subjectId),
                 SafeCsvField(trialId),
@@ -470,7 +432,24 @@ public class GazeRecorder : MonoBehaviour
                 headPos.x.ToString("F4"), headPos.y.ToString("F4"), headPos.z.ToString("F4"),
                 headRot.x.ToString("F4"), headRot.y.ToString("F4"), headRot.z.ToString("F4"), headRot.w.ToString("F4"),
                 roiName,
-                float.IsNaN(roiDistance) ? "" : roiDistance.ToString("F3")
+                float.IsNaN(roiDistance) ? "" : roiDistance.ToString("F3"),
+                // ----- Revision 2 appended columns -----
+                tAbs.ToString("F4"),
+                SafeCsvField(sessionId),
+                Time.frameCount.ToString(),
+                gazeRaySource,
+                didHit ? "1" : "0",
+                didHit ? hp.x.ToString("F4") : "", didHit ? hp.y.ToString("F4") : "", didHit ? hp.z.ToString("F4") : "",
+                SafeCsvField(aoi.colliderName),
+                SafeCsvField(aoi.objectName),
+                didHit ? aoi.instanceId.ToString() : "",
+                aoi.layer >= 0 ? aoi.layer.ToString() : "",
+                SafeCsvField(aoi.tag),
+                aoi.semanticClass,
+                SafeCsvField(aoi.buildingId),
+                SafeCsvField(aoi.npcId),
+                SafeCsvField(aoi.npcSpawnInstanceId),
+                aoi.isInteractable
             });
 
             WriteRow(row);
@@ -483,12 +462,13 @@ public class GazeRecorder : MonoBehaviour
     {
         try
         {
+            string dir = Path.GetDirectoryName(fullPath);
+            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+
             if (!File.Exists(fullPath))
             {
                 using (StreamWriter writer = new StreamWriter(fullPath, append: false))
-                {
                     writer.WriteLine(GetCsvHeader());
-                }
             }
             headerWritten = true;
         }
@@ -501,14 +481,10 @@ public class GazeRecorder : MonoBehaviour
 
     void WriteRow(string row)
     {
-        // Same crash-safety pattern as TrajectoryRecorder: open, write, and close (flush) on every single
-        // row, so at most one in-flight sample is ever at risk if the app terminates unexpectedly.
         try
         {
             using (StreamWriter writer = new StreamWriter(fullPath, append: true))
-            {
                 writer.WriteLine(row);
-            }
         }
         catch (Exception e)
         {
@@ -520,8 +496,6 @@ public class GazeRecorder : MonoBehaviour
     string SafeCsvField(string s)
     {
         if (string.IsNullOrEmpty(s)) return "";
-        // Strip characters that would break the simple comma-separated format used here (no quoting/escaping),
-        // consistent with the lightweight CSV approach already used by TrajectoryRecorder.
         return s.Replace(",", " ").Replace("\n", " ").Replace("\r", " ");
     }
 }

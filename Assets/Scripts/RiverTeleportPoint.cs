@@ -6,15 +6,11 @@
 //
 // Design notes:
 // - Mirrors the existing TargetSelectable.cs pattern already used in this project (IPointerClickHandler +
-//   OnMouseDown for Editor testing + a public Select() method that XR interactors can call directly),
-//   so it fits the established interaction style without introducing a new input pathway.
-// - The player rig reference is resolved the same way TargetSelectable resolves ExperimentManager: assign it
-//   explicitly in the Inspector if possible, otherwise it is auto-found via ExperimentManager.playerRig at Start().
-// - A short cooldown prevents a "teleport ping-pong" in case both points on either bank are placed close enough
-//   that arriving at pairedPoint immediately re-triggers pairedPoint's own collider/click handler.
+//   OnMouseDown for Editor testing + a public Select() method that XR interactors can call directly).
+// - The player rig reference is resolved the same way TargetSelectable resolves ExperimentManager.
+// - A short cooldown prevents a "teleport ping-pong".
 // - This script does NOT change AutoGroundAlign or MoveToTarget/NavMeshAgent state; it only repositions the
-//   player rig Transform, consistent with how ExperimentManager.TeleportPlayerTo(...) already teleports the
-//   player between Part2 group start/teleport positions.
+//   player rig Transform.
 //
 // All comments are in English per project convention.
 
@@ -52,9 +48,11 @@ public class RiverTeleportPoint : MonoBehaviour, IPointerClickHandler
              "back-and-forth teleporting if points are placed very close to each other.")]
     public float teleportCooldown = 0.5f;
 
-    // Fired after a successful teleport; other systems (e.g. a future data logger) can subscribe to this
+    // Fired after a successful teleport; other systems (e.g. the data-capture layer) can subscribe to this
     // to record river-crossing events without modifying this script.
-    public event Action<RiverTeleportPoint, RiverTeleportPoint> OnPlayerTeleported;
+    // Args: (fromPoint, toPoint, playerPositionBeforeTeleport, playerPositionAfterTeleport).
+    // The extra Vector3 args were added for Revision 2 data capture; the teleport mechanics are unchanged.
+    public event Action<RiverTeleportPoint, RiverTeleportPoint, Vector3, Vector3> OnPlayerTeleported;
 
     private float lastTeleportTime = -999f;
 
@@ -112,8 +110,7 @@ public class RiverTeleportPoint : MonoBehaviour, IPointerClickHandler
             return;
         }
 
-        // Cooldown guard to avoid immediate re-trigger (e.g. if the destination point's own collider
-        // overlaps the player right after arrival).
+        // Cooldown guard to avoid immediate re-trigger.
         if (Time.time - lastTeleportTime < teleportCooldown)
         {
             return;
@@ -130,6 +127,7 @@ public class RiverTeleportPoint : MonoBehaviour, IPointerClickHandler
     /// </summary>
     private void TeleportPlayerTo(Transform destination)
     {
+        Vector3 fromPos = playerRig.position;
         Vector3 targetPos = destination.position + Vector3.up * verticalOffset;
         playerRig.position = targetPos;
 
@@ -140,11 +138,10 @@ public class RiverTeleportPoint : MonoBehaviour, IPointerClickHandler
 
         Debug.Log($"RiverTeleportPoint: Teleported player from '{gameObject.name}' to '{destination.name}' at {targetPos}.");
 
-        // Notify any listeners (e.g. a future TrajectoryRecorder-style logger) that a river crossing occurred.
-        // 'this' is the point the player teleported FROM; destination's own RiverTeleportPoint (if present)
-        // is looked up so listeners get both ends of the crossing.
+        // Notify any listeners (e.g. the data-capture layer) that a river crossing occurred. The raw
+        // pre/post player positions are passed so trajectory analysis can preserve the discontinuity exactly.
         RiverTeleportPoint destinationPoint = destination.GetComponent<RiverTeleportPoint>();
-        OnPlayerTeleported?.Invoke(this, destinationPoint);
+        OnPlayerTeleported?.Invoke(this, destinationPoint, fromPos, targetPos);
     }
 
     // Draw a line in the Scene view between paired points to make 1:1 mapping easy to verify visually.

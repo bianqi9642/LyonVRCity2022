@@ -42,7 +42,9 @@ public class PedestrianAgent : MonoBehaviour
     public Action<PedestrianAgent> onAgentFinished;
 
     // internal state machine
-    enum State { Moving, WaitingAtAttractor, Finished }
+    // NOTE (data-capture, Revision 2): enum is public read-only so the capture layer can OBSERVE the
+    // existing semantic state. The state machine itself is unchanged.
+    public enum State { Moving, WaitingAtAttractor, Finished }
 
     // Core references
     MoveToTarget moveToTarget; // The single authority for movement in this modified script
@@ -82,6 +84,12 @@ public class PedestrianAgent : MonoBehaviour
     [Tooltip("Read-only unique ID assigned to this agent instance at Awake.")]
     [SerializeField] string agentID = null;
     public string AgentID => agentID;
+
+    /// <summary>
+    /// Read-only view of the existing internal state (data-capture, Revision 2). Observation only:
+    /// this getter never changes NPC behaviour, itinerary, dwell timing, randomisation, or NavMesh state.
+    /// </summary>
+    public State CurrentState => state;
 
     // Keep track of whether we've subscribed to the current MoveToTarget.OnArrived
     bool subscribedToMoveToArrived = false;

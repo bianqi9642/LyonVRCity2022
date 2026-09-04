@@ -77,6 +77,12 @@ public static class CaptureConstants
     public const string EvtNpcSpawn             = "npc_spawn";
     public const string EvtNpcDespawn           = "npc_despawn";
 
+    // NEW (NPC warm-up): structural markers written to events.csv exactly like part_start/part_end. They
+    // exist purely for audit/traceability of the warm-up window in the participant's own event stream and
+    // never gate participant-facing (trajectory/gaze) capture. See DataCaptureManager.NpcCaptureActive.
+    public const string EvtNpcWarmupStart       = "npc_warmup_start";
+    public const string EvtNpcWarmupEnd         = "npc_warmup_end";
+
     // npc_events.csv event_type values
     public const string NpcEvtSpawn      = "npc_spawn";
     public const string NpcEvtDespawn    = "npc_despawn";

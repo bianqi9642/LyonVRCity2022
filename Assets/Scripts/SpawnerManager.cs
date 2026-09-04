@@ -28,6 +28,41 @@
 // defaulting to true so existing Editor workflows are unaffected, and every Debug.Log/LogWarning/LogError
 // call in this script is gated behind it so it can be switched off for Quest builds.
 //
+// NEW (NPC warm-up): SpawnLoop()'s spawning gate previously had exactly one "open" condition while gating
+// is enabled: trialActive (set by HandleTrialStart/HandleTrialEnd, which are themselves driven only by
+// ExperimentManager.OnTrialStart/OnTrialEnd). That meant NPCs could never spawn before the very first
+// participant trial of a Part. ExperimentManager now runs an explicit NPC warm-up window BEFORE the
+// participant-facing Start panel is shown (and therefore before OnTrialStart fires), during which it wants
+// SpawnerManager to spawn and move NPCs using its completely normal runtime behaviour - same spawnInterval,
+// maxAgents, itinerary generation, AttractorDwell, UncertainBehavior, MoveToTarget, and pooling - so the NPC
+// population has time to form and spread out before the participant's trial begins. SpawnerManager exposes
+// this as a second, independent gate flag ('npcWarmupActive', opened/closed only via the new
+// BeginNpcWarmup()/EndNpcWarmup() public methods) rather than overloading 'trialActive', because the two
+// represent different experimental semantics (pre-trial population settling vs. the participant's actual
+// trial window) and must be distinguishable by any observer (see DataCaptureManager.NpcCaptureActive, which
+// must NOT treat warm-up NPC activity as trial data). ExperimentManager sequences the two so they never
+// overlap and there is no gap in spawning at the warm-up -> trial boundary. This change touches ONLY the
+// spawning gate; it does not add, remove, or alter any movement/itinerary/pooling logic.
+//
+// NEW (per-Part NPC control, supersedes the Stage-6 SetNpcsEnabledForPart mechanism): whether NPCs may
+// operate for the Part currently running is now PULLED directly from
+// ExperimentManager.CurrentPartConfig.npcEnabled every SpawnLoop tick (NpcsEnabledForActivePart()), instead
+// of being pushed into a locally-cached field via a dedicated method call. This removes a second,
+// independently-updated copy of the same boolean - ExperimentManager remains the single source of truth for
+// all per-Part NPC/capture configuration, and every other system (this one included) merely reads it.
+//
+// NEW (End Panel hard stop): ExperimentManager now raises OnEndPanelShown immediately before a Part's End
+// Panel is shown to the participant - strictly before part_end (raised only once the participant confirms
+// the panel). SpawnerManager subscribes unconditionally (regardless of gateSpawningByTrialState) to: close
+// the spawning gate (endPanelActive, ANDed into SpawnLoop's gate the same way NpcsEnabledForActivePart() is)
+// and freeze every currently-active agent using ONLY existing public APIs - MoveToTarget.PauseExternal() and
+// disabling UncertainBehavior (see HardStopAgent()). Because a one-shot freeze is not airtight against
+// PedestrianAgent's own dwell coroutines (independent of MoveToTarget's paused state), the freeze is
+// continuously re-applied every frame for as long as endPanelActive is true (see Update()). The hard stop is
+// cleared only when the NEXT Part's NPC lifecycle begins (ResetForNewPart(), called unconditionally from
+// ExperimentManager.RunNpcWarmup()). None of this touches NavMeshAgent directly, and none of it changes the
+// Stage 4 architecture (UncertainBehavior -> MoveToTarget -> NavMeshAgent).
+//
 // All comments in English.
 
 using System.Collections;
@@ -95,8 +130,9 @@ public class SpawnerManager : MonoBehaviour
     public ExperimentManager experimentManager;
 
     [Tooltip("If true, SpawnLoop() only spawns new agents while a trial is active (between " +
-             "ExperimentManager.OnTrialStart and OnTrialEnd). If false, spawning is continuous for the " +
-             "lifetime of the scene, matching the previous (ungated) behaviour.")]
+             "ExperimentManager.OnTrialStart and OnTrialEnd) OR while an NPC warm-up window is open (see " +
+             "BeginNpcWarmup/EndNpcWarmup). If false, spawning is continuous for the lifetime of the scene, " +
+             "matching the original (ungated) behaviour.")]
     public bool gateSpawningByTrialState = true;
 
     [Tooltip("If true, agents that are already alive when a trial ends are paused (frozen in place, " +
@@ -157,19 +193,56 @@ public class SpawnerManager : MonoBehaviour
     // is ignored entirely (SpawnLoop behaves exactly as it did before this change).
     private bool trialActive = false;
 
+    // NEW (NPC warm-up): whether an NPC warm-up window is currently open. Independent of 'trialActive' -
+    // ExperimentManager sequences the two so they never overlap (EndNpcWarmup() is always called immediately
+    // before OnTrialStart fires), but they are tracked as two separate flags because they represent
+    // different experimental semantics: pre-trial population settling vs. the participant's actual trial
+    // window. Only ExperimentManager (via BeginNpcWarmup/EndNpcWarmup) ever sets this.
+    private bool npcWarmupActive = false;
+
+    /// <summary>Read-only: whether an NPC warm-up window is currently open.</summary>
+    public bool NpcWarmupActive => npcWarmupActive;
+
+    // NEW (Part-scoped NPC control, Requirement 1/7): whether the NPC system is permitted to operate for the
+    // Part currently running is now PULLED directly from ExperimentManager.CurrentPartConfig.npcEnabled every
+    // SpawnLoop tick (see NpcsEnabledForActivePart() below), rather than pushed/cached via a dedicated
+    // SetNpcsEnabledForPart() call (the Stage-6 mechanism this supersedes). This removes a second,
+    // independently-updated copy of the same boolean - ExperimentManager.CurrentPartConfig remains the sole
+    // source of truth, and SpawnerManager merely reads it. Falls back to "enabled" (true) if no
+    // ExperimentManager/CurrentPartConfig is available, so a scene that never configures per-Part NPC control
+    // keeps unrestricted spawning (matching the behaviour of any other field left at its default).
+    private bool NpcsEnabledForActivePart()
+    {
+        if (experimentManager == null) return true;
+        var cfg = experimentManager.CurrentPartConfig;
+        return cfg == null || cfg.npcEnabled;
+    }
+
+    // NEW (End Panel hard stop, Requirement 2): true from the moment ExperimentManager.OnEndPanelShown fires
+    // for the current Part until SpawnerManager.ResetForNewPart() is called at the start of the NEXT Part's
+    // NPC lifecycle (see RunNpcWarmup()). Closes the spawning gate unconditionally (regardless of
+    // gateSpawningByTrialState) and drives the continuous per-frame freeze in Update() below.
+    private bool endPanelActive = false;
+
+    /// <summary>Read-only: whether the End-Panel hard stop is currently in effect.</summary>
+    public bool EndPanelActive => endPanelActive;
+
     // state to ensure we don't spawn before prewarm/initialization finished
     bool poolInitializationComplete = false;
 
     void Start()
     {
-        // NEW: resolve ExperimentManager and subscribe to trial start/end events if gating is enabled.
+        // NEW: resolve ExperimentManager unconditionally (not just when gateSpawningByTrialState is true) -
+        // it is now also needed for the per-Part NPC-enable pull (NpcsEnabledForActivePart()) and for the
+        // End-Panel hard-stop subscription below, both of which must work regardless of trial-state gating.
+        if (experimentManager == null)
+        {
+            experimentManager = FindObjectOfType<ExperimentManager>();
+        }
+
+        // Existing trial-state gating subscription - unchanged logic, just using the reference resolved above.
         if (gateSpawningByTrialState)
         {
-            if (experimentManager == null)
-            {
-                experimentManager = FindObjectOfType<ExperimentManager>();
-            }
-
             if (experimentManager != null)
             {
                 experimentManager.OnTrialStart += HandleTrialStart;
@@ -185,6 +258,14 @@ public class SpawnerManager : MonoBehaviour
             }
         }
 
+        // NEW (End Panel hard stop): subscribed unconditionally - the hard stop must apply even in scenes
+        // that run with gateSpawningByTrialState == false (continuous spawning), where trialActive alone
+        // would otherwise never close the spawning gate at the End Panel boundary.
+        if (experimentManager != null)
+        {
+            experimentManager.OnEndPanelShown += HandleEndPanelShown;
+        }
+
         // Start sequence that waits/attempts NavMesh prewarm and only then starts spawn loop.
         StartCoroutine(InitializePoolThenSpawn());
     }
@@ -196,6 +277,84 @@ public class SpawnerManager : MonoBehaviour
         {
             experimentManager.OnTrialStart -= HandleTrialStart;
             experimentManager.OnTrialEnd -= HandleTrialEnd;
+            experimentManager.OnEndPanelShown -= HandleEndPanelShown;
+        }
+    }
+
+    void Update()
+    {
+        // NEW (End Panel hard stop): continuously re-assert the freeze on every active agent, every frame,
+        // for as long as endPanelActive is true. A single one-shot freeze (applied once in
+        // HandleEndPanelShown()) is not airtight: PedestrianAgent's own dwell coroutines
+        // (WaitAtAttractor/PollForCapacity/SimpleDwellThenAdvance) run independently of MoveToTarget's
+        // paused state, and MoveToTarget.MoveTo(...) unconditionally un-stops the NavMeshAgent regardless of
+        // externallyPaused - so an agent whose dwell timer happens to elapse while the End Panel is visible
+        // would otherwise resume moving until the next OnTrialStart. Re-applying the freeze every frame
+        // (cheap early-return when not needed) bounds any such escape to a single frame. See
+        // HardStopAllActiveAgents() for what "freeze" means and why (existing public APIs only).
+        if (endPanelActive) HardStopAllActiveAgents();
+    }
+
+    /// <summary>
+    /// NEW (End Panel hard stop). Called when ExperimentManager raises OnEndPanelShown for the Part currently
+    /// running - i.e. immediately before that Part's End Panel is instantiated/shown to the participant
+    /// (strictly before part_end, which only fires later once the participant confirms the panel). Closes
+    /// the spawning gate (via endPanelActive, checked in SpawnLoop) and immediately freezes every
+    /// currently-active agent. Unconditional: applies regardless of gateSpawningByTrialState,
+    /// pauseLiveAgentsOutsideTrial, or despawnLiveAgentsOnTrialEnd - none of those existing toggles are
+    /// modified.
+    /// </summary>
+    private void HandleEndPanelShown()
+    {
+        endPanelActive = true;
+        HardStopAllActiveAgents();
+        if (enableDebugLogs) Debug.Log("[SpawnerManager] End Panel shown -> NPC spawning and movement hard-stopped.");
+    }
+
+    /// <summary>
+    /// NEW (End Panel hard stop). Called by ExperimentManager (via RunNpcWarmup(), unconditionally, at the
+    /// very start of every Part's NPC lifecycle) to clear any End-Panel hard stop left over from whichever
+    /// Part ran previously. Must happen before that new Part's own warm-up/trial spawning decisions are
+    /// evaluated - resetting only on the new Part's OnTrialStart would be too late, since NPC warm-up
+    /// spawning happens BEFORE OnTrialStart.
+    /// </summary>
+    public void ResetForNewPart()
+    {
+        endPanelActive = false;
+        if (enableDebugLogs) Debug.Log("[SpawnerManager] New Part starting -> End-Panel hard stop cleared.");
+    }
+
+    /// <summary>
+    /// NEW (End Panel hard stop). Freezes one active agent using ONLY existing public APIs - never touches
+    /// NavMeshAgent directly, and does not modify the Stage 4 movement architecture
+    /// (UncertainBehavior -> MoveToTarget -> NavMeshAgent):
+    ///   - MoveToTarget.PauseExternal(true, true): halts NavMeshAgent movement and freezes the animator -
+    ///     the same mechanism already used by PauseAllActiveAgents()/HandleTrialEnd().
+    ///   - Disabling UncertainBehavior (if present): stops ITS OWN per-second-probability state machine
+    ///     (Pause/Hesitate/Slow/Detour), which would otherwise independently call
+    ///     MoveToTarget.ResumeExternal()/SetTemporarySpeed() on its own timer regardless of the pause above.
+    ///     UncertainBehavior.OnDisable() only unsubscribes its own event handlers - no movement side effect.
+    ///     A pooled agent's UncertainBehavior is unconditionally re-enabled/re-rolled by
+    ///     AgentFactory.ApplyProfileToInstance() on its next spawn, so disabling it here has no lasting effect
+    ///     beyond the current (ending) Part.
+    /// Idempotent and cheap - safe to call every frame (see Update() above).
+    /// </summary>
+    private void HardStopAgent(GameObject go)
+    {
+        if (go == null) return;
+
+        MoveToTarget mt = go.GetComponent<MoveToTarget>();
+        if (mt != null) mt.PauseExternal(true, true);
+
+        UncertainBehavior ub = go.GetComponent<UncertainBehavior>();
+        if (ub != null) ub.enabled = false;
+    }
+
+    private void HardStopAllActiveAgents()
+    {
+        for (int i = 0; i < activeAgents.Count; i++)
+        {
+            HardStopAgent(activeAgents[i]);
         }
     }
 
@@ -232,6 +391,36 @@ public class SpawnerManager : MonoBehaviour
         {
             PauseAllActiveAgents();
         }
+    }
+
+    /// <summary>
+    /// NEW (NPC warm-up). Called by ExperimentManager at the start of a Part, BEFORE the participant-facing
+    /// Start panel is shown and BEFORE OnTrialStart fires. Opens the spawning gate exactly like a trial does
+    /// (SpawnLoop below simply OR's this flag together with trialActive), using the existing
+    /// spawnInterval/maxAgents/itinerary-generation/pooling machinery completely unchanged, so the NPC
+    /// population can begin forming and distributing itself before the participant's trial is officially
+    /// under way. Does NOT fire OnTrialStart, does NOT touch trialActive, and does NOT pause/resume/despawn
+    /// any agent - it only flips the spawning gate.
+    /// </summary>
+    public void BeginNpcWarmup()
+    {
+        npcWarmupActive = true;
+        if (enableDebugLogs) Debug.Log("[SpawnerManager] NPC warm-up started -> NPC spawning enabled (pre-trial).");
+    }
+
+    /// <summary>
+    /// NEW (NPC warm-up). Called by ExperimentManager once the configured warm-up duration has elapsed,
+    /// immediately before OnTrialStart is invoked. Closes the warm-up gate. Deliberately does NOT pause,
+    /// resume, or despawn any currently-alive agent - existing NPCs (walking, dwelling, mid-detour, etc.)
+    /// simply continue exactly as they were. Because ExperimentManager calls this and then invokes
+    /// OnTrialStart in the same breath (no yield in between), SpawnLoop's combined gate
+    /// ('trialActive || npcWarmupActive') never goes false in between, so there is no gap in spawning across
+    /// the warm-up -> trial boundary.
+    /// </summary>
+    public void EndNpcWarmup()
+    {
+        npcWarmupActive = false;
+        if (enableDebugLogs) Debug.Log("[SpawnerManager] NPC warm-up ended.");
     }
 
     /// <summary>
@@ -498,10 +687,20 @@ public class SpawnerManager : MonoBehaviour
                 continue;
             }
 
-            // NEW: when gating is enabled, only spawn new agents while a trial is active. The loop keeps
-            // running (so it re-checks every 'spawnInterval') rather than stopping, so spawning resumes
-            // automatically as soon as the next OnTrialStart fires.
-            bool allowedToSpawn = (!gateSpawningByTrialState) || trialActive;
+            // NEW: when gating is enabled, only spawn new agents while a trial is active OR an NPC warm-up
+            // window is open (see BeginNpcWarmup/EndNpcWarmup). The loop keeps running (so it re-checks every
+            // 'spawnInterval') rather than stopping, so spawning resumes automatically as soon as the next
+            // warm-up or OnTrialStart fires.
+            // NEW (Part-scoped NPC control, Requirement 1/3): NpcsEnabledForActivePart() is ANDed in
+            // regardless of gateSpawningByTrialState, so a Part configured with npcEnabled=false in its
+            // ExperimentManager.PartCaptureConfig stays NPC-free even if trialActive happens to be true
+            // (every Part fires OnTrialStart/OnTrialEnd) or if gating is switched off scene-wide.
+            // NEW (End Panel hard stop, Requirement 2/2D): '!endPanelActive' is ALSO ANDed in regardless of
+            // gateSpawningByTrialState, so no new NPC can spawn once the current Part's End Panel has been
+            // shown, even in a continuous-spawning (gateSpawningByTrialState == false) configuration where
+            // trialActive would otherwise never close the gate at that boundary.
+            bool allowedToSpawn = !endPanelActive && NpcsEnabledForActivePart() &&
+                ((!gateSpawningByTrialState) || trialActive || npcWarmupActive);
 
             if (allowedToSpawn && liveAgents < maxAgents)
             {
@@ -927,7 +1126,7 @@ public class SpawnerManager : MonoBehaviour
         liveAgents--;
         activeAgents.Remove(agent.gameObject); // NEW: stop tracking this agent for trial-state pause/despawn
         RaiseAgentDespawned(agent); // data-capture observer (after list mutation)
-        
+
         if (usePooling)
         {
             GameObject go = agent.gameObject;

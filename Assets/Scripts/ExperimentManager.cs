@@ -28,15 +28,99 @@ using UnityEngine;
 ///    cap, d2Ran, endReason, candidate interactability windows, panel gating, OnTrialStart/OnTrialEnd
 ///    and the coroutine yield structure are all identical to before.
 ///
-/// OnTrialStart / OnTrialEnd still fire exactly once each.
+/// NPC WARM-UP (additive):
+///  - Each Part now runs an explicit NPC-only warm-up window at the very start, AFTER the participant is
+///    teleported to the Part's start position but BEFORE the participant-facing Start panel is shown and
+///    BEFORE OnTrialStart fires. During warm-up, SpawnerManager spawns/moves NPCs using its completely
+///    normal runtime behaviour (unchanged spawnInterval/maxAgents/itinerary generation/AttractorDwell/
+///    UncertainBehavior/MoveToTarget/pooling) via two public methods (BeginNpcWarmup/EndNpcWarmup) that only
+///    toggle its existing spawning gate - no NPC movement/architecture code was touched.
+///  - The participant literally cannot start the trial before warm-up ends, because the Start panel is not
+///    shown (and therefore cannot be confirmed) until the warm-up wait completes.
+///  - 'npcWarmupDuration' (Inspector-configurable, seconds) controls the wait; 0 disables the WAIT but NPC
+///    presence itself is controlled by the per-Part 'npcEnabled' flag below (see PER-PART CONFIGURATION).
+///  - Two observer events ("npc_warmup_start" / "npc_warmup_end") are raised through the existing
+///    RaiseEvt(...) -> OnExperimentEvent pathway so DataCaptureManager can both log the window as an
+///    events.csv marker AND suppress NPC telemetry (npc_state.csv / npc_events.csv) while it is open, so
+///    warm-up NPC activity never contaminates the participant's NPC trial record. See
+///    DataCaptureManager.NpcCaptureActive. These two events are raised ONLY when the current Part's
+///    'npcEnabled' is true (see below) - an NPC-disabled Part never runs RunNpcWarmup() at all.
+///
+/// PER-PART CONFIGURATION (additive; supersedes the previous Part1-hardcoded "no NPC" rule):
+///  - Each Part (part1Config/part2Config/part3Config, a PartCaptureConfig) now independently declares, via
+///    the Inspector: whether NPCs exist at all (npcEnabled), whether NPC telemetry is written
+///    (npcCaptureEnabled), whether gaze is recorded (gazeCaptureEnabled), and whether participant trajectory
+///    is recorded (trajectoryCaptureEnabled). This is the SINGLE authoritative source for all four settings -
+///    SpawnerManager (npcEnabled, via a direct read of CurrentPartConfig) and DataCaptureManager /
+///    GazeRecorder (the three capture flags, via CurrentPartConfig) query it; none of them hold their own
+///    independent copy. CurrentPartConfig is set once, at the very top of each RunPartX(), before part_start
+///    is even raised.
+///  - npcEnabled and npcCaptureEnabled are INDEPENDENT: npcEnabled=true + npcCaptureEnabled=false means NPCs
+///    exist and move but are not recorded (this was Part2's original hardcoded behaviour, now just a
+///    Part2Config default rather than special-cased code). npcEnabled=false + npcCaptureEnabled=true is
+///    accepted (not blocked) but produces empty npc_state.csv/npc_events.csv content for that Part, since no
+///    NPC can ever exist to capture; DataCaptureManager logs a one-time warning for this combination.
+///  - Default values reproduce the exact pre-Stage-7 behaviour: Part1 = everything off; Part2 = NPCs on,
+///    NPC capture off, gaze+trajectory on; Part3 = everything on.
+///
+/// END PANEL HARD STOP (additive):
+///  - OnEndPanelShown is a new event, raised immediately before uiManager.ShowPartXEndPanel(...) is called
+///    (i.e. at the exact moment identified by auditing the actual panel-show call sites - NOT at part_end,
+///    which only fires later, after the participant confirms the panel). SpawnerManager subscribes to freeze
+///    NPC movement (via MoveToTarget.PauseExternal + disabling UncertainBehavior - existing public APIs
+///    only) and close the spawn gate; DataCaptureManager subscribes to hard-stop trajectory/gaze/NPC capture.
+///    Both remain frozen/stopped through the entire End Panel wait, and only resume readiness for the NEXT
+///    Part (SpawnerManager.ResetForNewPart(), called at the top of RunNpcWarmup()).
+///  - part_end (raised after the participant confirms the End Panel) is UNCHANGED and still fires exactly
+///    where it always did; this feature does not move it earlier and does not alter panel/UI semantics.
+///
+/// OnTrialStart / OnTrialEnd still fire exactly once each, for every Part including Part1.
 /// </summary>
 public class ExperimentManager : MonoBehaviour
 {
     public event Action OnTrialStart;
     public event Action OnTrialEnd;
 
+    /// <summary>
+    /// NEW: raised exactly once per Part, immediately before that Part's End Panel is shown to the
+    /// participant (before uiManager.ShowPartXEndPanel(...) is called) - i.e. strictly BEFORE part_end,
+    /// which only fires later once the participant confirms the panel. This is the authoritative
+    /// "hard stop" boundary: subscribers (SpawnerManager, DataCaptureManager) use it to freeze NPCs and stop
+    /// all continuous data capture for the remainder of the End Panel's visible duration.
+    /// </summary>
+    public event Action OnEndPanelShown;
+
     /// <summary>Additive observer event for the data-capture layer (Revision 2). Never affects control flow.</summary>
     public event Action<ExperimentEventInfo> OnExperimentEvent;
+
+    /// <summary>
+    /// Per-Part configuration: whether NPCs exist, and whether each of the three continuous experimental
+    /// capture streams is recorded, for one Part. This is the SINGLE authoritative source of truth for these
+    /// four settings (Requirement: avoid duplicate sources of truth) - SpawnerManager, DataCaptureManager and
+    /// GazeRecorder all read it via ExperimentManager.CurrentPartConfig rather than holding their own copies.
+    /// </summary>
+    [Serializable]
+    public class PartCaptureConfig
+    {
+        [Tooltip("Whether the NPC population (SpawnerManager spawning/warm-up) exists at all during this " +
+                 "Part. False means: no warm-up, no spawning, no NPCs ever appear - independent of the " +
+                 "capture flags below.")]
+        public bool npcEnabled = true;
+
+        [Tooltip("Whether NPC telemetry (npc_state.csv / npc_events.csv) is written during this Part's " +
+                 "trial. Independent of 'Npc Enabled': NPCs can exist and move (Npc Enabled = true) without " +
+                 "being recorded (Npc Capture Enabled = false). If enabled while Npc Enabled is false, no " +
+                 "NPCs will exist to capture - allowed, but DataCaptureManager logs a one-time warning.")]
+        public bool npcCaptureEnabled = true;
+
+        [Tooltip("Whether GazeRecorder writes gaze.csv rows during this Part's trial (OnTrialStart..OnTrialEnd, " +
+                 "and never before part_start or during NPC warm-up).")]
+        public bool gazeCaptureEnabled = true;
+
+        [Tooltip("Whether participant trajectory.csv rows are written during this Part's trial " +
+                 "(OnTrialStart..OnTrialEnd, and never before part_start or during NPC warm-up).")]
+        public bool trajectoryCaptureEnabled = true;
+    }
 
     /// <summary>Coarse Part 3 sub-phase label ("idle" / "d1_pending" / "d1_search" / "d2_pending" / "d2_search" / "ended").</summary>
     public string CurrentPhase { get; private set; } = "idle";
@@ -52,6 +136,67 @@ public class ExperimentManager : MonoBehaviour
     public float part1Duration = 60f;
     public float part2FirstDuration = 60f;
     public float part2SecondDuration = 60f;
+
+    [Header("Part 1 Configuration")]
+    [Tooltip("NPC presence and per-stream capture for Part 1. Defaults reproduce the previous hard-coded " +
+             "'Part1 = no NPC, no research capture' behaviour; change freely per Requirement 1.")]
+    public PartCaptureConfig part1Config = new PartCaptureConfig
+    {
+        npcEnabled = false,
+        npcCaptureEnabled = false,
+        gazeCaptureEnabled = false,
+        trajectoryCaptureEnabled = false
+    };
+
+    [Header("Part 2 Configuration")]
+    [Tooltip("NPC presence and per-stream capture for Part 2. Defaults reproduce the previous behaviour: " +
+             "NPCs on, NPC telemetry off, gaze + trajectory on.")]
+    public PartCaptureConfig part2Config = new PartCaptureConfig
+    {
+        npcEnabled = true,
+        npcCaptureEnabled = false,
+        gazeCaptureEnabled = true,
+        trajectoryCaptureEnabled = true
+    };
+
+    [Header("Part 3 Configuration")]
+    [Tooltip("NPC presence and per-stream capture for Part 3. Defaults reproduce the previous behaviour: " +
+             "everything on (full dataset).")]
+    public PartCaptureConfig part3Config = new PartCaptureConfig
+    {
+        npcEnabled = true,
+        npcCaptureEnabled = true,
+        gazeCaptureEnabled = true,
+        trajectoryCaptureEnabled = true
+    };
+
+    /// <summary>
+    /// The PartCaptureConfig for whichever Part is currently running (set at the top of RunPart1/2/3, before
+    /// part_start is raised). Null when no Part is running. This is the single value every other system
+    /// (SpawnerManager, DataCaptureManager, GazeRecorder) reads - see the PER-PART CONFIGURATION class doc.
+    /// </summary>
+    public PartCaptureConfig CurrentPartConfig { get; private set; }
+
+    /// <summary>
+    /// True from the moment this Part's End Panel is shown (OnEndPanelShown raised) until the next Part's
+    /// NPC lifecycle begins (SpawnerManager.ResetForNewPart(), called at the top of RunNpcWarmup()). Exposed
+    /// for polling convenience; SpawnerManager/DataCaptureManager primarily react to the OnEndPanelShown
+    /// event itself rather than polling this.
+    /// </summary>
+    public bool EndPanelActive { get; private set; }
+
+    [Header("NPC Warm-up")]
+    [Tooltip("Seconds of NPC-only warm-up run at the start of a Part that has 'Npc Enabled' = true in its " +
+             "Part Configuration above, after the participant is teleported to the Part's start position but " +
+             "BEFORE the participant-facing Start panel is shown and BEFORE OnTrialStart fires. During " +
+             "warm-up, SpawnerManager spawns and moves NPCs using its completely normal runtime behaviour " +
+             "(same spawnInterval, maxAgents, itinerary generation, AttractorDwell, UncertainBehavior, " +
+             "MoveToTarget, pooling) so the NPC population has time to spawn and spread out through the " +
+             "environment before the participant can begin the actual trial. This single duration applies to " +
+             "every NPC-enabled Part - there is no separate per-Part duration field. Set to 0 to skip only " +
+             "the WAIT (the Start panel is then shown immediately); NPC presence itself is still controlled " +
+             "exclusively by 'Npc Enabled' above, never by this duration.")]
+    public float npcWarmupDuration = 30f;
 
     [Header("Part1")]
     [Tooltip("Part1 start position (single).")]
@@ -215,22 +360,86 @@ public class ExperimentManager : MonoBehaviour
 
     #endregion
 
+    #region NPC warm-up (additive; see class-level doc comment)
+
+    /// <summary>
+    /// Runs the NPC-only warm-up window for the Part currently starting. Called uniformly by ALL THREE
+    /// RunPartX() methods (no more Part1 special-casing at the call site) - NPC presence is now controlled
+    /// exclusively by 'cfg.npcEnabled' (Requirement 3), not by which Part structurally calls this method.
+    ///
+    /// Always calls spawner.ResetForNewPart() FIRST, unconditionally, regardless of cfg/npcEnabled/duration -
+    /// this clears any End-Panel hard-stop left over from whichever Part ran previously (see
+    /// SpawnerManager.ResetForNewPart doc comment), and must happen before any warm-up/trial spawning
+    /// decision for the new Part is evaluated.
+    ///
+    /// If cfg is null or cfg.npcEnabled is false: returns immediately - no defaultProfile assignment, no
+    /// BeginNpcWarmup(), no npc_warmup_start/end events, no wait. This Part is NPC-free.
+    ///
+    /// Otherwise: assigns spawner.defaultProfile, then (if npcWarmupDuration > 0) opens SpawnerManager's
+    /// warm-up spawning gate (BeginNpcWarmup), waits 'npcWarmupDuration' seconds of scaled time (consistent
+    /// with the existing Part-duration timers below, which also use Time.deltaTime rather than realtime),
+    /// then closes the gate (EndNpcWarmup) immediately before returning. Never shows a panel, never fires
+    /// OnTrialStart/OnTrialEnd, and never touches NPC movement/NavMeshAgent/Animator state directly - it only
+    /// toggles SpawnerManager's existing spawning gates via its public API and raises two observer events for
+    /// DataCaptureManager. When npcWarmupDuration &lt;= 0 this only skips the WAIT (NPCs are still enabled
+    /// for the Part and can spawn once OnTrialStart fires, via SpawnerManager's own trialActive gate).
+    /// </summary>
+    private IEnumerator RunNpcWarmup(PartCaptureConfig cfg, string partLabel)
+    {
+        if (spawner != null)
+            spawner.ResetForNewPart();
+
+        if (cfg == null || !cfg.npcEnabled)
+            yield break;
+
+        if (spawner != null)
+            spawner.defaultProfile = currentProfile;
+
+        if (npcWarmupDuration <= 0f)
+            yield break;
+
+        if (spawner != null)
+            spawner.BeginNpcWarmup();
+
+        RaiseEvt("npc_warmup_start", partLabel, numValue: npcWarmupDuration);
+
+        float wt = 0f;
+        while (wt < npcWarmupDuration)
+        {
+            wt += Time.deltaTime;
+            yield return null;
+        }
+
+        RaiseEvt("npc_warmup_end", partLabel, numValue: wt);
+
+        if (spawner != null)
+            spawner.EndNpcWarmup();
+    }
+
+    #endregion
+
     #region Part implementations (coroutines)
 
     private IEnumerator RunPart1()
     {
         currentRunningPart = RunningPart.Part1;
+        CurrentPartConfig = part1Config;
+        EndPanelActive = false;
         RaiseEvt("part_start", "Part1");
 
         ConfigureTargetsForPart1();
         TeleportPlayerTo(part1StartPosition);
+
+        // NPC presence is now controlled entirely by part1Config.npcEnabled (Requirement 1/3) - no more
+        // Part1-specific special-casing here. With the shipped default (npcEnabled=false) this call returns
+        // immediately after clearing any stale End-Panel hard-stop, exactly reproducing "Part1 is NPC-free".
+        yield return RunNpcWarmup(part1Config, "Part1");
 
         bool started = false;
         RaiseEvt("panel_shown", "Part1", label: "part1_start");
         uiManager.ShowPart1StartPanel(() => { started = true; RaiseEvt("panel_confirmed", "Part1", label: "part1_start"); });
         yield return new WaitUntil(() => started);
 
-        if (spawner != null) spawner.defaultProfile = currentProfile;
         OnTrialStart?.Invoke();
 
         targetWasSelected = false;
@@ -242,6 +451,13 @@ public class ExperimentManager : MonoBehaviour
         }
 
         OnTrialEnd?.Invoke();
+
+        // Requirement 2: the End Panel hard stop. Raised BEFORE the panel is instantiated/shown, so
+        // subscribers (SpawnerManager, DataCaptureManager) freeze NPCs/capture before the participant can
+        // see anything - not after they confirm it (that remains part_end, raised further below, unchanged).
+        EndPanelActive = true;
+        OnEndPanelShown?.Invoke();
+
         bool confirmed = false;
         RaiseEvt("panel_shown", "Part1", label: "part1_end");
         uiManager.ShowPart1EndPanel(() => { confirmed = true; RaiseEvt("panel_confirmed", "Part1", label: "part1_end"); });
@@ -254,6 +470,8 @@ public class ExperimentManager : MonoBehaviour
     private IEnumerator RunPart2()
     {
         currentRunningPart = RunningPart.Part2;
+        CurrentPartConfig = part2Config;
+        EndPanelActive = false;
         RaiseEvt("part_start", "Part2");
 
         int gIdx = (sessionController != null) ? sessionController.part2GroupIndex : 0;
@@ -270,12 +488,13 @@ public class ExperimentManager : MonoBehaviour
 
         TeleportPlayerTo(chosenStart);
 
+        yield return RunNpcWarmup(part2Config, "Part2");
+
         bool started = false;
         RaiseEvt("panel_shown", "Part2", label: "part2_start");
         uiManager.ShowPart2StartPanel(() => { started = true; RaiseEvt("panel_confirmed", "Part2", label: "part2_start"); });
         yield return new WaitUntil(() => started);
 
-        if (spawner != null) spawner.defaultProfile = currentProfile;
         OnTrialStart?.Invoke();
 
         targetWasSelected = false;
@@ -305,6 +524,11 @@ public class ExperimentManager : MonoBehaviour
         }
 
         OnTrialEnd?.Invoke();
+
+        // Requirement 2: the End Panel hard stop (see RunPart1() for the full explanation).
+        EndPanelActive = true;
+        OnEndPanelShown?.Invoke();
+
         bool confirmed = false;
         RaiseEvt("panel_shown", "Part2", label: "part2_end");
         uiManager.ShowPart2EndPanel(() => { confirmed = true; RaiseEvt("panel_confirmed", "Part2", label: "part2_end"); });
@@ -317,6 +541,8 @@ public class ExperimentManager : MonoBehaviour
     private IEnumerator RunPart3()
     {
         currentRunningPart = RunningPart.Part3;
+        CurrentPartConfig = part3Config;
+        EndPanelActive = false;
         RaiseEvt("part_start", "Part3");
         SetPhase("idle");
 
@@ -384,13 +610,16 @@ public class ExperimentManager : MonoBehaviour
         AppendPart3Log("assigned", groupNumber, def, startPoint, destination1Building, destination2Building,
             selectedId: "", found: false, elapsedSeconds: 0.0, notes: "");
 
+        // --- 6b. NPC warm-up: NPCs spawn/spread out via SpawnerManager's normal runtime behaviour, BEFORE
+        // the Phase 3 Start panel is shown. Not part of the participant's trial - see DataCaptureManager.
+        yield return RunNpcWarmup(part3Config, "Part3");
+
         // --- 7. Phase 3 Start panel. (All candidates are still non-interactable ordinary buildings.) ---
         bool started = false;
         RaiseEvt("panel_shown", "Part3", label: "part3_start");
         uiManager.ShowPart3StartPanel(() => { started = true; RaiseEvt("panel_confirmed", "Part3", label: "part3_start"); });
         yield return new WaitUntil(() => started);
 
-        if (spawner != null) spawner.defaultProfile = currentProfile;
         OnTrialStart?.Invoke();
         SetPhase("d1_pending");
 
@@ -550,6 +779,10 @@ public class ExperimentManager : MonoBehaviour
 
         // Phase 3 is over: no Phase 3 target-specific interaction remains anywhere.
         SetAllPart3CandidatesInteractable(false);
+
+        // Requirement 2: the End Panel hard stop (see RunPart1() for the full explanation).
+        EndPanelActive = true;
+        OnEndPanelShown?.Invoke();
 
         bool confirmed = false;
         RaiseEvt("panel_shown", "Part3", label: "part3_end");

@@ -5,8 +5,12 @@
 // Revision 2 (data-capture Architecture C) changes - all ADDITIVE, existing columns unchanged:
 //  - Writes into the shared session folder as "gaze.csv" ({session_id}/gaze.csv) when a
 //    DataCaptureManager is present. File + header are created LAZILY on the first written row.
-//  - Per-sample scope gate: rows are written only while DataCaptureManager.ParticipantCaptureActive is
-//    true (Part 2 + Part 3). A Part 1 session therefore produces NO gaze.csv.
+//  - Per-sample scope gate: rows are written only while DataCaptureManager.GazeCaptureActive is true - which
+//    folds together the current Part's PartCaptureConfig.gazeCaptureEnabled (Inspector-configurable per Part
+//    on ExperimentManager, Requirement 1B), an open trial (OnTrialStart..OnTrialEnd), and the End-Panel hard
+//    stop. Previously gated on ParticipantCaptureActive (a hardcoded Part2/Part3 rule with no per-Part
+//    configurability and no End-Panel awareness); GazeCaptureActive supersedes it for this purpose. With the
+//    shipped default Part1Config (gazeCaptureEnabled=false), a Part 1 session still produces NO gaze.csv.
 //  - The ROI raycast now runs whenever enableROIRaycast is true - it is NO LONGER gated on
 //    combined_valid. When eye tracking is invalid the ray is cast from the head-forward fallback and
 //    gaze_ray_source is recorded as "head_fallback". combined_valid remains a TRUE eye-tracking
@@ -330,8 +334,10 @@ public class GazeRecorder : MonoBehaviour
 
         while (true)
         {
-            // Revision 2 scope gate: only Part 2 + Part 3 are captured. Part 1 -> no file, no rows.
-            if (dataCapture != null && !dataCapture.ParticipantCaptureActive)
+            // Revision 2.3 scope gate: per-Part gazeCaptureEnabled AND an open trial AND no End-Panel hard
+            // stop (DataCaptureManager.GazeCaptureActive). With gazeCaptureEnabled=false for a Part -> no
+            // file, no rows for that Part (matches the shipped Part1Config default).
+            if (dataCapture != null && !dataCapture.GazeCaptureActive)
             {
                 yield return new WaitForSecondsRealtime(interval);
                 continue;

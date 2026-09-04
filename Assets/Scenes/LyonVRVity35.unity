@@ -162190,6 +162190,22 @@ MonoBehaviour:
   part1Duration: 15
   part2FirstDuration: 15
   part2SecondDuration: 15
+  part1Config:
+    npcEnabled: 0
+    npcCaptureEnabled: 0
+    gazeCaptureEnabled: 0
+    trajectoryCaptureEnabled: 0
+  part2Config:
+    npcEnabled: 1
+    npcCaptureEnabled: 0
+    gazeCaptureEnabled: 1
+    trajectoryCaptureEnabled: 1
+  part3Config:
+    npcEnabled: 1
+    npcCaptureEnabled: 1
+    gazeCaptureEnabled: 1
+    trajectoryCaptureEnabled: 1
+  npcWarmupDuration: 30
   part1StartPosition: {fileID: 1571442372}
   part1TargetBuildings:
   - {fileID: 1707754393}
@@ -211480,7 +211496,6 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 38f8a3bffff5e4ac5918976fc4507990, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  agentPrefab: {fileID: 3132995531446026970, guid: c34a3349d586043c09271e3b19db0437, type: 3}
 --- !u!4 &2139592828
 Transform:
   m_ObjectHideFlags: 0

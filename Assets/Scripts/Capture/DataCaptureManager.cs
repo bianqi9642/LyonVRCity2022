@@ -4,8 +4,9 @@
 // RESPONSIBILITIES
 //   - Own the session output folder and the manifest (3 write passes).
 //   - Own events.csv, trajectory.csv, npc_state.csv, npc_events.csv, building_registry.csv.
-//   - Hold the single capture-scope state machine (currentPart / currentPhase ->
-//     ParticipantCaptureActive [Part2|Part3], NpcCaptureActive [Part3 only]).
+//   - Hold the single capture-scope state machine (TrajectoryCaptureActive / GazeCaptureActive /
+//     NpcCaptureActive), each derived from ExperimentManager.CurrentPartConfig (the single authoritative
+//     per-Part configuration - see Requirement 7) plus the shared trial/warm-up/End-Panel lifecycle flags.
 //   - Own the teleport epoch counter (single-increment debounce shared by scripted + river teleports).
 //   - Own the NPC spawn-instance id map (PedestrianAgent.AgentID is only a pool-slot identity).
 //   - Provide read context to GazeRecorder + AoiClassifier.
@@ -13,12 +14,45 @@
 // PURE OBSERVER: never calls into experiment control flow; never moves a transform, NavMeshAgent,
 // animator, or timing value. Only subscribes to existing events / reads public state.
 //
-// SCOPE (frozen):
-//   Part 1 : NO research capture. events.csv only: session_start / part_start / part_end /
-//            session_end / app_pause / app_focus. No gaze / trajectory / NPC / registry.
-//   Part 2 : gaze + trajectory + building_registry + participant events. NO NPC capture at all
-//            (0 iteration / 0 linecasts).
-//   Part 3 : full dataset. events.csv is the single authoritative Part 3 record.
+// SCOPE (per-Part configurable, Revision 2.3 - previously a frozen Part1/Part2/Part3 rule table):
+//   Each Part's ExperimentManager.PartCaptureConfig (part1Config/part2Config/part3Config) independently
+//   declares npcEnabled / npcCaptureEnabled / gazeCaptureEnabled / trajectoryCaptureEnabled. The shipped
+//   defaults exactly reproduce the previous frozen rules: Part1 = everything off; Part2 = NPCs on, NPC
+//   capture off, gaze+trajectory on; Part3 = everything on. building_registry.csv generation and the
+//   Part1-suppression of misc. participant events (building_click, river_crossing, candidate_interactable_*,
+//   teleport rows) are UNCHANGED and still hardcoded to "not Part1" - they are not among the four
+//   configurable settings and were left untouched per the minimal-change instruction.
+//
+// NPC WARM-UP (additive, Revision 2.1; Requirement 3 in Revision 2.3 made it conditional on npcEnabled):
+//   ExperimentManager now runs a pre-trial NPC warm-up window (see ExperimentManager.RunNpcWarmup) during
+//   which SpawnerManager spawns/moves NPCs completely normally, but the participant has not yet started
+//   their trial. NpcCaptureActive requires that no warm-up window is open (_npcWarmupActive, driven by the
+//   npc_warmup_start/npc_warmup_end experiment events, which are now raised ONLY for a Part whose
+//   PartCaptureConfig.npcEnabled is true) - otherwise warm-up NPC telemetry would silently enter
+//   npc_state.csv / npc_events.csv and contaminate the participant's NPC record. Any NPC that was already
+//   alive when warm-up ends is picked up automatically by the EXISTING "late-bound" path in SampleNpcs() (an
+//   active agent with no prior spawn record gets one assigned the first time it is sampled) - so carried-over
+//   NPCs start appearing in npc_state.csv from trial start onward, with a one-time npc_latebind warning, and
+//   WITHOUT a synthetic npc_spawn event inside the trial window (which would misrepresent when they actually
+//   spawned). CSV schemas (column order/names) are unchanged.
+//
+// PARTICIPANT CAPTURE SCOPE (additive, Revision 2.2, generalised to gaze+NPC in Revision 2.3):
+//   trajectory.csv (and, as of Revision 2.3, gaze.csv and NPC telemetry too) previously recorded for the
+//   participant's entire Part2/Part3 lifetime, which begins the instant part_start fires - well before
+//   OnTrialStart. That meant capture could include the teleport, the NPC warm-up window, and the Start panel
+//   wait, none of which is the participant's actual experimental behaviour. TrajectoryCaptureActive /
+//   GazeCaptureActive / NpcCaptureActive now ALL require _trialActive (a Part-agnostic flag set true in
+//   OnTrialStart() and false in OnTrialEnd()) AND !_endPanelActive (set true when ExperimentManager raises
+//   OnEndPanelShown, immediately before a Part's End Panel is shown - strictly before part_end). So every
+//   continuous capture stream now runs ONLY between OnTrialStart and the End-Panel-shown moment, for every
+//   Part where its respective *CaptureEnabled flag is on. Part 3's internal D1/D2 sub-phases do not raise
+//   their own OnTrialStart/OnTrialEnd or OnEndPanelShown (ExperimentManager fires exactly one of each per
+//   Part, including Part 3), so this does not fragment capture across Part 3's sub-phases - it only trims the
+//   pre-trial and post-trial/End-Panel edges. GazeRecorder's own per-sample check now reads
+//   dataCapture.GazeCaptureActive instead of the old ParticipantCaptureActive (see GazeRecorder.cs). CSV
+//   schemas (trajectory.csv / gaze.csv / npc_state.csv / npc_events.csv columns) are unchanged; no new
+//   events.csv event type was added for the End-Panel boundary - the existing "panel_shown" row (label
+//   "partX_end") already timestamps that exact moment (see Requirement 8 in the audit response).
 //
 // [DefaultExecutionOrder(-100)] so Start() (and the OnExperimentEvent subscription) runs before
 // ExperimentManager.Start() -> StartSelectedPart() -> RunPartX(), so the very first part_start is caught.
@@ -60,10 +94,26 @@ public class DataCaptureManager : MonoBehaviour
     public string CurrentPart    { get; private set; } = "Unknown";
     public string CurrentPhase   { get; private set; } = "idle";
 
-    /// <summary>Gaze + trajectory + building registry are captured for Part 2 and Part 3.</summary>
-    public bool ParticipantCaptureActive => CurrentPart == CaptureConstants.Part2 || CurrentPart == CaptureConstants.Part3;
-    /// <summary>NPC state / events / LOS are captured for Part 3 ONLY.</summary>
-    public bool NpcCaptureActive => CurrentPart == CaptureConstants.Part3;
+    /// <summary>
+    /// The current Part's PartCaptureConfig, read directly from ExperimentManager - the single authoritative
+    /// source for per-Part NPC/capture configuration (Requirement 7). Null when no Part is running or no
+    /// ExperimentManager is present, in which case all three *CaptureActive properties below are false.
+    /// </summary>
+    ExperimentManager.PartCaptureConfig CurrentConfig => _experimentManager != null ? _experimentManager.CurrentPartConfig : null;
+
+    /// <summary>
+    /// Trajectory is captured only when the current Part's config enables it (trajectoryCaptureEnabled), a
+    /// trial is currently open (_trialActive, OnTrialStart..OnTrialEnd), and the End-Panel hard stop has not
+    /// fired (_endPanelActive). Replaces the old CurrentPart==Part2||Part3 rule, which could not express
+    /// per-Part configurability.
+    /// </summary>
+    public bool TrajectoryCaptureActive => CurrentConfig != null && CurrentConfig.trajectoryCaptureEnabled && _trialActive && !_endPanelActive;
+
+    /// <summary>Gaze is captured only when the current Part's config enables it, a trial is open, and the End-Panel hard stop has not fired.</summary>
+    public bool GazeCaptureActive => CurrentConfig != null && CurrentConfig.gazeCaptureEnabled && _trialActive && !_endPanelActive;
+
+    /// <summary>NPC telemetry is captured only when the current Part's config enables it, a trial is open, no NPC warm-up window is open, and the End-Panel hard stop has not fired.</summary>
+    public bool NpcCaptureActive => CurrentConfig != null && CurrentConfig.npcCaptureEnabled && _trialActive && !_npcWarmupActive && !_endPanelActive;
 
     public GameObject AssignedBuildingD1 { get; private set; }
     public GameObject AssignedBuildingD2 { get; private set; }
@@ -84,6 +134,30 @@ public class DataCaptureManager : MonoBehaviour
     int    _teleportEpoch = 0;
     double _lastEpochBumpT = -10.0;
     int    _spawnInstanceCounter = 0;
+
+    // NEW (NPC warm-up): true while ExperimentManager's pre-trial NPC warm-up window is open (between the
+    // npc_warmup_start and npc_warmup_end experiment events for the current Part). Used only to gate
+    // NpcCaptureActive; never affects trajectory/gaze capture or any other stream.
+    bool _npcWarmupActive = false;
+
+    // NEW (participant capture scope, renamed from _trajectoryCaptureActive): true only between
+    // ExperimentManager.OnTrialStart and OnTrialEnd for the Part currently running - set/cleared in the
+    // OnTrialStart()/OnTrialEnd() handlers below, which already exist and already subscribe to those exact
+    // events. Deliberately Part-agnostic (set to true even during a Part1 trial), mirroring
+    // SpawnerManager.trialActive: it only tracks "is a trial currently open", not "which Part" or "which
+    // stream". Per-Part enable/disable and the End-Panel hard stop are layered on separately by each
+    // *CaptureActive property above, which is what actually decides whether a given stream records anything.
+    bool _trialActive = false;
+
+    // NEW (End Panel hard stop): true from the moment ExperimentManager.OnEndPanelShown fires for the
+    // current Part until the next Part's part_start event is handled below (HandleExperimentEvent). Gates
+    // all three *CaptureActive properties above. In the CURRENT code this is provably redundant with
+    // _trialActive (OnTrialEnd always fires synchronously, in the same frame, strictly before
+    // OnEndPanelShown - see ExperimentManager.RunPartX()), but it is kept as an explicit, independent
+    // condition so the invariant ("no capture while the End Panel is visible") remains correct even if that
+    // synchronous relationship is ever changed (e.g. a fade-out before the panel appears), and so it reads
+    // as self-documenting intent rather than an implicit assumption about coroutine timing.
+    bool _endPanelActive = false;
 
     sealed class NpcRec
     {
@@ -157,6 +231,7 @@ public class DataCaptureManager : MonoBehaviour
             _experimentManager.OnTrialStart += OnTrialStart;
             _experimentManager.OnTrialEnd   += OnTrialEnd;
             _experimentManager.OnExperimentEvent += OnExperimentEvent;
+            _experimentManager.OnEndPanelShown += OnEndPanelShown;
         }
         else Debug.LogWarning("[DataCapture] No ExperimentManager found; event capture / scope tracking limited.");
 
@@ -193,6 +268,7 @@ public class DataCaptureManager : MonoBehaviour
             _experimentManager.OnTrialStart -= OnTrialStart;
             _experimentManager.OnTrialEnd   -= OnTrialEnd;
             _experimentManager.OnExperimentEvent -= OnExperimentEvent;
+            _experimentManager.OnEndPanelShown -= OnEndPanelShown;
         }
         if (_spawner != null)
         {
@@ -249,6 +325,25 @@ public class DataCaptureManager : MonoBehaviour
         {
             CurrentPart = string.IsNullOrEmpty(e.part) ? CurrentPart : e.part;
             CurrentPhase = "idle";
+
+            // NEW (End Panel hard stop): clear any stale hard-stop from whichever Part ran previously, so
+            // the new Part's own OnTrialStart/OnTrialEnd window can capture normally. ExperimentManager has
+            // already set CurrentPartConfig to the new Part's config by the time this event is raised (it is
+            // the very first statement in each RunPartX()), so CurrentConfig below already reflects the new
+            // Part.
+            _endPanelActive = false;
+
+            // NEW (per-Part config, Requirement 1A): one-time diagnostic for a suspicious-but-allowed
+            // configuration - npcCaptureEnabled=true with npcEnabled=false produces an empty (not missing)
+            // npc_state.csv/npc_events.csv for this Part, since no NPC can ever exist to capture.
+            var cfg = CurrentConfig;
+            if (cfg != null && cfg.npcCaptureEnabled && !cfg.npcEnabled)
+            {
+                WarnOnce("npc_capture_without_npc_" + CurrentPart,
+                    $"{CurrentPart}: npcCaptureEnabled=true but npcEnabled=false - npc_state.csv/npc_events.csv " +
+                    "will contain zero rows for this Part (no NPCs will exist to capture).");
+            }
+
             WriteEventRow(e.type, CurrentPart, CurrentPhase, e.label, "", "", "", "", e.numValue, e.stringValue, Vector3.zero, Vector3.zero);
             MaybeBuildRegistry();
             if (CurrentPart != CaptureConstants.Part1)
@@ -268,6 +363,25 @@ public class DataCaptureManager : MonoBehaviour
             CurrentPhase = string.IsNullOrEmpty(e.label) ? CurrentPhase : e.label;
             if (CurrentPart == CaptureConstants.Part1) return;
             WriteEventRow(e.type, CurrentPart, CurrentPhase, e.label, "", "", "", "", 0.0, "", Vector3.zero, Vector3.zero);
+            return;
+        }
+
+        // NEW (NPC warm-up): structural markers, handled the same way as part_start/part_end - always
+        // written to events.csv (even for Part 1, for audit-trail completeness, though they are never
+        // actually raised for a Part whose npcEnabled is false) and NEVER dependent on CurrentPart.
+        // _npcWarmupActive is the ONLY thing these two events change; they never touch
+        // CurrentPart/CurrentPhase/TrajectoryCaptureActive/GazeCaptureActive.
+        if (e.type == CaptureConstants.EvtNpcWarmupStart)
+        {
+            _npcWarmupActive = true;
+            WriteEventRow(e.type, CurrentPart, CurrentPhase, e.label, "", "", "", "", e.numValue, "", Vector3.zero, Vector3.zero);
+            return;
+        }
+
+        if (e.type == CaptureConstants.EvtNpcWarmupEnd)
+        {
+            _npcWarmupActive = false;
+            WriteEventRow(e.type, CurrentPart, CurrentPhase, e.label, "", "", "", "", e.numValue, "", Vector3.zero, Vector3.zero);
             return;
         }
 
@@ -353,14 +467,39 @@ public class DataCaptureManager : MonoBehaviour
 
     void OnTrialStart()
     {
+        // NEW (participant capture scope): flips BEFORE the Part1 early-return below, so it always reflects
+        // "a trial is currently open" regardless of Part. Harmless for Part1 - TrajectoryCaptureActive /
+        // GazeCaptureActive / NpcCaptureActive also require CurrentConfig's respective *CaptureEnabled flag
+        // (false by default for Part1), so this never causes Part1 rows to be written.
+        _trialActive = true;
+
         if (CurrentPart == CaptureConstants.Part1) return;
         WriteEventRow(CaptureConstants.EvtTrialStart, CurrentPart, CurrentPhase, "", "", "", "", "", 0.0, "", Vector3.zero, Vector3.zero);
     }
 
     void OnTrialEnd()
     {
+        // NEW (participant capture scope): see OnTrialStart() above.
+        _trialActive = false;
+
         if (CurrentPart == CaptureConstants.Part1) return;
         WriteEventRow(CaptureConstants.EvtTrialEnd, CurrentPart, CurrentPhase, "", "", "", "", "", 0.0, "", Vector3.zero, Vector3.zero);
+    }
+
+    /// <summary>
+    /// NEW (End Panel hard stop, Requirement 2/2A). Called when ExperimentManager raises OnEndPanelShown for
+    /// the Part currently running - immediately before that Part's End Panel is shown to the participant,
+    /// strictly before part_end. Sets _endPanelActive, which TrajectoryCaptureActive / GazeCaptureActive /
+    /// NpcCaptureActive all require to be false - so TrajectoryLoop()/NpcLoop() stop producing rows on their
+    /// very next tick, and GazeRecorder's own per-sample check (dataCapture.GazeCaptureActive) does the same
+    /// for gaze.csv. No event row is written here beyond this in-memory flag flip: the moment is already
+    /// fully timestamped in events.csv by the existing "panel_shown" row (label "partX_end"), raised by
+    /// ExperimentManager immediately after this handler runs - a dedicated new event type would only
+    /// duplicate that timestamp (see Requirement 8).
+    /// </summary>
+    void OnEndPanelShown()
+    {
+        _endPanelActive = true;
     }
 
     void OnTargetSelectableClicked(TargetSelectable ts)
@@ -394,12 +533,15 @@ public class DataCaptureManager : MonoBehaviour
         _lastEpochBumpT = now;
     }
 
-    // ---------------- NPC lifecycle (Part 3 only) ----------------
+    // ---------------- NPC lifecycle (Part 3 only, and never during NPC warm-up) ----------------
 
     void OnAgentSpawned(PedestrianAgent pa)
     {
         try
         {
+            // NpcCaptureActive is false during warm-up, so a warm-up spawn simply is not recorded here -
+            // no spawn record is created, and the agent will be "late-bound" by SampleNpcs() the first time
+            // it is sampled after NpcCaptureActive becomes true (see SampleNpcs()).
             if (!NpcCaptureActive || pa == null) return;
 
             NpcRec rec = new NpcRec
@@ -457,14 +599,22 @@ public class DataCaptureManager : MonoBehaviour
     public bool IsRegisteredBuildingName(string name)
         => !string.IsNullOrEmpty(name) && _buildingNames.Contains(name);
 
-    // ---------------- trajectory loop (20 Hz) - Part 2 + Part 3 ----------------
+    // ---------------- trajectory loop (per-Part configurable, 20 Hz), ONLY between OnTrialStart and OnTrialEnd, and never after the End Panel is shown ----------------
 
     IEnumerator TrajectoryLoop()
     {
         while (true)
         {
             float interval = 1f / Mathf.Max(1f, trajectoryHz);
-            if (!ParticipantCaptureActive) { yield return new WaitForSecondsRealtime(interval); continue; }
+            // NEW (per-Part config + End Panel hard stop): TrajectoryCaptureActive folds together the
+            // current Part's trajectoryCaptureEnabled flag, the open-trial flag (_trialActive, set by
+            // OnTrialStart/OnTrialEnd), and the End-Panel hard stop (_endPanelActive). Previously a hardcoded
+            // CurrentPart==Part2||Part3 check gated this loop; that could not express per-Part configurability
+            // and had no notion of the End-Panel boundary. Part 3's internal D1/D2 sub-phases raise no
+            // additional OnTrialStart/OnTrialEnd (see ExperimentManager.RunPart3: exactly one pair per Part),
+            // so this does not fragment trajectory capture within Part 3 - it only trims the pre-trial and
+            // post-trial/End-Panel edges.
+            if (!TrajectoryCaptureActive) { yield return new WaitForSecondsRealtime(interval); continue; }
             try { SampleTrajectory(); }
             catch (Exception e) { WarnOnce("traj_tick", "trajectory sample failed: " + e.Message); }
             yield return new WaitForSecondsRealtime(interval);
@@ -523,14 +673,15 @@ public class DataCaptureManager : MonoBehaviour
         catch { return -1; }
     }
 
-    // ---------------- NPC state loop (10 Hz) - Part 3 ONLY ----------------
+    // ---------------- NPC state loop (per-Part configurable, 10 Hz), never during NPC warm-up, never after the End Panel is shown ----------------
 
     IEnumerator NpcLoop()
     {
         while (true)
         {
             float interval = 1f / Mathf.Max(1f, npcHz);
-            // FIRST operation every tick: bail out entirely unless Part 3 is running.
+            // FIRST operation every tick: bail out entirely unless the current Part's npcCaptureEnabled is
+            // true, a trial is open, no warm-up window is open, and the End Panel has not been shown.
             if (!NpcCaptureActive) { yield return new WaitForSecondsRealtime(interval); continue; }
             try { SampleNpcs(); }
             catch (Exception e) { WarnOnce("npc_tick", "npc sample failed: " + e.Message); }
@@ -559,6 +710,11 @@ public class DataCaptureManager : MonoBehaviour
 
             if (!_npcByGo.TryGetValue(go, out NpcRec rec))
             {
+                // NEW (NPC warm-up): this is also the normal path for an NPC that spawned during warm-up
+                // (when NpcCaptureActive was false, so OnAgentSpawned never created a record for it) and is
+                // still alive now that the trial has started. It gets a fresh instance id here, at the
+                // moment it FIRST becomes part of the participant's captured trial - not at its true
+                // (warm-up) spawn time.
                 PedestrianAgent pa = go.GetComponent<PedestrianAgent>();
                 if (pa == null) continue;
                 rec = new NpcRec
@@ -810,6 +966,31 @@ public class DataCaptureManager : MonoBehaviour
 
     // ---------------- manifest ----------------
 
+    /// <summary>
+    /// NEW (per-Part config, OPTIONAL, Requirement 9): a compact snapshot of one Part's
+    /// ExperimentManager.PartCaptureConfig, recorded in session_manifest.json so later analysis can tell,
+    /// without opening the project, whether a given Part had NPCs/NPC capture/gaze/trajectory enabled.
+    /// Purely informational - never read back by any capture logic.
+    /// </summary>
+    [Serializable]
+    public class PartConfigSnapshot
+    {
+        public bool npc_enabled;
+        public bool npc_capture_enabled;
+        public bool gaze_capture_enabled;
+        public bool trajectory_capture_enabled;
+
+        public PartConfigSnapshot() { }
+        public PartConfigSnapshot(ExperimentManager.PartCaptureConfig cfg)
+        {
+            if (cfg == null) return;
+            npc_enabled = cfg.npcEnabled;
+            npc_capture_enabled = cfg.npcCaptureEnabled;
+            gaze_capture_enabled = cfg.gazeCaptureEnabled;
+            trajectory_capture_enabled = cfg.trajectoryCaptureEnabled;
+        }
+    }
+
     [Serializable]
     public class Manifest
     {
@@ -831,6 +1012,12 @@ public class DataCaptureManager : MonoBehaviour
         public float sample_rate_gaze_hz, sample_rate_trajectory_hz, sample_rate_npc_hz;
         public int max_agents;
         public float spawn_interval, dwell_time_min, dwell_time_max;
+        // NEW (NPC warm-up, OPTIONAL): reproducibility record of the warm-up duration configured on
+        // ExperimentManager at session start. Purely informational - never read back by any capture logic.
+        public float npc_warmup_duration_seconds;
+        // NEW (per-Part config, OPTIONAL, Requirement 9): snapshot of all three Parts' PartCaptureConfig,
+        // regardless of which Part this session actually runs - see PartConfigSnapshot doc comment.
+        public PartConfigSnapshot part1_config, part2_config, part3_config;
         public bool npc_capture, trajectory_ok = true, gaze_ok = true, events_ok = true;
         public string randomization_note =
             "UnityEngine.Random not seeded; AttractorDwell uses TickCount-seeded System.Random; NPC trajectories are not replayable from initial conditions.";
@@ -874,6 +1061,15 @@ public class DataCaptureManager : MonoBehaviour
             sample_rate_npc_hz = npcHz,
 
             npc_capture = (_sessionController != null && _sessionController.selectedPart == ExternalSessionController.ExperimentPart.Part3),
+
+            // NEW (NPC warm-up, OPTIONAL): record the configured warm-up duration for reproducibility.
+            npc_warmup_duration_seconds = _experimentManager != null ? _experimentManager.npcWarmupDuration : 0f,
+
+            // NEW (per-Part config, OPTIONAL): snapshot all three Parts' configuration up front - these are
+            // static Inspector values, readable regardless of which Part this session will actually run.
+            part1_config = new PartConfigSnapshot(_experimentManager?.part1Config),
+            part2_config = new PartConfigSnapshot(_experimentManager?.part2Config),
+            part3_config = new PartConfigSnapshot(_experimentManager?.part3Config),
         };
 
         _manifest.part3_group_number = Mathf.Clamp(_manifest.part3_group_index + 1, 1, 12);

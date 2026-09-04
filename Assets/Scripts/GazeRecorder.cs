@@ -18,6 +18,10 @@
 //  - Legacy columns roi_hit_name / roi_hit_distance keep their EXACT previous semantics: populated only
 //    when combined_valid == 1 and the ray hit something.
 //  - Android eye-tracking permission is requested via OVRPermissionsRequester (Meta XR SDK 201).
+//  - Timestamps (time_since_start_s / t_abs / unix_time_ms) are now sourced from CaptureClock.TAbs /
+//    CaptureClock.TUnixMs, the single authoritative timebase for the data-capture layer, instead of
+//    computing Time.realtimeSinceStartupAsDouble / DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+//    independently. Values are numerically identical; only the call site moved.
 //
 // All comments in English per project convention.
 
@@ -201,7 +205,7 @@ public class GazeRecorder : MonoBehaviour
 
         fullPath = BuildFullPath();
         headerWritten = false;
-        recordingStartRealtime = Time.realtimeSinceStartupAsDouble;
+        recordingStartRealtime = CaptureClock.TAbs;
         isRecording = true;
 
         if (enableDebugLogs)
@@ -402,9 +406,9 @@ public class GazeRecorder : MonoBehaviour
             Vector3 headPos = headTransform != null ? headTransform.position : Vector3.zero;
             Quaternion headRot = headTransform != null ? headTransform.rotation : Quaternion.identity;
 
-            double tRel = Time.realtimeSinceStartupAsDouble - recordingStartRealtime;
-            double tAbs = Time.realtimeSinceStartupAsDouble;
-            long unixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            double tAbs = CaptureClock.TAbs;
+            double tRel = tAbs - recordingStartRealtime;
+            long unixMs = CaptureClock.TUnixMs;
             string sessionId = (dataCapture != null && !string.IsNullOrEmpty(dataCapture.SessionId))
                 ? dataCapture.SessionId : (SafeCsvField(subjectId) + "_" + SafeCsvField(trialId));
 

@@ -160288,6 +160288,16 @@ MonoBehaviour:
   subscribeToExperimentEvents: 1
   recordAgentVelocity: 0
   recordRigidbodyVelocity: 0
+  isRecording: 0
+  fullPath: 
+  lastPosition: {x: 0, y: 0, z: 0}
+  lastRealtimeSinceStartup: 0
+  agent: {fileID: 0}
+  rb: {fileID: 0}
+  charController: {fileID: 0}
+  experimentManager: {fileID: 0}
+  externalSessionController: {fileID: 0}
+  moveToTargetComponent: {fileID: 0}
 --- !u!1001 &1627593773
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -191023,7 +191033,6 @@ MonoBehaviour:
   maxAgents: 5
   minAttractorsPerAgent: 1
   maxAttractorsPerAgent: 4
-  stopProbability: 0.7
   dwellTimeSec: {x: 5, y: 15}
   sampleAttractorsAsPositions: 1
   spawnSampleRadius: 1

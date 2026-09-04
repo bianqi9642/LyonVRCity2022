@@ -1,6 +1,6 @@
 // SpawnerManager.cs
 // Extended SpawnerManager that supports:
-// - Sampling attractors as areas/positions (if attractor transforms provide AttractorArea or via NavMesh sampling).
+// - Sampling attractor positions via NavMesh sampling (the AttractorArea component system has been removed).
 // - Applying AgentProfile via optional AgentFactory when creating or reusing agents.
 // - Passing position-based itineraries to PedestrianAgent.InitializePositions(...).
 // - Minimal, non-invasive changes so existing behaviors remain unchanged if new features are not used.
@@ -68,13 +68,12 @@ public class SpawnerManager : MonoBehaviour
     [Header("Itinerary / Behavior")]
     public int minAttractorsPerAgent = 1;
     public int maxAttractorsPerAgent = 4;
-    [Tooltip("Probability to stop at any given attractor (0..1) when itineraries are probabilistic")]
-    public float stopProbability = 0.7f;
     public Vector2 dwellTimeSec = new Vector2(5f, 15f); // min/max dwell
 
     [Header("Attractor sampling")]
-    [Tooltip("If true, when an attractor has an area (AttractorArea component) we'll sample a point inside it and pass position-based itinerary to agents. " +
-             "If false, itinerary uses Transform references only.")]
+    [Tooltip("If true, itineraries are built as position lists via SampleAttractorPosition()/BuildPositionItinerary() instead of Transform references. " +
+             "Note: the AttractorArea component system that used to enable this automatically has been removed, so this path is currently unreachable " +
+             "(AtLeastOneAttractorHasArea() always returns false); left in place for a possible future area-based sampling mechanism.")]
     public bool sampleAttractorsAsPositions = true;
 
     [Header("Spawn Sampling")]
@@ -1037,23 +1036,15 @@ public class SpawnerManager : MonoBehaviour
 
     /// <summary>
     /// Sample a position for a given AttractorInfo:
-    /// - If the attractor transform provides an AttractorArea component, use that object's sampling method.
-    /// - Otherwise attempt NavMesh sampling near the attractor transform position (or fallback to transform.position).
+    /// - Attempt NavMesh sampling near the attractor transform position (or fallback to transform.position).
+    /// - (The previous AttractorArea-component sampling path has been removed; this method now always
+    ///   uses NavMesh sampling.)
     /// </summary>
     Vector3 SampleAttractorPosition(AttractorInfo a)
     {
         if (a == null || a.transform == null) return Vector3.zero;
 
-        // If AttractorArea component exists, prefer its sampling API
-        AttractorArea area = a.transform.GetComponent<AttractorArea>();
-        if (area != null)
-        {
-            Vector3 p = area.SamplePointOnNavMesh();
-            if (enableDebugLogs) Debug.Log($"[AttractorArea] SamplePointOnNavMesh() returning {p} (caller: {Time.frameCount})");
-            if (p != Vector3.zero) return p;
-        }
-
-        // Otherwise attempt NavMesh sampling near the attractor transform
+        // Attempt NavMesh sampling near the attractor transform
         Vector3 fallbackSample = SampleNavMeshNear(a.transform.position, spawnSampleRadius, spawnSampleMaxAttempts);
         if (fallbackSample != Vector3.zero) return fallbackSample;
 
@@ -1230,17 +1221,14 @@ public class SpawnerManager : MonoBehaviour
     }
 
     /// <summary>
-    /// Helper that returns true if at least one configured attractor has an AttractorArea component.
-    /// Used to decide whether position-based sampling makes sense.
+    /// Formerly returned true if at least one configured attractor had an AttractorArea component, which
+    /// gated position-based itinerary sampling. The AttractorArea component system has been removed, so
+    /// there is no longer any component to detect: this always returns false, preserving the exact
+    /// runtime behaviour of the current scene (which already has zero AttractorArea instances, so this
+    /// method already always returned false before this change).
     /// </summary>
     bool AtLeastOneAttractorHasArea()
     {
-        if (attractors == null) return false;
-        foreach (var a in attractors)
-        {
-            if (a == null || a.transform == null) continue;
-            if (a.transform.GetComponent<AttractorArea>() != null) return true;
-        }
         return false;
     }
 

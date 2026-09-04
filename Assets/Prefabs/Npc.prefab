@@ -2633,6 +2633,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   arriveTolerance: 0.6
   agentID: 
+  moveReadyPollTimeout: 3
 --- !u!114 &1508726075884422733
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -2680,7 +2681,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 58a18e62cb6f442a9b51f9c9f7b22c6c, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  moveController: {fileID: 0}
+  moveController: {fileID: 1508726075884422733}
   agent: {fileID: 530888773655168915}
   pauseProbPerSec: 0.02
   hesitateProbPerSec: 0.04

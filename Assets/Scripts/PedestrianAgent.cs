@@ -164,10 +164,13 @@ public class PedestrianAgent : MonoBehaviour
             try { moveToTarget.SetMoveSpeed(moveToTarget.speed); } catch (Exception) { /* ignore if missing */ }
         }
 
-        // If this agent has an UncertainBehavior (pooled reuse case), ensure it is resumed
-        // so uncertain behavior will run for the entire new itinerary.
+        // Stage 4: fully reset UncertainBehavior's per-life runtime state (state machine, saved detour
+        // target, retry count, suspend flag, event subscriptions) so a reused pooled instance starts this
+        // life clean, then re-enable it for the new itinerary. (ResumeAfterArrival() remains used for the
+        // lighter-weight per-dwell resume in the WaitAtAttractor/PollForCapacity/SimpleDwellThenAdvance
+        // coroutines below - this call site needs the full reset instead.)
         if (uncertainBehavior != null)
-            uncertainBehavior.ResumeAfterArrival();
+            uncertainBehavior.ResetForReuse();
 
         // NEW (fix for pooled-agent reactivation race): rather than calling MoveToCurrent() synchronously
         // here (which could race with MoveToTarget's own pooled-reuse re-warp onto the NavMesh, see

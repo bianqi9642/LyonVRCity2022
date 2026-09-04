@@ -23,7 +23,7 @@ MonoBehaviour:
   acceleration: 8
   angularSpeed: 120
   avoidancePriority: 50
-  forceUncertain: 0
+  forceUncertain: 1
   uncertainProbability: 0.2
   bodyOptions: []
   hairOptions:

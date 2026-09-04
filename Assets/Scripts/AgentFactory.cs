@@ -6,6 +6,9 @@ using UnityEngine.AI;
 /// NPC GameObject. This script calls AppearanceController.ApplyProfile and applies movement/behavior/navmesh
 /// settings. Supports AgentProfile.speedOptions (multipliers) so final per-agent speed = profile.speed *
 /// chosenMultiplier.
+/// Stage 4 (Option A movement-architecture migration): the applied speed is now handed to
+/// MoveToTarget.SetNormalSpeed() instead of being written to NavMeshAgent.speed directly - MoveToTarget is
+/// the single component allowed to control the NavMeshAgent.
 /// </summary>
 public class AgentFactory : MonoBehaviour
 {
@@ -32,27 +35,32 @@ public class AgentFactory : MonoBehaviour
 
         if (nav != null)
         {
+            // Shape/avoidance configuration - unrelated to movement authority, stays a direct NavMeshAgent write.
             nav.radius = profile.agentRadius;
             nav.height = profile.agentHeight;
-            nav.speed = appliedSpeed;
             nav.acceleration = profile.acceleration;
             nav.angularSpeed = profile.angularSpeed;
             nav.avoidancePriority = Mathf.Clamp(profile.avoidancePriority, 0, 99);
         }
-        else if (move != null)
+
+        // Stage 4: the normal-walking speed baseline is now owned exclusively by MoveToTarget. AgentFactory
+        // no longer writes NavMeshAgent.speed directly - it hands the applied profile speed to
+        // MoveToTarget.SetNormalSpeed(), which both stores it as the baseline (for
+        // UncertainBehavior.RestoreNormalSpeed()/EnterSlow() to read/restore) and writes it to the live
+        // NavMeshAgent immediately.
+        if (move != null)
         {
-            move.SetMoveSpeed(appliedSpeed);
+            move.SetNormalSpeed(appliedSpeed);
+        }
+        else if (nav != null)
+        {
+            // Defensive fallback for a prefab with a NavMeshAgent but no MoveToTarget (should not occur on
+            // the real NPC prefab, which always carries both).
+            nav.speed = appliedSpeed;
         }
 
         if (uncertain != null)
         {
-            // Re-baseline UncertainBehavior's "normal" speed to THIS spawn's applied speed.
-            // UncertainBehavior.Start() only runs once per pooled GameObject's lifetime, so on every pool
-            // reuse this call is the only thing that keeps the Slow/Detour "restore speed" baseline in
-            // sync with the CURRENT AgentProfile - without it, a reused NPC could restore a stale speed
-            // left over from a previous lifetime's profile after a Slow state ends.
-            uncertain.ResetBaselineSpeed(appliedSpeed);
-
             // configure UncertainBehavior: either force, probabilistic, or off
             uncertain.enabled = profile.forceUncertain || Random.value < profile.uncertainProbability;
         }

@@ -1,9 +1,13 @@
 // UncertainBehavior.cs
-// Attach to an NPC GameObject that has MoveToTarget (preferred) or a NavMeshAgent.
+// Attach to an NPC GameObject alongside its MoveToTarget component.
 // Implements uncertain walking: pauses, hesitates (in-place turns), slow-walk, and short detours.
-// New behavior: when the agent reaches its main target, uncertain behavior is suspended/stopped.
-// - If a MoveToTarget is assigned, we listen to its OnArrived event (main arrival).
-// - If only a NavMeshAgent is used, we poll remainingDistance to detect arrival.
+// Stage 4 (Option A movement-architecture migration): MoveToTarget is now the ONLY component that may
+// touch NavMeshAgent for movement control (SetDestination/isStopped/speed). UncertainBehavior expresses
+// behavioural intent exclusively through MoveToTarget's public API (PauseExternal/ResumeExternal/MoveTo/
+// SetTemporarySpeed/RestoreNormalSpeed/OnArrived). The 'agent' field is retained only as a read-only NavMesh
+// helper reference for EnterDetour()'s path-planning sample/verify step - it is never used to issue a
+// movement command.
+// When the agent reaches its main target (via MoveToTarget.OnArrived), uncertain behavior is suspended/stopped.
 //
 // All comments and logs are in English.
 
@@ -13,11 +17,13 @@ using UnityEngine.AI;
 
 public class UncertainBehavior : MonoBehaviour
 {
-    [Header("References (one recommended)")]
-    [Tooltip("Preferred: assign the MoveToTarget component on this GameObject.")]
-    public MoveToTarget moveController; // optional, preferred control API
-    [Tooltip("Fallback: assign NavMeshAgent if MoveToTarget is not used.")]
-    public NavMeshAgent agent;          // fallback control if moveController null
+    [Header("References")]
+    [Tooltip("Required: the MoveToTarget component on this GameObject. All movement (pause/resume/detour/" +
+             "temporary speed) is expressed through this reference; there is no NavMeshAgent-direct fallback.")]
+    public MoveToTarget moveController;
+    [Tooltip("Read-only helper (NOT used for movement control): only EnterDetour() reads agent.nextPosition " +
+             "here for NavMesh path-planning. Movement is always routed through moveController (MoveToTarget).")]
+    public NavMeshAgent agent;
 
     [Header("Probabilities (per second)")]
     [Tooltip("Chance per second to start a pause")]
@@ -59,8 +65,9 @@ public class UncertainBehavior : MonoBehaviour
     [Tooltip("Angular speed (deg/s) when doing in-place turn")]
     public float turnSpeedDeg = 120f;
 
-    [Header("Arrival detection (when MoveToTarget is NOT used)")]
-    [Tooltip("Threshold (m) used when polling NavMeshAgent.remainingDistance to declare arrival if MoveToTarget is not present.")]
+    [Header("Arrival detection (legacy - no longer read)")]
+    [Tooltip("No longer used after Stage 4: arrival is now detected exclusively via MoveToTarget.OnArrived. " +
+             "Kept only so this Inspector value is not silently dropped from the prefab.")]
     public float arrivalStopThreshold = 0.22f;
 
     [Header("Logging")]
@@ -73,7 +80,6 @@ public class UncertainBehavior : MonoBehaviour
 
     float stateTimer = 0f;
     Vector3 detourTarget;
-    float originalSpeed = 1f;
 
     // For logging durations
     float stateStartTime = 0f;
@@ -104,26 +110,18 @@ public class UncertainBehavior : MonoBehaviour
             else
                 Debug.Log($"[UncertainBehavior] [{gameObject.name}] moveController assigned at Start -> {moveController.name}");
 
-        // Auto-assign agent if none provided
-        if (moveController == null && agent == null)
+        // Auto-assign the read-only NavMeshAgent helper reference if none provided. Movement itself is
+        // always routed through moveController (MoveToTarget); 'agent' is used only for the nextPosition
+        // read in EnterDetour()'s path-planning step.
+        if (agent == null)
             agent = GetComponent<NavMeshAgent>();
 
-        // Save original speed (from MoveToTarget or agent)
-        if (moveController != null)
-        {
-            originalSpeed = moveController.speed;
-            // If MoveToTarget wraps a NavMeshAgent, prefer that runtime speed as authoritative
-            if (moveController.agent != null)
-                originalSpeed = moveController.agent.speed;
-        }
-        else if (agent != null)
-        {
-            originalSpeed = agent.speed;
-        }
-
-        // If we have a MoveToTarget, subscribe to its OnArrived to detect arrival at the main target.
-        // We keep a separate handler (onMainArrivalHandler) to distinguish from the detour-specific handler.
-        if (moveController != null)
+        // Subscribe to MoveToTarget's OnArrived to detect arrival at the main target.
+        // Guarded by 'onMainArrivalHandler == null' (Stage 4): ResetForReuse() can already have subscribed
+        // this handler by the time Start() runs (Start() is deferred by Unity, while PedestrianAgent.Initialize()
+        // -> ResetForReuse() can run synchronously right after Instantiate()/SetActive(true)), so this guard
+        // prevents a duplicate subscription on an NPC's very first activation.
+        if (moveController != null && onMainArrivalHandler == null)
         {
             onMainArrivalHandler = () => OnMainArrivedFromMoveController();
             moveController.OnArrived += onMainArrivalHandler;
@@ -131,16 +129,39 @@ public class UncertainBehavior : MonoBehaviour
     }
 
     /// <summary>
-    /// Resets the "normal walking speed" baseline that EnterSlow() scales down from and ExitCurrentState()
-    /// restores to. Must be called every time this (possibly pooled) instance is spawned/reused with a
-    /// (possibly new) AgentProfile - Start() only runs once per GameObject lifetime, so it cannot detect a
-    /// later pool reuse on its own. Calling this does not touch the current state machine, isStopped,
-    /// NavMeshAgent, or MoveToTarget - it only updates the internal baseline used the NEXT time a
-    /// Slow/Detour state starts or ends.
+    /// Stage 4: full per-life runtime reset for pool reuse / a fresh spawn. Called once by
+    /// PedestrianAgent.Initialize() before the new itinerary begins - NOT after every dwell (see
+    /// ResumeAfterArrival() for that lighter-weight case, still used by the dwell coroutines). Clears every
+    /// piece of state that belongs to the PREVIOUS lifetime so a reused NPC always starts this life in a
+    /// clean Walking state, with no leftover behavioural state, saved detour target, retry count, or stale
+    /// event subscription. Does not touch configuration values (probabilities/durations/factors/references) -
+    /// only runtime state. Does not need to reset any "temporary speed" state because Stage 4 no longer
+    /// stores that here at all - the normal-speed baseline lives in MoveToTarget.speed, freshly set every
+    /// spawn/reuse by AgentFactory.ApplyProfileToInstance() -> MoveToTarget.SetNormalSpeed().
     /// </summary>
-    public void ResetBaselineSpeed(float speed)
+    public void ResetForReuse()
     {
-        originalSpeed = speed;
+        // Defensive unsubscribe of a detour handler left over from a previous life (e.g. if the object was
+        // pooled mid-Detour without a clean ExitCurrentState() pass).
+        if (moveController != null && onMoveToArrivedHandler != null)
+        {
+            moveController.OnArrived -= onMoveToArrivedHandler;
+            onMoveToArrivedHandler = null;
+        }
+
+        state = State.Walking;
+        stateTimer = 0f;
+        detourArrivalRetryCount = 0;
+        haveSavedMainTarget = false;
+        mainTargetOnDetourStart = Vector3.zero;
+        suspendedBecauseArrived = false;
+
+        // Re-subscribe the main-arrival handler for this life (idempotent: only subscribes if not already).
+        if (moveController != null && onMainArrivalHandler == null)
+        {
+            onMainArrivalHandler = () => OnMainArrivedFromMoveController();
+            moveController.OnArrived += onMainArrivalHandler;
+        }
     }
 
     void Update()
@@ -150,23 +171,6 @@ public class UncertainBehavior : MonoBehaviour
         // If we've been suspended due to arrival, do nothing — uncertain behavior is stopped.
         if (suspendedBecauseArrived)
             return;
-
-        // If MoveToTarget is not present, but we have a NavMeshAgent, poll for main-target arrival.
-        // This detects arrival and suspends uncertain behavior when using agent-only navigation.
-        if (moveController == null && agent != null)
-        {
-            // Only evaluate arrival when agent has a finite remainingDistance and path is not pending.
-            if (!agent.pathPending)
-            {
-                float rd = agent.remainingDistance;
-                if (!float.IsInfinity(rd) && rd <= arrivalStopThreshold)
-                {
-                    // Agent has arrived at its destination -> suspend uncertain behavior.
-                    SuspendBecauseArrived("agent.remainingDistance");
-                    return;
-                }
-            }
-        }
 
         // Normal state timer handling (only runs when not suspended)
         if (state != State.Walking)
@@ -211,7 +215,7 @@ public class UncertainBehavior : MonoBehaviour
                 DoHesitate(dt);
                 break;
             case State.Detour:
-                // Detour flow is driven by MoveToTarget / agent and OnArrived verification.
+                // Detour flow is driven by MoveToTarget and OnArrived verification.
                 // We only use stateTimer as a fallback timeout; no manual movement here.
                 break;
             // Pause and Slow are handled by PauseExternal/ResumeExternal or speed scaling; no per-frame action needed here.
@@ -225,16 +229,16 @@ public class UncertainBehavior : MonoBehaviour
         state = State.Pause;
         stateTimer = UnityEngine.Random.Range(pauseMin, pauseMax);
         stateStartTime = Time.time;
+
         // Use PauseExternal so MoveToTarget won't treat this as 'arrived'
         if (moveController != null)
         {
             // Full halt + freeze animator
             moveController.PauseExternal(true, true);
         }
-        else if (agent != null)
+        else if (enableLogging)
         {
-            // Fallback: stop the agent directly
-            agent.isStopped = true;
+            Debug.LogWarning($"[UncertainBehavior] [{gameObject.name}] EnterPause: moveController is null; cannot pause movement.");
         }
 
         LogStateEnter(State.Pause, stateTimer);
@@ -251,11 +255,9 @@ public class UncertainBehavior : MonoBehaviour
             // Hesitate uses a "soft pause": don't halt movement and don't freeze animator.
             moveController.PauseExternal(false, false);
         }
-        else if (agent != null)
+        else if (enableLogging)
         {
-            // For agent-only fallback, we intentionally do not stop the agent so small translational motion can happen.
-            // If you prefer strict in-place turning for Hesitate, uncomment the next line:
-            // agent.isStopped = true;
+            Debug.LogWarning($"[UncertainBehavior] [{gameObject.name}] EnterHesitate: moveController is null; cannot apply soft pause.");
         }
 
         LogStateEnter(State.Hesitate, stateTimer);
@@ -267,16 +269,15 @@ public class UncertainBehavior : MonoBehaviour
         stateTimer = UnityEngine.Random.Range(slowMin, slowMax);
         stateStartTime = Time.time;
 
-        // When MoveToTarget drives the NPC, ensure we set both its public speed field and its internal agent runtime speed.
         if (moveController != null)
         {
-            moveController.speed = originalSpeed * slowFactor;
-            if (moveController.agent != null)
-                moveController.agent.speed = originalSpeed * slowFactor;
+            // moveController.speed is MoveToTarget's own normal-walking baseline (kept current by
+            // AgentFactory.SetNormalSpeed() every spawn/reuse) - read it live rather than caching a copy.
+            moveController.SetTemporarySpeed(moveController.speed * slowFactor);
         }
-        else if (agent != null)
+        else if (enableLogging)
         {
-            agent.speed = originalSpeed * slowFactor;
+            Debug.LogWarning($"[UncertainBehavior] [{gameObject.name}] EnterSlow: moveController is null; cannot reduce speed.");
         }
 
         LogStateEnter(State.Slow, stateTimer);
@@ -314,7 +315,9 @@ public class UncertainBehavior : MonoBehaviour
                 // verify reachability with a full path calculation from current position to hit.position
                 NavMeshPath testPath = new NavMeshPath();
                 Vector3 startPos = transform.position;
-                // If we have a NavMeshAgent and updatePosition==false, it's safer to use agent.nextPosition as start for path calc.
+                // Read-only NavMesh planning helper: prefer the agent's own nextPosition as the path-calc
+                // start when available. This is an informational read only - it never issues a movement
+                // command against the NavMeshAgent.
                 if (agent != null)
                     startPos = agent.nextPosition;
 
@@ -341,8 +344,8 @@ public class UncertainBehavior : MonoBehaviour
             stateStartTime = Time.time;
             if (moveController != null)
                 moveController.PauseExternal(true, true);
-            else if (agent != null)
-                agent.isStopped = true;
+            else if (enableLogging)
+                Debug.LogWarning($"[UncertainBehavior] [{gameObject.name}] EnterDetour: no valid detour point found and moveController is null; cannot pause movement.");
 
             LogStateEnter(State.Pause, stateTimer);
             return;
@@ -371,11 +374,9 @@ public class UncertainBehavior : MonoBehaviour
             // Ask MoveToTarget to navigate to detour target
             moveController.MoveTo(detourTarget);
         }
-        else if (agent != null)
+        else if (enableLogging)
         {
-            // Fallback: use the agent to go to detour
-            agent.isStopped = false;
-            agent.SetDestination(detourTarget);
+            Debug.LogWarning($"[UncertainBehavior] [{gameObject.name}] EnterDetour: moveController is null; cannot move to detour target.");
         }
 
         // fallback timer so detour doesn't run forever if something blocks movement visually
@@ -419,10 +420,6 @@ public class UncertainBehavior : MonoBehaviour
                 {
                     moveController.MoveTo(detourTarget);
                 }
-                else if (agent != null)
-                {
-                    agent.SetDestination(detourTarget);
-                }
 
                 // extend a little time so we give it another chance
                 stateTimer = Mathf.Max(0.5f, stateTimer);
@@ -446,10 +443,6 @@ public class UncertainBehavior : MonoBehaviour
                 if (moveController != null)
                 {
                     moveController.PauseExternal(true, true);
-                }
-                else if (agent != null)
-                {
-                    agent.isStopped = true;
                 }
 
                 LogStateEnter(State.Pause, stateTimer);
@@ -483,10 +476,9 @@ public class UncertainBehavior : MonoBehaviour
 
         if (moveController != null)
         {
-            // restore speed (ensure runtime agent speed if present matches)
-            moveController.speed = originalSpeed;
-            if (moveController.agent != null)
-                moveController.agent.speed = originalSpeed;
+            // Restore the normal-walking speed baseline (owned by MoveToTarget; set on every spawn/reuse by
+            // AgentFactory via SetNormalSpeed()).
+            moveController.RestoreNormalSpeed();
 
             // resume external control
             moveController.ResumeExternal();
@@ -499,39 +491,22 @@ public class UncertainBehavior : MonoBehaviour
                 moveController.MoveTo(mainTarget);
             }
         }
-        else if (agent != null)
+        else if (enableLogging)
         {
-            // restore speed and resume agent
-            agent.speed = originalSpeed;
-            agent.isStopped = false;
-
-            // re-assign destination if it's meaningfully different from current
-            Vector3 agentDest = agent.destination;
-            if (float.IsNaN(agentDest.x) || float.IsNaN(agentDest.y) || float.IsNaN(agentDest.z) ||
-                Vector3.Distance(agentDest, mainTarget) > k_DestCompareThreshold)
-            {
-                agent.SetDestination(mainTarget);
-            }
-
-            // ensure agent internal nextPosition synced to transform to avoid a large warp
-            agent.nextPosition = transform.position;
+            Debug.LogWarning($"[UncertainBehavior] [{gameObject.name}] ExitCurrentState: moveController is null; cannot restore movement.");
         }
 
         // Reset detour retry counter
         detourArrivalRetryCount = 0;
     }
 
-    // Helper to determine the main target (the goal that MoveToTarget or agent should go to after interruptions)
+    // Helper to determine the main target (the goal that MoveToTarget should go to after interruptions)
     Vector3 GetCurrentMainTarget()
     {
         if (moveController != null)
         {
             // MoveToTarget exposes public targetTransform/targetPosition fields in earlier code
             return moveController.targetTransform != null ? moveController.targetTransform.position : moveController.targetPosition;
-        }
-        else if (agent != null)
-        {
-            return agent.destination;
         }
         return transform.position;
     }
@@ -562,7 +537,7 @@ public class UncertainBehavior : MonoBehaviour
 
     // ---- Arrival handling helpers ----
 
-    // Called when MoveToTarget.OnArrived fires (subscribed in Start()).
+    // Called when MoveToTarget.OnArrived fires (subscribed in Start()/ResetForReuse()).
     // We treat this as the main-target arrival signal, but only if we are not currently performing a detour.
     void OnMainArrivedFromMoveController()
     {

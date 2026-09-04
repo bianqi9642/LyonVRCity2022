@@ -1,8 +1,13 @@
 // MoveToTarget_NavMeshOnly.cs
 // NavMeshAgent-only mover that drives a GameObject from a start Transform/position to a target Transform/position.
 // - Uses NavMeshAgent exclusively for movement. The NavMeshAgent is the authoritative steering controller.
-// - MoveToTarget will NOT overwrite NavMeshAgent.speed by default. To allow MoveToTarget to set agent.speed,
-//   enable the 'autoSetAgentSpeed' flag on the component.
+// - MoveToTarget will NOT overwrite NavMeshAgent.speed via SetMoveSpeed()/autoSetAgentSpeed by default. To
+//   allow SetMoveSpeed() to write agent.speed, enable the 'autoSetAgentSpeed' flag on the component.
+// - Stage 4 (Option A movement-architecture migration): SetNormalSpeed()/SetTemporarySpeed()/
+//   RestoreNormalSpeed() are a SEPARATE, always-active speed API used by AgentFactory (normal baseline,
+//   every spawn/reuse) and UncertainBehavior (temporary Slow-state override) now that MoveToTarget is the
+//   single movement authority. They intentionally bypass the autoSetAgentSpeed gate - that flag still governs
+//   only the older SetMoveSpeed() path.
 // - Script keeps control of rotation (agent.updateRotation = false) so rotation smoothing is applied here.
 // - External pause API available (halt movement and/or freeze animator).
 // - Drives animator from measured translational speed (smoothed).
@@ -29,8 +34,11 @@ public class MoveToTarget : MonoBehaviour
     public Vector3 targetPosition = new Vector3(5f, 0f, 5f);
 
     [Header("Movement")]
-    // Local copy of desired speed; used for animator fallback and when agent is absent.
-    // NOTE: When a NavMeshAgent is present, that agent's speed is authoritative unless autoSetAgentSpeed == true.
+    // Local copy of desired speed; used for animator fallback and when agent is absent, and (Stage 4) as the
+    // "normal walking" baseline set via SetNormalSpeed() and restored via RestoreNormalSpeed() after a
+    // temporary override from SetTemporarySpeed().
+    // NOTE: When a NavMeshAgent is present, that agent's speed is authoritative unless autoSetAgentSpeed ==
+    // true OR one of SetNormalSpeed()/SetTemporarySpeed()/RestoreNormalSpeed() is called explicitly.
     public float speed = 1.4f;
     public float arriveThreshold = 0.2f;
     public bool faceMovementDirection = true;
@@ -636,6 +644,42 @@ public class MoveToTarget : MonoBehaviour
         {
             agent.speed = s;
         }
+    }
+
+    /// <summary>
+    /// Stage 4 (Option A movement-architecture migration): sets the authoritative "normal walking" speed
+    /// baseline. Called by AgentFactory.ApplyProfileToInstance() every spawn/pool reuse, after the current
+    /// AgentProfile's applied speed (base speed * speedOptions multiplier) has been computed. Unlike
+    /// SetMoveSpeed()/autoSetAgentSpeed (a separate, opt-in mechanism left unchanged for any other caller),
+    /// this ALWAYS writes NavMeshAgent.speed immediately - MoveToTarget is the single component allowed to
+    /// do so, and 'speed' becomes what RestoreNormalSpeed() returns to after a temporary override.
+    /// </summary>
+    public void SetNormalSpeed(float s)
+    {
+        speed = s;
+        if (agent != null)
+            agent.speed = s;
+    }
+
+    /// <summary>
+    /// Stage 4: immediately overrides the live NavMeshAgent speed for a temporary behavioural interruption
+    /// (e.g. UncertainBehavior's Slow state). Does NOT change the normal-speed baseline ('speed') - call
+    /// RestoreNormalSpeed() to return to it. Independent of autoSetAgentSpeed by design.
+    /// </summary>
+    public void SetTemporarySpeed(float s)
+    {
+        if (agent != null)
+            agent.speed = s;
+    }
+
+    /// <summary>
+    /// Stage 4: restores NavMeshAgent.speed to the current normal-walking baseline (the last value set via
+    /// SetNormalSpeed()), ending a temporary override from SetTemporarySpeed().
+    /// </summary>
+    public void RestoreNormalSpeed()
+    {
+        if (agent != null)
+            agent.speed = speed;
     }
 
     /// <summary>

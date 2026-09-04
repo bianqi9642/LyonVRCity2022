@@ -130,6 +130,19 @@ public class UncertainBehavior : MonoBehaviour
         }
     }
 
+    /// <summary>
+    /// Resets the "normal walking speed" baseline that EnterSlow() scales down from and ExitCurrentState()
+    /// restores to. Must be called every time this (possibly pooled) instance is spawned/reused with a
+    /// (possibly new) AgentProfile - Start() only runs once per GameObject lifetime, so it cannot detect a
+    /// later pool reuse on its own. Calling this does not touch the current state machine, isStopped,
+    /// NavMeshAgent, or MoveToTarget - it only updates the internal baseline used the NEXT time a
+    /// Slow/Detour state starts or ends.
+    /// </summary>
+    public void ResetBaselineSpeed(float speed)
+    {
+        originalSpeed = speed;
+    }
+
     void Update()
     {
         float dt = Time.deltaTime;

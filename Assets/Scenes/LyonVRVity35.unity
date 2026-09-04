@@ -15661,9 +15661,6 @@ PrefabInstance:
     - targetCorrespondingSourceObject: {fileID: 7696548424635294048, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
       insertIndex: -1
       addedObject: {fileID: 1625669938}
-    - targetCorrespondingSourceObject: {fileID: 7696548424635294048, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
-      insertIndex: -1
-      addedObject: {fileID: 1625669945}
     - targetCorrespondingSourceObject: {fileID: 9014170783809206332, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
       insertIndex: -1
       addedObject: {fileID: 560509423}
@@ -160268,36 +160265,6 @@ Transform:
   m_CorrespondingSourceObject: {fileID: 7696548424635294051, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
   m_PrefabInstance: {fileID: 156316457}
   m_PrefabAsset: {fileID: 0}
---- !u!114 &1625669945
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1625669931}
-  m_Enabled: 0
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: e5ff12a6508a243f68bbb4536a6b1210, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  subjectId: sub-001
-  trialId: trial-001
-  sampleRate: 30
-  autoStartIfNoExperimentManager: 0
-  appendToFile: 0
-  subscribeToExperimentEvents: 1
-  recordAgentVelocity: 0
-  recordRigidbodyVelocity: 0
-  isRecording: 0
-  fullPath: 
-  lastPosition: {x: 0, y: 0, z: 0}
-  lastRealtimeSinceStartup: 0
-  agent: {fileID: 0}
-  rb: {fileID: 0}
-  charController: {fileID: 0}
-  experimentManager: {fileID: 0}
-  externalSessionController: {fileID: 0}
-  moveToTargetComponent: {fileID: 0}
 --- !u!1001 &1627593773
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -191034,7 +191001,6 @@ MonoBehaviour:
   minAttractorsPerAgent: 1
   maxAttractorsPerAgent: 4
   dwellTimeSec: {x: 5, y: 15}
-  sampleAttractorsAsPositions: 1
   spawnSampleRadius: 1
   spawnSampleMaxAttempts: 8
   groundLayers:

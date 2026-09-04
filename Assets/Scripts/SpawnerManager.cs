@@ -1,8 +1,6 @@
 // SpawnerManager.cs
 // Extended SpawnerManager that supports:
-// - Sampling attractor positions via NavMesh sampling (the AttractorArea component system has been removed).
 // - Applying AgentProfile via optional AgentFactory when creating or reusing agents.
-// - Passing position-based itineraries to PedestrianAgent.InitializePositions(...).
 // - Minimal, non-invasive changes so existing behaviors remain unchanged if new features are not used.
 //
 // This version fixes compile errors caused by previous MoveToTarget refactor that removed the
@@ -23,7 +21,7 @@
 // (e.g. for ambient background population that is not meant to be the manipulated stimulus).
 //
 // NEW (Quest logging fix): SpawnerManager previously logged unconditionally and verbosely on every
-// spawn/despawn (LogAgentItinerary/LogAgentItineraryPositions build a multi-line StringBuilder per spawn),
+// spawn/despawn (LogAgentItinerary builds a multi-line StringBuilder per spawn),
 // with no build-time or runtime gate - unlike MoveToTarget, which already has an 'enableDebugLogs' toggle.
 // On Quest, this string-heavy per-spawn logging is a known performance drain that scales with
 // maxAgents/spawnInterval. SpawnerManager now has its own 'enableDebugLogs' flag (mirroring MoveToTarget's),
@@ -69,12 +67,6 @@ public class SpawnerManager : MonoBehaviour
     public int minAttractorsPerAgent = 1;
     public int maxAttractorsPerAgent = 4;
     public Vector2 dwellTimeSec = new Vector2(5f, 15f); // min/max dwell
-
-    [Header("Attractor sampling")]
-    [Tooltip("If true, itineraries are built as position lists via SampleAttractorPosition()/BuildPositionItinerary() instead of Transform references. " +
-             "Note: the AttractorArea component system that used to enable this automatically has been removed, so this path is currently unreachable " +
-             "(AtLeastOneAttractorHasArea() always returns false); left in place for a possible future area-based sampling mechanism.")]
-    public bool sampleAttractorsAsPositions = true;
 
     [Header("Spawn Sampling")]
     public float spawnSampleRadius = 1.0f; // sample radius around entrance on the horizontal plane
@@ -641,75 +633,38 @@ public class SpawnerManager : MonoBehaviour
                 return;
             }
 
-            // Build itinerary - choose between Transform-based or Position-based itineraries depending on configuration
-            bool usingPositions = sampleAttractorsAsPositions && AtLeastOneAttractorHasArea();
+            // Build itinerary (Transform-based; BuildItinerary will insert the chosen entrance as itinerary[0]).
             float dwell = Random.Range(dwellTimeSec.x, dwellTimeSec.y);
 
-            if (usingPositions)
+            List<Transform> itinerary = BuildItinerary(chosenEntrance);
+
+            // --- ensure MoveToTarget start/target reflect StartTransform -> first itinerary entry ---
+            if (mt != null)
             {
-                // Build position itinerary and optional parallel AttractorInfo list.
-                // IMPORTANT: BuildPositionItinerary will insert the chosen entrance position as positions[0].
-                List<Vector3> posItin;
-                List<AttractorInfo> posAttractorInfos;
-                BuildPositionItinerary(chosenEntrance, out posItin, out posAttractorInfos);
+                mt.startTransform = (startTransform != null) ? startTransform : chosenEntrance;
 
-                // Configure MoveToTarget start/target for position-mode
-                if (mt != null)
+                if (itinerary != null && itinerary.Count > 0 && itinerary[0] != null)
+                    mt.targetTransform = itinerary[0];
+                else
                 {
-                    // Start transform should be the user-provided startTransform (if present). If not present fallback to chosen entrance.
-                    mt.startTransform = (startTransform != null) ? startTransform : chosenEntrance;
-                    mt.startPosition = go.transform.position;
-
-                    mt.targetTransform = null;
-                    if (posItin != null && posItin.Count > 0)
-                        mt.targetPosition = posItin[0];
+                    if (itinerary != null && itinerary.Count > 0)
+                        mt.targetTransform = itinerary[itinerary.Count - 1];
                     else
-                        mt.targetPosition = go.transform.position;
+                        mt.targetTransform = null;
                 }
 
-                // Try to get AgentID for logging
-                string aid = agentScript != null ? agentScript.AgentID : "n/a";
-
-                // Log
-                LogAgentItineraryPositions(go, entranceIndex, chosenEntrance, posItin, mt, go.GetComponent<NavMeshAgent>(), dwell);
-                if (enableDebugLogs) Debug.Log($"[SpawnerManager] Spawned pooled agent AgentID={aid} (pooled reuse) at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}");
-                // Initialize agent with positions + optional attractor infos
-                agentScript.InitializePositions(posItin, posAttractorInfos, this, dwell);
+                mt.startPosition = go.transform.position;
             }
-            else
-            {
-                // Build transform-based itinerary
-                // BuildItinerary will insert the chosen entrance as itinerary[0].
-                List<Transform> itinerary = BuildItinerary(chosenEntrance);
+            // --- end ---
 
-                // --- ensure MoveToTarget start/target reflect StartTransform -> first itinerary entry ---
-                if (mt != null)
-                {
-                    mt.startTransform = (startTransform != null) ? startTransform : chosenEntrance;
+            // Log itinerary
+            LogAgentItinerary(go, entranceIndex, chosenEntrance, itinerary, mt, go.GetComponent<NavMeshAgent>(), dwell);
 
-                    if (itinerary != null && itinerary.Count > 0 && itinerary[0] != null)
-                        mt.targetTransform = itinerary[0];
-                    else
-                    {
-                        if (itinerary != null && itinerary.Count > 0)
-                            mt.targetTransform = itinerary[itinerary.Count - 1];
-                        else
-                            mt.targetTransform = null;
-                    }
+            // Also log AgentID explicitly
+            string aid = agentScript != null ? agentScript.AgentID : "n/a";
+            if (enableDebugLogs) Debug.Log($"[SpawnerManager] Spawned pooled agent AgentID={aid} (pooled reuse) at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}");
 
-                    mt.startPosition = go.transform.position;
-                }
-                // --- end ---
-
-                // Log itinerary
-                LogAgentItinerary(go, entranceIndex, chosenEntrance, itinerary, mt, go.GetComponent<NavMeshAgent>(), dwell);
-
-                // Also log AgentID explicitly
-                string aid = agentScript != null ? agentScript.AgentID : "n/a";
-                if (enableDebugLogs) Debug.Log($"[SpawnerManager] Spawned pooled agent AgentID={aid} (pooled reuse) at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}");
-
-                agentScript.Initialize(itinerary, this, dwell);
-            }
+            agentScript.Initialize(itinerary, this, dwell);
 
             liveAgents++;
             activeAgents.Add(go); // NEW: track for trial-state pause/resume/despawn
@@ -795,65 +750,34 @@ public class SpawnerManager : MonoBehaviour
                 // NOTE: MoveToTarget no longer exposes 'useNavMeshAgent' flag.
             }
 
-            // Build itinerary and initialize (respect position-based sampling option)
-            bool usingPositions = sampleAttractorsAsPositions && AtLeastOneAttractorHasArea();
+            // Build itinerary and initialize (Transform-based; BuildItinerary inserts the chosen entrance as first entry).
             float dwell = Random.Range(dwellTimeSec.x, dwellTimeSec.y);
 
-            if (usingPositions)
-            {
-                // Build position itinerary: BuildPositionItinerary inserts entrance position at index 0.
-                List<Vector3> posItin;
-                List<AttractorInfo> posAttractorInfos;
-                BuildPositionItinerary(chosenEntrance, out posItin, out posAttractorInfos);
+            List<Transform> itinerary = BuildItinerary(chosenEntrance);
 
-                if (mt != null)
+            if (mt != null)
+            {
+                mt.startTransform = (startTransform != null) ? startTransform : chosenEntrance;
+
+                if (itinerary != null && itinerary.Count > 0 && itinerary[0] != null)
+                    mt.targetTransform = itinerary[0];
+                else
                 {
-                    // Start transform should be the user-provided startTransform if supplied.
-                    mt.startTransform = (startTransform != null) ? startTransform : chosenEntrance;
-                    mt.startPosition = go.transform.position;
-                    mt.targetTransform = null;
-                    if (posItin != null && posItin.Count > 0)
-                        mt.targetPosition = posItin[0];
+                    if (itinerary != null && itinerary.Count > 0)
+                        mt.targetTransform = itinerary[itinerary.Count - 1];
                     else
-                        mt.targetPosition = go.transform.position;
+                        mt.targetTransform = null;
                 }
 
-                // Log with AgentID
-                string aid = agentScript != null ? agentScript.AgentID : "n/a";
-                LogAgentItineraryPositions(go, entranceIndex, chosenEntrance, posItin, mt, nav, dwell);
-                if (enableDebugLogs) Debug.Log($"[SpawnerManager] Spawned new agent AgentID={aid} at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}");
-
-                agentScript.InitializePositions(posItin, posAttractorInfos, this, dwell);
+                mt.startPosition = go.transform.position;
             }
-            else
-            {
-                // Build transform-based itinerary; BuildItinerary will insert the chosen entrance as first entry.
-                List<Transform> itinerary = BuildItinerary(chosenEntrance);
 
-                if (mt != null)
-                {
-                    mt.startTransform = (startTransform != null) ? startTransform : chosenEntrance;
+            // Log itinerary and AgentID
+            string aid = agentScript != null ? agentScript.AgentID : "n/a";
+            LogAgentItinerary(go, entranceIndex, chosenEntrance, itinerary, mt, nav, dwell);
+            if (enableDebugLogs) Debug.Log($"[SpawnerManager] Spawned new agent AgentID={aid} at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}");
 
-                    if (itinerary != null && itinerary.Count > 0 && itinerary[0] != null)
-                        mt.targetTransform = itinerary[0];
-                    else
-                    {
-                        if (itinerary != null && itinerary.Count > 0)
-                            mt.targetTransform = itinerary[itinerary.Count - 1];
-                        else
-                            mt.targetTransform = null;
-                    }
-
-                    mt.startPosition = go.transform.position;
-                }
-
-                // Log itinerary and AgentID
-                string aid = agentScript != null ? agentScript.AgentID : "n/a";
-                LogAgentItinerary(go, entranceIndex, chosenEntrance, itinerary, mt, nav, dwell);
-                if (enableDebugLogs) Debug.Log($"[SpawnerManager] Spawned new agent AgentID={aid} at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}");
-
-                agentScript.Initialize(itinerary, this, dwell);
-            }
+            agentScript.Initialize(itinerary, this, dwell);
 
             liveAgents++;
             activeAgents.Add(go); // NEW: track for trial-state pause/resume/despawn
@@ -863,89 +787,12 @@ public class SpawnerManager : MonoBehaviour
     }
 
     /// <summary>
-    /// Log itinerary when using position-based itineraries.
-    /// </summary>
-    void LogAgentItineraryPositions(GameObject go, int entranceIndex, Transform entrance, List<Vector3> positions, MoveToTarget mt, NavMeshAgent nav, float dwell)
-    {
-        // NEW: bail out before doing any string work if logging is disabled - this is the actual
-        // performance-relevant fix, since building the StringBuilder below is the expensive part,
-        // not just the Debug.Log(...) call at the end.
-        if (!enableDebugLogs) return;
-
-        // Try to include the unique AgentID in logs if present
-        PedestrianAgent pa = go.GetComponent<PedestrianAgent>();
-        string agentId = pa != null ? pa.AgentID : "n/a";
-
-        string goId = $"{go.name} AgentID={agentId}";
-        string entranceName = entrance != null ? entrance.name : "null";
-        string entranceInfo = $"Entrance[{entranceIndex}]={entranceName}";
-
-        System.Text.StringBuilder sb = new System.Text.StringBuilder();
-        sb.AppendLine($"[SpawnerManager][AgentSpawn] {goId} spawnInfo: {entranceInfo} dwell={dwell:F2}s liveAgents={liveAgents}");
-        if (positions == null || positions.Count == 0)
-        {
-            sb.AppendLine("  Position itinerary: EMPTY");
-        }
-        else
-        {
-            for (int i = 0; i < positions.Count; i++)
-            {
-                Vector3 p = positions[i];
-                // Check if this index corresponds to an exit (last)
-                if (i == positions.Count - 1)
-                {
-                    sb.AppendLine($"  Itinerary[{i}] = EXIT   pos={p}");
-                }
-                else if (i == 0)
-                {
-                    // First entry is the entrance position (we log that explicitly)
-                    sb.AppendLine($"  Itinerary[{i}] = ENTRANCE pos={p} (entrance name='{entranceName}')");
-                }
-                else
-                {
-                    // Try to find matching attractor index for logging clarity (best-effort)
-                    int attractorIdx = -1;
-                    if (attractors != null)
-                    {
-                        for (int ai = 0; ai < attractors.Length; ai++)
-                        {
-                            var a = attractors[ai];
-                            if (a != null && a.transform != null)
-                            {
-                                // compare horizontal proximity as heuristic
-                                if (Vector3.SqrMagnitude(a.transform.position - new Vector3(p.x, a.transform.position.y, p.z)) < 0.5f * 0.5f)
-                                {
-                                    attractorIdx = ai;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    if (attractorIdx >= 0)
-                        sb.AppendLine($"  Itinerary[{i}] = ATTRACTOR [attractors[{attractorIdx}]] approxPos={p}");
-                    else
-                        sb.AppendLine($"  Itinerary[{i}] = ATTRACTOR pos={p}");
-                }
-            }
-        }
-
-        string navInfo = nav != null ? $"NavMeshAgent(enabled={nav.enabled}, isOnNavMesh={nav.isOnNavMesh}, speed={nav.speed:F2})" : "NavMeshAgent=null";
-        // MoveToTarget no longer exposes useNavMeshAgent; report whether MoveToTarget has an agent assigned.
-        string mtInfo = mt != null ? $"MoveToTarget(start={(mt.startTransform!=null?mt.startTransform.name:"null")}, agentAssigned={(mt.agent!=null? "yes":"no")}, targetPos={(positions!=null && positions.Count>0?positions[0].ToString():"null")})" : "MoveToTarget=null";
-
-        sb.AppendLine($"  Runtime: {navInfo} | {mtInfo} | prefab={agentPrefab.name}");
-        if (enableDebugLogs) Debug.Log(sb.ToString());
-    }
-
-    /// <summary>
-    /// Existing log function for transform-based itineraries retained.
+    /// Log function for the active Transform-based itinerary.
     /// </summary>
     void LogAgentItinerary(GameObject go, int entranceIndex, Transform entrance, List<Transform> itinerary, MoveToTarget mt, NavMeshAgent nav, float dwell)
     {
-        // NEW: bail out before doing any string work if logging is disabled - see the matching comment
-        // in LogAgentItineraryPositions() above for why this early-return (not just gating Debug.Log)
-        // is the part that actually matters for performance.
+        // NEW: bail out before doing any string work if logging is disabled - this early-return (not
+        // just gating Debug.Log) is the part that actually matters for performance.
         if (!enableDebugLogs) return;
 
         // Try to include the unique AgentID in logs if present
@@ -1035,79 +882,8 @@ public class SpawnerManager : MonoBehaviour
     }
 
     /// <summary>
-    /// Sample a position for a given AttractorInfo:
-    /// - Attempt NavMesh sampling near the attractor transform position (or fallback to transform.position).
-    /// - (The previous AttractorArea-component sampling path has been removed; this method now always
-    ///   uses NavMesh sampling.)
-    /// </summary>
-    Vector3 SampleAttractorPosition(AttractorInfo a)
-    {
-        if (a == null || a.transform == null) return Vector3.zero;
-
-        // Attempt NavMesh sampling near the attractor transform
-        Vector3 fallbackSample = SampleNavMeshNear(a.transform.position, spawnSampleRadius, spawnSampleMaxAttempts);
-        if (fallbackSample != Vector3.zero) return fallbackSample;
-
-        // final fallback: use the transform's position
-        return a.transform.position;
-    }
-
-    /// <summary>
-    /// Build a position-based itinerary (list of world positions) and a parallel list of AttractorInfo for capacity checks.
-    /// The returned posAttractorInfos has the same length as positions; entries corresponding to non-attractor (e.g. entrance or exit) are null.
-    ///
-    /// IMPORTANT: The 'entrance' parameter is the chosen entrance transform which will be inserted as positions[0].
-    /// The rest of the logic (n attractors then exit) is preserved.
-    /// </summary>
-    void BuildPositionItinerary(Transform entrance, out List<Vector3> positions, out List<AttractorInfo> posAttractorInfos)
-    {
-        positions = new List<Vector3>();
-        posAttractorInfos = new List<AttractorInfo>();
-
-        int num = Random.Range(minAttractorsPerAgent, maxAttractorsPerAgent + 1);
-
-        if (attractors != null && attractors.Length > 0)
-        {
-            List<int> indices = new List<int>();
-            for (int i = 0; i < attractors.Length; i++) indices.Add(i);
-            for (int k = 0; k < num && indices.Count > 0; k++)
-            {
-                int iSel = Random.Range(0, indices.Count);
-                int idx = indices[iSel];
-                indices.RemoveAt(iSel); // avoid visiting same attractor twice
-                var a = attractors[idx];
-                if (a != null)
-                {
-                    Vector3 p = SampleAttractorPosition(a);
-                    positions.Add(p);
-                    posAttractorInfos.Add(a);
-                }
-            }
-        }
-
-        // finally pick an exit
-        if (exits != null && exits.Length > 0)
-        {
-            Transform exit = exits[Random.Range(0, exits.Length)];
-            positions.Add(exit.position);
-            posAttractorInfos.Add(null); // exit has no AttractorInfo
-        }
-
-        // Insert the chosen entrance position at the start of the itinerary so itinerary[0] = entrance
-        if (entrance != null)
-        {
-            positions.Insert(0, entrance.position);
-            posAttractorInfos.Insert(0, null); // entrance is not an attractor; store null in parallel list
-        }
-        else
-        {
-            // If entrance is null (no entrances configured), we do nothing; itinerary will just be attractors+exit
-        }
-    }
-
-    /// <summary>
-    /// Existing transform-based itinerary builder retained (for backward compatibility).
-    /// MODIFIED: the chosen 'entrance' transform is inserted as the first itinerary element (itinerary[0]).
+    /// Transform-based itinerary builder (the active itinerary system).
+    /// The chosen 'entrance' transform is inserted as the first itinerary element (itinerary[0]).
     /// The rest of the logic (n attractors then exit) is preserved.
     /// </summary>
     List<Transform> BuildItinerary(Transform entrance)
@@ -1218,18 +994,6 @@ public class SpawnerManager : MonoBehaviour
         foreach (var a in attractors)
             if (a != null && a.transform == t) return a;
         return null;
-    }
-
-    /// <summary>
-    /// Formerly returned true if at least one configured attractor had an AttractorArea component, which
-    /// gated position-based itinerary sampling. The AttractorArea component system has been removed, so
-    /// there is no longer any component to detect: this always returns false, preserving the exact
-    /// runtime behaviour of the current scene (which already has zero AttractorArea instances, so this
-    /// method already always returned false before this change).
-    /// </summary>
-    bool AtLeastOneAttractorHasArea()
-    {
-        return false;
     }
 
     /// <summary>

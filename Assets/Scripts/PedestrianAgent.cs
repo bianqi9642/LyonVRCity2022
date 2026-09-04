@@ -1,5 +1,5 @@
 // PedestrianAgent.cs
-// Runtime component that drives a pedestrian along a pre-built itinerary (either a list of Transforms OR a list of Vector3 positions).
+// Runtime component that drives a pedestrian along a pre-built Transform-based itinerary.
 // This modified version exclusively delegates movement to MoveToTarget and removes direct NavMeshAgent usage.
 // Arrival detection and pause/resume use MoveToTarget APIs.
 //
@@ -49,13 +49,9 @@ public class PedestrianAgent : MonoBehaviour
     // Core references
     MoveToTarget moveToTarget; // The single authority for movement in this modified script
 
-    // Itinerary variants: either transforms OR positions
+    // Itinerary (Transform-based; the entrance/attractor/exit sequence built by SpawnerManager.BuildItinerary()).
     List<Transform> itineraryTransforms;
-    List<Vector3> itineraryPositions;
-    // Optional parallel attractor info list for position-based itineraries (same length as itineraryPositions, entries nullable)
-    List<AttractorInfo> itineraryPositionAttractorInfos;
 
-    bool usingPositionItinerary = false;
     int currentIndex = 0;
     State state = State.Moving;
     SpawnerManager manager;
@@ -148,9 +144,6 @@ public class PedestrianAgent : MonoBehaviour
         if (itinerary == null) itinerary = new List<Transform>();
 
         this.itineraryTransforms = new List<Transform>(itinerary);
-        this.itineraryPositions = null;
-        this.itineraryPositionAttractorInfos = null;
-        this.usingPositionItinerary = false;
 
         this.manager = mgr;
         this.dwellTime = dwellSeconds;
@@ -183,43 +176,6 @@ public class PedestrianAgent : MonoBehaviour
         BeginMovementWhenReady();
     }
 
-    /// <summary>
-    /// Initialize with a position-based itinerary. Optionally pass a parallel list of AttractorInfo objects that map to each position
-    /// to enable capacity checks. If positionAttractorInfos is null, capacity checks are disabled for positions.
-    /// </summary>
-    public void InitializePositions(List<Vector3> positions, List<AttractorInfo> positionAttractorInfos, SpawnerManager mgr, float dwellSeconds)
-    {
-        if (positions == null) positions = new List<Vector3>();
-
-        this.itineraryPositions = new List<Vector3>(positions);
-        this.itineraryPositionAttractorInfos = positionAttractorInfos != null ? new List<AttractorInfo>(positionAttractorInfos) : null;
-        this.itineraryTransforms = null;
-        this.usingPositionItinerary = true;
-
-        this.manager = mgr;
-        this.dwellTime = dwellSeconds;
-        this.currentIndex = 0;
-        this.state = State.Moving;
-
-        // Additive: clear any stale per-leg override (unused on the position path, cleared for safety).
-        this.currentLegStopOverride = null;
-
-        if (moveToTarget != null)
-        {
-            moveToTarget.startTransform = null;
-            moveToTarget.startPosition = transform.position;
-            try { moveToTarget.SetMoveSpeed(moveToTarget.speed); } catch (Exception) { /* ignore */ }
-        }
-
-        // If this agent has an UncertainBehavior (pooled reuse case), ensure it is resumed
-        // so uncertain behavior will run for the entire new itinerary.
-        if (uncertainBehavior != null)
-            uncertainBehavior.ResumeAfterArrival();
-
-        // NEW (fix for pooled-agent reactivation race): see Initialize() above for the full explanation.
-        BeginMovementWhenReady();
-    }
-
     void Update()
     {
         // Only perform arrival detection while moving
@@ -228,81 +184,43 @@ public class PedestrianAgent : MonoBehaviour
 
         // If we are using the MoveToTarget.OnArrived event we may have already handled arrival.
         // Keep polling logic as a fallback for robustness.
-        if (usingPositionItinerary)
+        if (itineraryTransforms == null || currentIndex >= itineraryTransforms.Count) return;
+        Transform t = itineraryTransforms[currentIndex];
+        if (t == null)
         {
-            if (itineraryPositions == null || currentIndex >= itineraryPositions.Count) return;
-
-            Vector3 curPosTarget = itineraryPositions[currentIndex];
-
-            // Primary arrival check is delegated to MoveToTarget when available (we subscribe to OnArrived).
-            if (moveToTarget != null)
-            {
-                if (moveToTarget.IsArrived)
-                {
-                    OnReachedWaypoint();
-                    return;
-                }
-
-                // As a robustness check, also consider simple distance
-                float simpleDist = Vector3.Distance(transform.position, curPosTarget);
-                if (simpleDist <= arriveTolerance)
-                {
-                    OnReachedWaypoint();
-                    return;
-                }
-            }
-            else
-            {
-                // No MoveToTarget: fall back to simple distance-based arrival detection
-                float d = Vector3.Distance(transform.position, curPosTarget);
-                if (d <= arriveTolerance)
-                {
-                    OnReachedWaypoint();
-                    return;
-                }
-            }
+            OnReachedWaypoint();
+            return;
         }
-        else
+
+        // When a per-leg physical stop override is active (a random point inside an Attractor Plane),
+        // the distance fallback must measure to THAT point, not to the Plane pivot 't.position' -
+        // otherwise it could fire early as the agent passes near the pivot on the way to the random
+        // point. For every non-attractor leg 'currentLegStopOverride' is null and this is unchanged.
+        Vector3 transformFallbackTarget = currentLegStopOverride ?? t.position;
+
+        if (moveToTarget != null)
         {
-            // Transform-based itinerary
-            if (itineraryTransforms == null || currentIndex >= itineraryTransforms.Count) return;
-            Transform t = itineraryTransforms[currentIndex];
-            if (t == null)
+            if (moveToTarget.IsArrived)
             {
                 OnReachedWaypoint();
                 return;
             }
 
-            // When a per-leg physical stop override is active (a random point inside an Attractor Plane),
-            // the distance fallback must measure to THAT point, not to the Plane pivot 't.position' -
-            // otherwise it could fire early as the agent passes near the pivot on the way to the random
-            // point. For every non-attractor leg 'currentLegStopOverride' is null and this is unchanged.
-            Vector3 transformFallbackTarget = currentLegStopOverride ?? t.position;
-
-            if (moveToTarget != null)
+            // Additional distance fallback
+            float d = Vector3.Distance(transform.position, transformFallbackTarget);
+            if (d <= arriveTolerance)
             {
-                if (moveToTarget.IsArrived)
-                {
-                    OnReachedWaypoint();
-                    return;
-                }
-
-                // Additional distance fallback
-                float d = Vector3.Distance(transform.position, transformFallbackTarget);
-                if (d <= arriveTolerance)
-                {
-                    OnReachedWaypoint();
-                    return;
-                }
+                OnReachedWaypoint();
+                return;
             }
-            else
+        }
+        else
+        {
+            float d = Vector3.Distance(transform.position, transformFallbackTarget);
+            if (d <= arriveTolerance)
             {
-                float d = Vector3.Distance(transform.position, transformFallbackTarget);
-                if (d <= arriveTolerance)
-                {
-                    OnReachedWaypoint();
-                    return;
-                }
+                OnReachedWaypoint();
+                return;
             }
         }
     }
@@ -310,7 +228,7 @@ public class PedestrianAgent : MonoBehaviour
     /// <summary>
     /// NEW (fix for pooled-agent reactivation race): starts (or restarts) the coroutine that waits for
     /// MoveToTarget to report readiness before issuing the first MoveToCurrent() command for this itinerary.
-    /// Cancels any previous pending wait first, in case Initialize()/InitializePositions() is called again
+    /// Cancels any previous pending wait first, in case Initialize() is called again
     /// in quick succession (e.g. very fast pool reuse) before the previous wait finished.
     /// </summary>
     void BeginMovementWhenReady()
@@ -324,7 +242,7 @@ public class PedestrianAgent : MonoBehaviour
         if (!gameObject.activeInHierarchy)
         {
             // Cannot start a coroutine on an inactive GameObject. This is not an error: SpawnerManager
-            // always calls go.SetActive(true) before Initialize()/InitializePositions(), so this should
+            // always calls go.SetActive(true) before Initialize(), so this should
             // not normally happen, but if it does, MoveToCurrent() will simply run the next time this
             // agent is (re)activated and re-initialized.
             return;
@@ -338,7 +256,7 @@ public class PedestrianAgent : MonoBehaviour
     ///
     /// Problem this solves: MoveToTarget.OnEnable() -> ReinitializeAfterEnable() re-warps a pooled agent's
     /// NavMeshAgent onto the NavMesh, but that re-warp is not guaranteed to have completed by the time
-    /// SpawnerManager.SpawnAgent() calls PedestrianAgent.Initialize()/InitializePositions() in the same
+    /// SpawnerManager.SpawnAgent() calls PedestrianAgent.Initialize() in the same
     /// frame as go.SetActive(true). Previously, MoveToCurrent() (-> MoveToTarget.MoveTo(...)) was invoked
     /// synchronously right there, so it could run before MoveToTarget.IsReadyToMove() was true; MoveTo(...)
     /// would then silently skip calling agent.SetDestination(...) (only logging a warning), leaving the
@@ -396,94 +314,61 @@ public class PedestrianAgent : MonoBehaviour
         // re-set below ONLY when the new waypoint is an Attractor Plane with an AttractorDwell component.
         currentLegStopOverride = null;
 
-        if (usingPositionItinerary)
+        if (itineraryTransforms == null || currentIndex >= itineraryTransforms.Count)
         {
-            if (itineraryPositions == null || currentIndex >= itineraryPositions.Count)
-            {
-                Finish();
-                return;
-            }
+            Finish();
+            return;
+        }
 
-            Vector3 posTarget = itineraryPositions[currentIndex];
+        Transform target = itineraryTransforms[currentIndex];
+        if (target == null)
+        {
+            AdvanceItinerary();
+            return;
+        }
 
-            if (moveToTarget != null)
+        if (moveToTarget != null)
+        {
+            moveToTarget.startTransform = null;
+            moveToTarget.startPosition = transform.position;
+
+            // ROUTE-PRESERVING STOP OVERRIDE.
+            // 'target' remains the itinerary waypoint (the Attractor Plane Transform) and is still the
+            // value used by OnReachedWaypoint() / FindAttractorInfo() / the exit test / AdvanceItinerary().
+            // Only the PHYSICAL destination handed to MoveToTarget is swapped for an independent random
+            // point inside that same Plane, so NPCs dwelling at one Attractor spread out instead of all
+            // stacking on Plane.transform.position. For entrances, exits, or Planes without an
+            // AttractorDwell component this falls through to the original code path unchanged.
+            Vector3 attractorStop;
+            if (TryGetAttractorDwellStop(target, out attractorStop))
             {
-                // configure MoveToTarget for a position-based leg
-                moveToTarget.startTransform = null;
-                moveToTarget.startPosition = transform.position;
+                currentLegStopOverride = attractorStop;
+
+                // Vector3 target: MoveToTarget reads targetPosition (targetTransform must be null).
                 moveToTarget.targetTransform = null;
-                moveToTarget.targetPosition = posTarget;
+                moveToTarget.targetPosition = attractorStop;
 
-                // Subscribe to OnArrived so we react immediately on arrival
+                // Subscribe to OnArrived for immediate reaction
                 SubscribeToMoveToArrived();
 
-                // Tell MoveToTarget to perform the move (it handles its own internal arrival detection)
-                moveToTarget.MoveTo(posTarget);
+                // Existing public overload - MoveToTarget's movement implementation is NOT modified.
+                moveToTarget.MoveTo(attractorStop);
             }
             else
             {
-                // No MoveToTarget present: nothing to command. Rely on external movement or distance checks.
+                // Original behaviour: move to the waypoint Transform itself.
+                moveToTarget.targetTransform = target;
+
+                // Subscribe to OnArrived for immediate reaction
+                SubscribeToMoveToArrived();
+
+                // MoveToTarget will handle movement and arrival
+                moveToTarget.MoveTo(target);
             }
         }
         else
         {
-            // Transform-based itinerary
-            if (itineraryTransforms == null || currentIndex >= itineraryTransforms.Count)
-            {
-                Finish();
-                return;
-            }
-
-            Transform target = itineraryTransforms[currentIndex];
-            if (target == null)
-            {
-                AdvanceItinerary();
-                return;
-            }
-
-            if (moveToTarget != null)
-            {
-                moveToTarget.startTransform = null;
-                moveToTarget.startPosition = transform.position;
-
-                // ROUTE-PRESERVING STOP OVERRIDE.
-                // 'target' remains the itinerary waypoint (the Attractor Plane Transform) and is still the
-                // value used by OnReachedWaypoint() / FindAttractorInfo() / the exit test / AdvanceItinerary().
-                // Only the PHYSICAL destination handed to MoveToTarget is swapped for an independent random
-                // point inside that same Plane, so NPCs dwelling at one Attractor spread out instead of all
-                // stacking on Plane.transform.position. For entrances, exits, or Planes without an
-                // AttractorDwell component this falls through to the original code path unchanged.
-                Vector3 attractorStop;
-                if (TryGetAttractorDwellStop(target, out attractorStop))
-                {
-                    currentLegStopOverride = attractorStop;
-
-                    // Vector3 target: MoveToTarget reads targetPosition (targetTransform must be null).
-                    moveToTarget.targetTransform = null;
-                    moveToTarget.targetPosition = attractorStop;
-
-                    // Subscribe to OnArrived for immediate reaction
-                    SubscribeToMoveToArrived();
-
-                    // Existing public overload - MoveToTarget's movement implementation is NOT modified.
-                    moveToTarget.MoveTo(attractorStop);
-                }
-                else
-                {
-                    // Original behaviour: move to the waypoint Transform itself.
-                    moveToTarget.targetTransform = target;
-
-                    // Subscribe to OnArrived for immediate reaction
-                    SubscribeToMoveToArrived();
-
-                    // MoveToTarget will handle movement and arrival
-                    moveToTarget.MoveTo(target);
-                }
-            }
-            else
-            {
-                // No MoveToTarget present - rely on external movement and periodic distance checks.
-            }
+            // No MoveToTarget present - rely on external movement and periodic distance checks.
         }
     }
 
@@ -530,84 +415,42 @@ public class PedestrianAgent : MonoBehaviour
     /// <summary>
     /// Called when a waypoint is considered reached.
     /// Handles attractor capacity/dwell or finishing when exit reached.
-    /// For position-based itinerary, capacity handling only occurs if itineraryPositionAttractorInfos was supplied.
     /// </summary>
     void OnReachedWaypoint()
     {
         // Defensive unsubscribe to ensure no stale subscriptions remain
         UnsubscribeFromMoveToArrived();
 
-        if (usingPositionItinerary)
+        if (itineraryTransforms == null || currentIndex >= itineraryTransforms.Count) return;
+        Transform target = itineraryTransforms[currentIndex];
+        bool isExit = (currentIndex == itineraryTransforms.Count - 1);
+
+        if (!isExit)
         {
-            if (itineraryPositions == null || currentIndex >= itineraryPositions.Count) return;
-            bool isExit = (currentIndex == itineraryPositions.Count - 1);
-
-            if (!isExit)
+            AttractorInfo info = manager != null ? manager.FindAttractorInfo(target) : null;
+            if (info != null)
             {
-                AttractorInfo info = null;
-                if (itineraryPositionAttractorInfos != null && currentIndex < itineraryPositionAttractorInfos.Count)
-                    info = itineraryPositionAttractorInfos[currentIndex];
-
-                if (info != null && manager != null)
+                bool accepted = manager.TryEnterAttractor(info, this);
+                if (accepted)
                 {
-                    bool accepted = manager.TryEnterAttractor(info, this);
-                    if (accepted)
-                    {
-                        StartCoroutine(WaitAtAttractor(info));
-                        return;
-                    }
-                    else
-                    {
-                        StartCoroutine(PollForCapacity(info));
-                        return;
-                    }
+                    StartCoroutine(WaitAtAttractor(info));
+                    return;
                 }
                 else
                 {
-                    // no capacity semantics for this position -> simple dwell then advance
-                    StartCoroutine(SimpleDwellThenAdvance());
+                    StartCoroutine(PollForCapacity(info));
                     return;
                 }
             }
             else
             {
-                Finish();
+                StartCoroutine(SimpleDwellThenAdvance());
+                return;
             }
         }
         else
         {
-            // transform-based itinerary
-            if (itineraryTransforms == null || currentIndex >= itineraryTransforms.Count) return;
-            Transform target = itineraryTransforms[currentIndex];
-            bool isExit = (currentIndex == itineraryTransforms.Count - 1);
-
-            if (!isExit)
-            {
-                AttractorInfo info = manager != null ? manager.FindAttractorInfo(target) : null;
-                if (info != null)
-                {
-                    bool accepted = manager.TryEnterAttractor(info, this);
-                    if (accepted)
-                    {
-                        StartCoroutine(WaitAtAttractor(info));
-                        return;
-                    }
-                    else
-                    {
-                        StartCoroutine(PollForCapacity(info));
-                        return;
-                    }
-                }
-                else
-                {
-                    StartCoroutine(SimpleDwellThenAdvance());
-                    return;
-                }
-            }
-            else
-            {
-                Finish();
-            }
+            Finish();
         }
     }
 
@@ -712,8 +555,7 @@ public class PedestrianAgent : MonoBehaviour
     void AdvanceItinerary()
     {
         currentIndex++;
-        if ((usingPositionItinerary && (itineraryPositions == null || currentIndex >= itineraryPositions.Count)) ||
-            (!usingPositionItinerary && (itineraryTransforms == null || currentIndex >= itineraryTransforms.Count)))
+        if (itineraryTransforms == null || currentIndex >= itineraryTransforms.Count)
         {
             Finish();
             return;
@@ -852,22 +694,11 @@ public class PedestrianAgent : MonoBehaviour
     {
         if (manager == null) return;
 
-        if (usingPositionItinerary)
+        if (itineraryTransforms != null && currentIndex < itineraryTransforms.Count)
         {
-            if (itineraryPositionAttractorInfos != null && currentIndex < itineraryPositionAttractorInfos.Count)
-            {
-                var info = itineraryPositionAttractorInfos[currentIndex];
-                if (info != null) manager.ReleaseAttractor(info, this);
-            }
-        }
-        else
-        {
-            if (itineraryTransforms != null && currentIndex < itineraryTransforms.Count)
-            {
-                var t = itineraryTransforms[currentIndex];
-                var info = manager.FindAttractorInfo(t);
-                if (info != null) manager.ReleaseAttractor(info, this);
-            }
+            var t = itineraryTransforms[currentIndex];
+            var info = manager.FindAttractorInfo(t);
+            if (info != null) manager.ReleaseAttractor(info, this);
         }
     }
 

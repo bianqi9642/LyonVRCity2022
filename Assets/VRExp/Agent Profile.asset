@@ -113,6 +113,14 @@ MonoBehaviour:
     - {fileID: 2100000, guid: 84e86a3c0e83c1747814a3a5ecf8fff6, type: 2}
     - {fileID: 2100000, guid: deb385b170d262a42a75441dcc4cf722, type: 2}
     weight: 1
-  accessoriesOptions: []
+  accessoriesOptions:
+  - mesh: {fileID: -8798783132424415978, guid: e1efa5985d3fb4014b18e2281bf56faa, type: 3}
+    materials:
+    - {fileID: -6478536213147159724, guid: e1efa5985d3fb4014b18e2281bf56faa, type: 3}
+    weight: 0.5
+  - mesh: {fileID: 493326964870366955, guid: e1efa5985d3fb4014b18e2281bf56faa, type: 3}
+    materials:
+    - {fileID: -6478536213147159724, guid: e1efa5985d3fb4014b18e2281bf56faa, type: 3}
+    weight: 0.5
   agentRadius: 0.3
   agentHeight: 1.8

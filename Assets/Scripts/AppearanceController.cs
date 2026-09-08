@@ -4,6 +4,20 @@ using UnityEngine;
 /// Apply AgentProfile visuals to the assigned SkinnedMeshRenderer components.
 /// Assign the appropriate SkinnedMeshRenderer fields in the prefab Inspector:
 /// bodyRenderer, hairRenderer, topRenderer, bottomRenderer, shoesRenderer, accessoriesRenderer.
+///
+/// Gender-consistent appearance:
+///   - ApplyProfile() rolls the NPC's gender ONCE (AgentProfile.ChooseGender), stores it on
+///     CurrentGender, then passes that single value into every ApplyPart call. Gender is
+///     therefore determined once per NPC (per spawn / pool reuse), never per clothing item.
+///   - Hair / Top / Bottom are selected with the gender-filtered overload
+///     (AgentProfile.ChooseWeightedOption(options, gender)), so a male NPC can only ever
+///     receive Unisex or MaleOnly options and a female NPC only Unisex or FemaleOnly options.
+///   - Shoes / Accessories / Body options are Unisex and behave exactly as before.
+///   - On pool reuse ApplyProfile runs again in full: a fresh gender is rolled and ALL of
+///     hair/top/bottom are re-applied for it in the same synchronous call, so there is no
+///     window in which the gender and the clothing disagree. If a required gendered pool is
+///     empty for the rolled gender, the renderer is cleared (never left showing the previous
+///     NPC's opposite-gender mesh) and a warning is logged when enableDebugLogs is on.
 /// </summary>
 [DisallowMultipleComponent]
 public class AppearanceController : MonoBehaviour
@@ -16,33 +30,76 @@ public class AppearanceController : MonoBehaviour
     public SkinnedMeshRenderer shoesRenderer;
     public SkinnedMeshRenderer accessoriesRenderer;
 
+    [Header("Debug")]
+    [Tooltip("When true, logs a warning if a gendered appearance pool (hair/top/bottom) has no " +
+             "option for the rolled gender. Enable while setting up the Agent Profile.")]
+    public bool enableDebugLogs = false;
+
     /// <summary>
-    /// Apply the profile visuals to all assigned renderers.
+    /// Gender assigned to this NPC by the most recent ApplyProfile call. Constant for the
+    /// lifetime of one spawn/pool-activation; re-rolled on the next ApplyProfile (pool reuse).
+    /// Meaningful only after ApplyProfile has run at least once (always the case before an NPC
+    /// is spawned into view, since AgentFactory calls ApplyProfile during spawn setup).
+    /// </summary>
+    public AgentGender CurrentGender { get; private set; }
+
+    /// <summary>
+    /// Apply the profile visuals to all assigned renderers. Gender is rolled from the profile.
     /// Null-safe: missing renderers or missing profile data are skipped.
     /// </summary>
     public void ApplyProfile(AgentProfile profile)
     {
         if (profile == null) return;
+        ApplyProfile(profile, profile.ChooseGender());
+    }
 
-        ApplyPart(profile, profile.bodyOptions, bodyRenderer);
-        ApplyPart(profile, profile.hairOptions, hairRenderer);
-        ApplyPart(profile, profile.topOptions, topRenderer);
-        ApplyPart(profile, profile.bottomOptions, bottomRenderer);
-        ApplyPart(profile, profile.shoesOptions, shoesRenderer);
-        ApplyPart(profile, profile.accessoriesOptions, accessoriesRenderer);
+    /// <summary>
+    /// Apply the profile visuals with an explicitly forced gender (e.g. for a future
+    /// experiment gender condition). Existing callers use the single-argument overload.
+    /// </summary>
+    public void ApplyProfile(AgentProfile profile, AgentGender gender)
+    {
+        if (profile == null) return;
+
+        // Gender is decided ONCE here and reused for every gender-restricted part below.
+        CurrentGender = gender;
+
+        ApplyPart(profile, profile.bodyOptions,        bodyRenderer,        CurrentGender);
+        ApplyPart(profile, profile.hairOptions,        hairRenderer,        CurrentGender);
+        ApplyPart(profile, profile.topOptions,         topRenderer,         CurrentGender);
+        ApplyPart(profile, profile.bottomOptions,      bottomRenderer,      CurrentGender);
+        ApplyPart(profile, profile.shoesOptions,       shoesRenderer,       CurrentGender);
+        ApplyPart(profile, profile.accessoriesOptions, accessoriesRenderer, CurrentGender);
     }
 
     /// <summary>
     /// Apply one part's chosen option to the provided renderer.
-    /// Uses the profile's chooser to pick a PartOption by weight.
+    /// Uses the profile's gender-filtered chooser to pick a PartOption by weight.
+    /// Unisex options are always eligible, so shoes/accessories/body are unaffected.
     /// </summary>
-    private void ApplyPart(AgentProfile profile, AgentProfile.PartOption[] options, SkinnedMeshRenderer renderer)
+    private void ApplyPart(AgentProfile profile, AgentProfile.PartOption[] options,
+                           SkinnedMeshRenderer renderer, AgentGender gender)
     {
         if (renderer == null) return;
         if (options == null || options.Length == 0) return;
 
-        var chosen = profile.ChooseWeightedOption(options);
-        if (chosen == null) return;
+        var chosen = profile.ChooseWeightedOption(options, gender);
+
+        if (chosen == null)
+        {
+            // The array has options but NONE are valid for this gender. This is a profile
+            // configuration error for a gendered part. Do NOT leave the current mesh in place:
+            // on pool reuse it could be the opposite gender's mesh from the previous NPC.
+            if (renderer.sharedMesh != null)
+            {
+                renderer.sharedMesh = null;
+                if (enableDebugLogs)
+                    Debug.LogWarning($"[AppearanceController] '{renderer.name}' on '{gameObject.name}': " +
+                                     $"no PartOption is available for gender {gender}. Renderer cleared to " +
+                                     $"avoid a cross-gender mesh. Add at least one Unisex/{gender} option.");
+            }
+            return;
+        }
 
         // Apply mesh if provided
         if (chosen.mesh != null)

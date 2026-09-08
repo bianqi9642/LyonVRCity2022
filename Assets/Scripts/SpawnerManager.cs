@@ -63,6 +63,27 @@
 // ExperimentManager.RunNpcWarmup()). None of this touches NavMeshAgent directly, and none of it changes the
 // Stage 4 architecture (UncertainBehavior -> MoveToTarget -> NavMeshAgent).
 //
+// NEW (Part 2 continuous undirected wandering): SpawnAgent() now reads
+// ExperimentManager.CurrentPartConfig.npcDirectedMovement (via DirectedMovementForActivePart(), mirroring
+// NpcsEnabledForActivePart()'s pull pattern exactly) to decide, per spawn, whether to build a directed
+// itinerary (BuildItinerary() - unchanged, Part 3's existing behaviour) or initialize the agent for
+// undirected wandering instead (PedestrianAgent.Initialize(SpawnerManager, float, Transform) - no
+// itinerary, no attractors, no exit). The new 'wanderingPoints' array is a plain Transform[], declared and
+// used exactly like the existing entrances/exits/attractors arrays, and is NEVER referenced by
+// BuildItinerary() or any other Part 3 code path. Population accounting
+// (liveAgents/activeAgents/maxAgents/spawnInterval) is completely unconditional and shared between both
+// modes, unchanged - this is what guarantees Part 2 and Part 3 draw from the exact same population source
+// of truth.
+//
+// NEW (Part 2 shares Part 3's spawn origin and initial-Entrance draw): the physical spawn position
+// (samplingOrigin/spawnPos, startTransform-priority) is computed ONCE, unconditionally, identically for
+// BOTH modes - exactly as it always was, before ANY Part 2 wandering work. 'chosenEntrance' - the SAME
+// Random.Range(0, entrances.Length) draw Part 3 already made - is passed into the undirected
+// Initialize(...) overload as a one-time initial movement target: an undirected agent spawns at the shared
+// startTransform-based origin, walks to chosenEntrance using MoveToTarget's normal arrival behaviour, and
+// only then begins continuous wandering through wanderingPoints[]. chosenEntrance is NEVER used as the
+// undirected agent's physical spawn position, and is NEVER added to any itinerary.
+//
 // All comments in English.
 
 using System.Collections;
@@ -90,6 +111,24 @@ public class SpawnerManager : MonoBehaviour
     public Transform[] entrances;
     public Transform[] exits;
     public AttractorInfo[] attractors;
+
+    [Header("Wandering Points (Part 2 - undirected mode only)")]
+    [Tooltip("Predefined, experimenter-placed Transforms used ONLY by undirected (Part 2) NPCs as continuous " +
+             "wandering destinations. Anonymous movement waypoints - NOT attractors, NOT exits, and never " +
+             "referenced by BuildItinerary() or any directed (Part 3) code path. Place them on/near the " +
+             "walkable NavMesh, spread across the area NPCs should wander, forming a plausible low-density " +
+             "pedestrian movement network rather than a random scatter. At runtime each candidate is " +
+             "validated with NavMesh.CalculatePath before being accepted as a target - an unreachable point " +
+             "is skipped (with a warning), never silently replaced by a generated position.")]
+    public Transform[] wanderingPoints;
+
+    [Tooltip("Distance (metres) at which an undirected (Part 2) NPC selects its NEXT wandering point, " +
+             "before MoveToTarget's own (much tighter) arriveThreshold would otherwise bring it to a full " +
+             "stop. Must be larger than MoveToTarget.arriveThreshold (0.2 by default) by a comfortable " +
+             "margin - see the implementation notes shipped with this feature for the reasoning. Tune " +
+             "visually in Play mode: too small and NPCs visibly stop-start at every point; too large and " +
+             "NPCs change direction while still far from the point they were walking toward.")]
+    public float wanderLookAheadDistance = 1.5f;
 
     [Header("Prefab & Spawn")]
     public GameObject agentPrefab;
@@ -218,6 +257,18 @@ public class SpawnerManager : MonoBehaviour
         return cfg == null || cfg.npcEnabled;
     }
 
+    // NEW (Part 2 undirected wandering): mirrors NpcsEnabledForActivePart() exactly - PULLED, not pushed,
+    // from the same single source of truth (ExperimentManager.CurrentPartConfig.npcDirectedMovement).
+    // Falls back to "directed" (true) if no ExperimentManager/CurrentPartConfig is available, so a scene
+    // that never configures per-Part movement mode reproduces the original (pre-undirected-wandering)
+    // behaviour exactly.
+    private bool DirectedMovementForActivePart()
+    {
+        if (experimentManager == null) return true;
+        var cfg = experimentManager.CurrentPartConfig;
+        return cfg == null || cfg.npcDirectedMovement;
+    }
+
     // NEW (End Panel hard stop, Requirement 2): true from the moment ExperimentManager.OnEndPanelShown fires
     // for the current Part until SpawnerManager.ResetForNewPart() is called at the start of the NEXT Part's
     // NPC lifecycle (see RunNpcWarmup()). Closes the spawning gate unconditionally (regardless of
@@ -233,8 +284,8 @@ public class SpawnerManager : MonoBehaviour
     void Start()
     {
         // NEW: resolve ExperimentManager unconditionally (not just when gateSpawningByTrialState is true) -
-        // it is now also needed for the per-Part NPC-enable pull (NpcsEnabledForActivePart()) and for the
-        // End-Panel hard-stop subscription below, both of which must work regardless of trial-state gating.
+        // it is now also needed for the per-Part NPC-enable/movement-mode pulls and for the End-Panel
+        // hard-stop subscription below, all of which must work regardless of trial-state gating.
         if (experimentManager == null)
         {
             experimentManager = FindObjectOfType<ExperimentManager>();
@@ -337,6 +388,8 @@ public class SpawnerManager : MonoBehaviour
     ///     A pooled agent's UncertainBehavior is unconditionally re-enabled/re-rolled by
     ///     AgentFactory.ApplyProfileToInstance() on its next spawn, so disabling it here has no lasting effect
     ///     beyond the current (ending) Part.
+    /// Applies identically to directed and undirected agents - it only touches MoveToTarget/UncertainBehavior,
+    /// neither of which differs between the two movement modes.
     /// Idempotent and cheap - safe to call every frame (see Update() above).
     /// </summary>
     private void HardStopAgent(GameObject go)
@@ -397,10 +450,10 @@ public class SpawnerManager : MonoBehaviour
     /// NEW (NPC warm-up). Called by ExperimentManager at the start of a Part, BEFORE the participant-facing
     /// Start panel is shown and BEFORE OnTrialStart fires. Opens the spawning gate exactly like a trial does
     /// (SpawnLoop below simply OR's this flag together with trialActive), using the existing
-    /// spawnInterval/maxAgents/itinerary-generation/pooling machinery completely unchanged, so the NPC
-    /// population can begin forming and distributing itself before the participant's trial is officially
-    /// under way. Does NOT fire OnTrialStart, does NOT touch trialActive, and does NOT pause/resume/despawn
-    /// any agent - it only flips the spawning gate.
+    /// spawnInterval/maxAgents/itinerary-generation-or-undirected-wandering/pooling machinery completely
+    /// unchanged, so the NPC population can begin forming and distributing itself before the participant's
+    /// trial is officially under way. Does NOT fire OnTrialStart, does NOT touch trialActive, and does NOT
+    /// pause/resume/despawn any agent - it only flips the spawning gate.
     /// </summary>
     public void BeginNpcWarmup()
     {
@@ -411,8 +464,8 @@ public class SpawnerManager : MonoBehaviour
     /// <summary>
     /// NEW (NPC warm-up). Called by ExperimentManager once the configured warm-up duration has elapsed,
     /// immediately before OnTrialStart is invoked. Closes the warm-up gate. Deliberately does NOT pause,
-    /// resume, or despawn any currently-alive agent - existing NPCs (walking, dwelling, mid-detour, etc.)
-    /// simply continue exactly as they were. Because ExperimentManager calls this and then invokes
+    /// resume, or despawn any currently-alive agent - existing NPCs (walking, dwelling, mid-detour, mid-wander,
+    /// etc.) simply continue exactly as they were. Because ExperimentManager calls this and then invokes
     /// OnTrialStart in the same breath (no yield in between), SpawnLoop's combined gate
     /// ('trialActive || npcWarmupActive') never goes false in between, so there is no gap in spawning across
     /// the warm-up -> trial boundary.
@@ -461,7 +514,8 @@ public class SpawnerManager : MonoBehaviour
     /// <summary>
     /// NEW: immediately terminates every currently-alive agent's itinerary (PedestrianAgent.ForceFinish()),
     /// which triggers the normal onAgentFinished -> OnAgentFinished(...) pooling/destroy pathway. Iterates
-    /// over a copy of the list because OnAgentFinished mutates activeAgents while we iterate.
+    /// over a copy of the list because OnAgentFinished mutates activeAgents while we iterate. Works
+    /// identically for directed and undirected agents - ForceFinish() is unconditional in both.
     /// </summary>
     private void ForceFinishAllActiveAgents()
     {
@@ -699,6 +753,9 @@ public class SpawnerManager : MonoBehaviour
             // gateSpawningByTrialState, so no new NPC can spawn once the current Part's End Panel has been
             // shown, even in a continuous-spawning (gateSpawningByTrialState == false) configuration where
             // trialActive would otherwise never close the gate at that boundary.
+            // NOTE: DirectedMovementForActivePart() (which movement MODE a new spawn gets) is read inside
+            // SpawnAgent() itself, not here - it does not affect whether spawning is allowed, only what kind
+            // of agent gets spawned.
             bool allowedToSpawn = !endPanelActive && NpcsEnabledForActivePart() &&
                 ((!gateSpawningByTrialState) || trialActive || npcWarmupActive);
 
@@ -716,7 +773,13 @@ public class SpawnerManager : MonoBehaviour
         if (startTransform == null && (entrances == null || entrances.Length == 0) || agentPrefab == null)
             return;
 
-        // Choose a random entrance to be the *first itinerary entry*.
+        // Choose a random entrance - the SAME selection, used identically by both modes:
+        // - directed (Part 3): becomes itinerary[0], the first waypoint of BuildItinerary()'s route.
+        // - undirected (Part 2): becomes the agent's one-time INITIAL MOVEMENT TARGET (walked to from the
+        //   shared startTransform-based spawn position, via PedestrianAgent's new initial-Entrance leg -
+        //   see the branch inside each reuse/instantiate path below), never the physical spawn position and
+        //   never added to any itinerary. Entrance selection itself is completely unconditional and shared
+        //   between both modes - there is only ever one random-entrance draw per spawn.
         int entranceIndex = -1;
         Transform chosenEntrance = null;
         if (entrances != null && entrances.Length > 0)
@@ -742,6 +805,10 @@ public class SpawnerManager : MonoBehaviour
             spawnPos = samplingOrigin;
             if (enableDebugLogs) Debug.LogWarning("SpawnerManager: failed to sample NavMesh near spawn origin. Using sampling origin position as fallback for spawn position.");
         }
+
+        // NEW (Part 2 continuous undirected wandering): resolve the movement mode for THIS spawn, once, up
+        // front. Reused identically by both the pooled-reuse and fresh-instantiate branches below.
+        bool directedMode = DirectedMovementForActivePart();
 
         GameObject go = null;
 
@@ -832,38 +899,63 @@ public class SpawnerManager : MonoBehaviour
                 return;
             }
 
-            // Build itinerary (Transform-based; BuildItinerary will insert the chosen entrance as itinerary[0]).
-            float dwell = Random.Range(dwellTimeSec.x, dwellTimeSec.y);
-
-            List<Transform> itinerary = BuildItinerary(chosenEntrance);
-
-            // --- ensure MoveToTarget start/target reflect StartTransform -> first itinerary entry ---
-            if (mt != null)
+            if (directedMode)
             {
-                mt.startTransform = (startTransform != null) ? startTransform : chosenEntrance;
+                // ---------------- EXISTING Part 3 directed path - unchanged ----------------
+                // Build itinerary (Transform-based; BuildItinerary will insert the chosen entrance as itinerary[0]).
+                float dwell = Random.Range(dwellTimeSec.x, dwellTimeSec.y);
 
-                if (itinerary != null && itinerary.Count > 0 && itinerary[0] != null)
-                    mt.targetTransform = itinerary[0];
-                else
+                List<Transform> itinerary = BuildItinerary(chosenEntrance);
+
+                // --- ensure MoveToTarget start/target reflect StartTransform -> first itinerary entry ---
+                if (mt != null)
                 {
-                    if (itinerary != null && itinerary.Count > 0)
-                        mt.targetTransform = itinerary[itinerary.Count - 1];
+                    mt.startTransform = (startTransform != null) ? startTransform : chosenEntrance;
+
+                    if (itinerary != null && itinerary.Count > 0 && itinerary[0] != null)
+                        mt.targetTransform = itinerary[0];
                     else
-                        mt.targetTransform = null;
+                    {
+                        if (itinerary != null && itinerary.Count > 0)
+                            mt.targetTransform = itinerary[itinerary.Count - 1];
+                        else
+                            mt.targetTransform = null;
+                    }
+
+                    mt.startPosition = go.transform.position;
+                }
+                // --- end ---
+
+                // Log itinerary
+                LogAgentItinerary(go, entranceIndex, chosenEntrance, itinerary, mt, go.GetComponent<NavMeshAgent>(), dwell);
+
+                // Also log AgentID explicitly
+                string aid = agentScript != null ? agentScript.AgentID : "n/a";
+                if (enableDebugLogs) Debug.Log($"[SpawnerManager] Spawned pooled agent AgentID={aid} (pooled reuse) at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}");
+
+                agentScript.Initialize(itinerary, this, dwell);
+            }
+            else
+            {
+                // ---------------- NEW Part 2 undirected wandering path ----------------
+                // Physical spawn position uses the SAME shared startTransform-priority samplingOrigin/spawnPos
+                // as Part 3 (computed once, above, unconditionally for both modes) - NOT chosenEntrance.
+                // chosenEntrance is instead passed into Initialize() below as the agent's one-time initial
+                // movement target: it walks FROM its startTransform-based spawn point TO chosenEntrance first,
+                // then transitions to continuous wandering. It is never added to any itinerary and is never a
+                // wandering destination itself (unless a wanderingPoints[] entry happens to coincide with it).
+                if (mt != null)
+                {
+                    mt.startTransform = (startTransform != null) ? startTransform : chosenEntrance;
+                    mt.startPosition = go.transform.position;
                 }
 
-                mt.startPosition = go.transform.position;
+                string aid = agentScript != null ? agentScript.AgentID : "n/a";
+                string entranceLabel = chosenEntrance != null ? chosenEntrance.name : "none";
+                if (enableDebugLogs) Debug.Log($"[SpawnerManager] Spawned pooled UNDIRECTED (wandering) agent AgentID={aid} (pooled reuse) at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}, initial Entrance target={entranceLabel}");
+
+                agentScript.Initialize(this, wanderLookAheadDistance, chosenEntrance);
             }
-            // --- end ---
-
-            // Log itinerary
-            LogAgentItinerary(go, entranceIndex, chosenEntrance, itinerary, mt, go.GetComponent<NavMeshAgent>(), dwell);
-
-            // Also log AgentID explicitly
-            string aid = agentScript != null ? agentScript.AgentID : "n/a";
-            if (enableDebugLogs) Debug.Log($"[SpawnerManager] Spawned pooled agent AgentID={aid} (pooled reuse) at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}");
-
-            agentScript.Initialize(itinerary, this, dwell);
 
             liveAgents++;
             activeAgents.Add(go); // NEW: track for trial-state pause/resume/despawn
@@ -949,34 +1041,56 @@ public class SpawnerManager : MonoBehaviour
                 // NOTE: MoveToTarget no longer exposes 'useNavMeshAgent' flag.
             }
 
-            // Build itinerary and initialize (Transform-based; BuildItinerary inserts the chosen entrance as first entry).
-            float dwell = Random.Range(dwellTimeSec.x, dwellTimeSec.y);
-
-            List<Transform> itinerary = BuildItinerary(chosenEntrance);
-
-            if (mt != null)
+            if (directedMode)
             {
-                mt.startTransform = (startTransform != null) ? startTransform : chosenEntrance;
+                // ---------------- EXISTING Part 3 directed path - unchanged ----------------
+                // Build itinerary and initialize (Transform-based; BuildItinerary inserts the chosen entrance as first entry).
+                float dwell = Random.Range(dwellTimeSec.x, dwellTimeSec.y);
 
-                if (itinerary != null && itinerary.Count > 0 && itinerary[0] != null)
-                    mt.targetTransform = itinerary[0];
-                else
+                List<Transform> itinerary = BuildItinerary(chosenEntrance);
+
+                if (mt != null)
                 {
-                    if (itinerary != null && itinerary.Count > 0)
-                        mt.targetTransform = itinerary[itinerary.Count - 1];
+                    mt.startTransform = (startTransform != null) ? startTransform : chosenEntrance;
+
+                    if (itinerary != null && itinerary.Count > 0 && itinerary[0] != null)
+                        mt.targetTransform = itinerary[0];
                     else
-                        mt.targetTransform = null;
+                    {
+                        if (itinerary != null && itinerary.Count > 0)
+                            mt.targetTransform = itinerary[itinerary.Count - 1];
+                        else
+                            mt.targetTransform = null;
+                    }
+
+                    mt.startPosition = go.transform.position;
                 }
 
-                mt.startPosition = go.transform.position;
+                // Log itinerary and AgentID
+                string aid = agentScript != null ? agentScript.AgentID : "n/a";
+                LogAgentItinerary(go, entranceIndex, chosenEntrance, itinerary, mt, nav, dwell);
+                if (enableDebugLogs) Debug.Log($"[SpawnerManager] Spawned new agent AgentID={aid} at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}");
+
+                agentScript.Initialize(itinerary, this, dwell);
             }
+            else
+            {
+                // ---------------- NEW Part 2 undirected wandering path ----------------
+                // Same reasoning as the pooled-reuse branch above: physical spawn stays startTransform-based
+                // (shared, unconditional samplingOrigin/spawnPos), chosenEntrance is passed to Initialize()
+                // as the one-time initial movement target instead.
+                if (mt != null)
+                {
+                    mt.startTransform = (startTransform != null) ? startTransform : chosenEntrance;
+                    mt.startPosition = go.transform.position;
+                }
 
-            // Log itinerary and AgentID
-            string aid = agentScript != null ? agentScript.AgentID : "n/a";
-            LogAgentItinerary(go, entranceIndex, chosenEntrance, itinerary, mt, nav, dwell);
-            if (enableDebugLogs) Debug.Log($"[SpawnerManager] Spawned new agent AgentID={aid} at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}");
+                string aid = agentScript != null ? agentScript.AgentID : "n/a";
+                string entranceLabel = chosenEntrance != null ? chosenEntrance.name : "none";
+                if (enableDebugLogs) Debug.Log($"[SpawnerManager] Spawned new UNDIRECTED (wandering) agent AgentID={aid} at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}, initial Entrance target={entranceLabel}");
 
-            agentScript.Initialize(itinerary, this, dwell);
+                agentScript.Initialize(this, wanderLookAheadDistance, chosenEntrance);
+            }
 
             liveAgents++;
             activeAgents.Add(go); // NEW: track for trial-state pause/resume/despawn
@@ -986,7 +1100,8 @@ public class SpawnerManager : MonoBehaviour
     }
 
     /// <summary>
-    /// Log function for the active Transform-based itinerary.
+    /// Log function for the active Transform-based itinerary. DIRECTED MODE ONLY - undirected spawns log a
+    /// simpler one-line message directly at their call sites above instead of calling this.
     /// </summary>
     void LogAgentItinerary(GameObject go, int entranceIndex, Transform entrance, List<Transform> itinerary, MoveToTarget mt, NavMeshAgent nav, float dwell)
     {
@@ -1081,9 +1196,10 @@ public class SpawnerManager : MonoBehaviour
     }
 
     /// <summary>
-    /// Transform-based itinerary builder (the active itinerary system).
+    /// Transform-based itinerary builder (the active DIRECTED itinerary system - Part 3 only).
     /// The chosen 'entrance' transform is inserted as the first itinerary element (itinerary[0]).
-    /// The rest of the logic (n attractors then exit) is preserved.
+    /// The rest of the logic (n attractors then exit) is preserved. NEVER called for undirected (Part 2)
+    /// spawns, and never reads SpawnerManager.wanderingPoints.
     /// </summary>
     List<Transform> BuildItinerary(Transform entrance)
     {

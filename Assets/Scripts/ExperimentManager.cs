@@ -49,19 +49,25 @@ using UnityEngine;
 /// PER-PART CONFIGURATION (additive; supersedes the previous Part1-hardcoded "no NPC" rule):
 ///  - Each Part (part1Config/part2Config/part3Config, a PartCaptureConfig) now independently declares, via
 ///    the Inspector: whether NPCs exist at all (npcEnabled), whether NPC telemetry is written
-///    (npcCaptureEnabled), whether gaze is recorded (gazeCaptureEnabled), and whether participant trajectory
-///    is recorded (trajectoryCaptureEnabled). This is the SINGLE authoritative source for all four settings -
-///    SpawnerManager (npcEnabled, via a direct read of CurrentPartConfig) and DataCaptureManager /
-///    GazeRecorder (the three capture flags, via CurrentPartConfig) query it; none of them hold their own
-///    independent copy. CurrentPartConfig is set once, at the very top of each RunPartX(), before part_start
-///    is even raised.
+///    (npcCaptureEnabled), whether gaze is recorded (gazeCaptureEnabled), whether participant trajectory
+///    is recorded (trajectoryCaptureEnabled), and (NEW) whether NPCs use directed itinerary movement or
+///    continuous undirected wandering (npcDirectedMovement). This is the SINGLE authoritative source for
+///    all five settings - SpawnerManager and DataCaptureManager / GazeRecorder all read it via
+///    ExperimentManager.CurrentPartConfig rather than holding their own copies. CurrentPartConfig is set
+///    once, at the very top of each RunPartX(), before part_start is even raised.
 ///  - npcEnabled and npcCaptureEnabled are INDEPENDENT: npcEnabled=true + npcCaptureEnabled=false means NPCs
 ///    exist and move but are not recorded (this was Part2's original hardcoded behaviour, now just a
 ///    Part2Config default rather than special-cased code). npcEnabled=false + npcCaptureEnabled=true is
 ///    accepted (not blocked) but produces empty npc_state.csv/npc_events.csv content for that Part, since no
 ///    NPC can ever exist to capture; DataCaptureManager logs a one-time warning for this combination.
-///  - Default values reproduce the exact pre-Stage-7 behaviour: Part1 = everything off; Part2 = NPCs on,
-///    NPC capture off, gaze+trajectory on; Part3 = everything on.
+///  - npcDirectedMovement (NEW): when true (Part3's default), SpawnerManager.SpawnAgent() builds a directed
+///    itinerary (BuildItinerary: entrance -> attractors -> exit) exactly as before. When false (Part2's
+///    default), SpawnerManager skips itinerary construction entirely and spawns the NPC in PedestrianAgent's
+///    new continuous undirected-wandering mode instead (see SpawnerManager.wanderingPoints /
+///    PedestrianAgent.Initialize(SpawnerManager, float)). Only meaningful when npcEnabled is also true.
+///  - Default values reproduce the exact pre-undirected-wandering behaviour: Part1 = everything off;
+///    Part2 = NPCs on (now undirected), NPC capture off, gaze+trajectory on; Part3 = everything on
+///    (directed, as it always was).
 ///
 /// END PANEL HARD STOP (additive):
 ///  - OnEndPanelShown is a new event, raised immediately before uiManager.ShowPartXEndPanel(...) is called
@@ -94,10 +100,11 @@ public class ExperimentManager : MonoBehaviour
     public event Action<ExperimentEventInfo> OnExperimentEvent;
 
     /// <summary>
-    /// Per-Part configuration: whether NPCs exist, and whether each of the three continuous experimental
-    /// capture streams is recorded, for one Part. This is the SINGLE authoritative source of truth for these
-    /// four settings (Requirement: avoid duplicate sources of truth) - SpawnerManager, DataCaptureManager and
-    /// GazeRecorder all read it via ExperimentManager.CurrentPartConfig rather than holding their own copies.
+    /// Per-Part configuration: whether NPCs exist, whether they move directed or undirected, and whether each
+    /// of the three continuous experimental capture streams is recorded, for one Part. This is the SINGLE
+    /// authoritative source of truth for these five settings (Requirement: avoid duplicate sources of truth) -
+    /// SpawnerManager, DataCaptureManager and GazeRecorder all read it via ExperimentManager.CurrentPartConfig
+    /// rather than holding their own copies.
     /// </summary>
     [Serializable]
     public class PartCaptureConfig
@@ -106,6 +113,12 @@ public class ExperimentManager : MonoBehaviour
                  "Part. False means: no warm-up, no spawning, no NPCs ever appear - independent of the " +
                  "capture flags below.")]
         public bool npcEnabled = true;
+
+        [Tooltip("Whether NPCs use directed itinerary movement (entrance -> attractors -> exit, existing " +
+                 "Part 3 behaviour) when true, or continuous undirected wandering (SpawnerManager." +
+                 "wanderingPoints, no attractors, no exit, no dwell) when false. Only meaningful while " +
+                 "'Npc Enabled' is true.")]
+        public bool npcDirectedMovement = true;
 
         [Tooltip("Whether NPC telemetry (npc_state.csv / npc_events.csv) is written during this Part's " +
                  "trial. Independent of 'Npc Enabled': NPCs can exist and move (Npc Enabled = true) without " +
@@ -138,33 +151,36 @@ public class ExperimentManager : MonoBehaviour
     public float part2SecondDuration = 60f;
 
     [Header("Part 1 Configuration")]
-    [Tooltip("NPC presence and per-stream capture for Part 1. Defaults reproduce the previous hard-coded " +
-             "'Part1 = no NPC, no research capture' behaviour; change freely per Requirement 1.")]
+    [Tooltip("NPC presence, movement mode and per-stream capture for Part 1. Defaults reproduce the previous " +
+             "hard-coded 'Part1 = no NPC, no research capture' behaviour; change freely.")]
     public PartCaptureConfig part1Config = new PartCaptureConfig
     {
         npcEnabled = false,
+        npcDirectedMovement = true,
         npcCaptureEnabled = false,
         gazeCaptureEnabled = false,
         trajectoryCaptureEnabled = false
     };
 
     [Header("Part 2 Configuration")]
-    [Tooltip("NPC presence and per-stream capture for Part 2. Defaults reproduce the previous behaviour: " +
-             "NPCs on, NPC telemetry off, gaze + trajectory on.")]
+    [Tooltip("NPC presence, movement mode and per-stream capture for Part 2. Defaults: NPCs on, UNDIRECTED " +
+             "continuous wandering, NPC telemetry off, gaze + trajectory on.")]
     public PartCaptureConfig part2Config = new PartCaptureConfig
     {
         npcEnabled = true,
+        npcDirectedMovement = false,
         npcCaptureEnabled = false,
         gazeCaptureEnabled = true,
         trajectoryCaptureEnabled = true
     };
 
     [Header("Part 3 Configuration")]
-    [Tooltip("NPC presence and per-stream capture for Part 3. Defaults reproduce the previous behaviour: " +
-             "everything on (full dataset).")]
+    [Tooltip("NPC presence, movement mode and per-stream capture for Part 3. Defaults reproduce the previous " +
+             "behaviour: everything on, DIRECTED itinerary movement (full dataset).")]
     public PartCaptureConfig part3Config = new PartCaptureConfig
     {
         npcEnabled = true,
+        npcDirectedMovement = true,
         npcCaptureEnabled = true,
         gazeCaptureEnabled = true,
         trajectoryCaptureEnabled = true
@@ -190,12 +206,12 @@ public class ExperimentManager : MonoBehaviour
              "Part Configuration above, after the participant is teleported to the Part's start position but " +
              "BEFORE the participant-facing Start panel is shown and BEFORE OnTrialStart fires. During " +
              "warm-up, SpawnerManager spawns and moves NPCs using its completely normal runtime behaviour " +
-             "(same spawnInterval, maxAgents, itinerary generation, AttractorDwell, UncertainBehavior, " +
-             "MoveToTarget, pooling) so the NPC population has time to spawn and spread out through the " +
-             "environment before the participant can begin the actual trial. This single duration applies to " +
-             "every NPC-enabled Part - there is no separate per-Part duration field. Set to 0 to skip only " +
-             "the WAIT (the Start panel is then shown immediately); NPC presence itself is still controlled " +
-             "exclusively by 'Npc Enabled' above, never by this duration.")]
+             "(same spawnInterval, maxAgents, itinerary generation OR undirected wandering, pooling) so the " +
+             "NPC population has time to spawn and spread out through the environment before the participant " +
+             "can begin the actual trial. This single duration applies to every NPC-enabled Part - there is " +
+             "no separate per-Part duration field. Set to 0 to skip only the WAIT (the Start panel is then " +
+             "shown immediately); NPC presence itself is still controlled exclusively by 'Npc Enabled' above, " +
+             "never by this duration.")]
     public float npcWarmupDuration = 30f;
 
     [Header("Part1")]
@@ -383,6 +399,8 @@ public class ExperimentManager : MonoBehaviour
     /// toggles SpawnerManager's existing spawning gates via its public API and raises two observer events for
     /// DataCaptureManager. When npcWarmupDuration &lt;= 0 this only skips the WAIT (NPCs are still enabled
     /// for the Part and can spawn once OnTrialStart fires, via SpawnerManager's own trialActive gate).
+    /// cfg.npcDirectedMovement decides, inside SpawnerManager.SpawnAgent(), whether spawned NPCs get a
+    /// directed itinerary or continuous undirected wandering - this method does not need to know which.
     /// </summary>
     private IEnumerator RunNpcWarmup(PartCaptureConfig cfg, string partLabel)
     {

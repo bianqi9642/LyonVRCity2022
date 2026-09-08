@@ -1,10 +1,45 @@
 using UnityEngine;
 
 /// <summary>
+/// The gender of a spawned NPC. Rolled once per NPC (per spawn / pool reuse) from
+/// AgentProfile.femaleProbability and stored on AppearanceController.CurrentGender.
+/// Gender-restricted appearance options (hair / top / bottom) are then all selected
+/// within this one gender, so an NPC can never wear a cross-gender combination.
+/// </summary>
+public enum AgentGender
+{
+    Male,
+    Female
+}
+
+/// <summary>
+/// Per-PartOption gender applicability. 'Unisex' (default) means the option is valid
+/// for both genders and is selected exactly as before. 'MaleOnly' / 'FemaleOnly'
+/// restrict the option to that gender's pool.
+/// </summary>
+public enum GenderRestriction
+{
+    Unisex,
+    MaleOnly,
+    FemaleOnly
+}
+
+/// <summary>
 /// Experimenter-facing profile that describes appearance and behavior settings for an agent.
 /// Appearance contains per-part options (mesh + candidate materials + weight).
 /// This version also supports configurable speed options (multipliers with weights),
 /// so you can control both absolute magnitude (speed) and proportional variation across agents.
+///
+/// Gender-consistent appearance:
+///   - Each spawned NPC is assigned a single AgentGender, rolled once from
+///     'femaleProbability' (see ChooseGender). AppearanceController does this once per
+///     ApplyProfile call and stores the result on AppearanceController.CurrentGender.
+///   - Hair / Top / Bottom PartOptions carry a GenderRestriction. AppearanceController
+///     passes the NPC's gender into ChooseWeightedOption(options, gender), which only
+///     considers options whose restriction is Unisex or matches that gender.
+///   - Shoes / Accessories / Body options stay Unisex and are selected exactly as before.
+///   - The weighted-random selection logic (ChooseWeightedOption) is unchanged; the
+///     gender overload merely skips non-matching options when summing weights and picking.
 /// </summary>
 [CreateAssetMenu(menuName = "VRExp/AgentProfile")]
 public class AgentProfile : ScriptableObject
@@ -43,7 +78,7 @@ public class AgentProfile : ScriptableObject
     // ---------------------------------------
 
     /// <summary>
-    /// One selectable option for a body part: mesh + candidate materials + weight.
+    /// One selectable option for a body part: mesh + candidate materials + weight (+ gender applicability).
     /// </summary>
     [System.Serializable]
     public class PartOption
@@ -56,6 +91,22 @@ public class AgentProfile : ScriptableObject
 
         // Relative selection weight for weighted random selection among options.
         public float weight = 1f;
+
+        [Tooltip("Which NPC gender this option may be used by. 'Unisex' (default) = both, " +
+                 "and behaviour is identical to before this field existed. Set 'MaleOnly' / " +
+                 "'FemaleOnly' to make Hair / Top / Bottom gender-specific.")]
+        public GenderRestriction genderRestriction = GenderRestriction.Unisex;
+
+        /// <summary>True if this option may be worn by an NPC of the given gender.</summary>
+        public bool AvailableTo(AgentGender gender)
+        {
+            switch (genderRestriction)
+            {
+                case GenderRestriction.MaleOnly:   return gender == AgentGender.Male;
+                case GenderRestriction.FemaleOnly: return gender == AgentGender.Female;
+                default:                           return true; // Unisex
+            }
+        }
     }
 
     [Header("Appearance - per part options")]
@@ -66,14 +117,51 @@ public class AgentProfile : ScriptableObject
     public PartOption[] shoesOptions;
     public PartOption[] accessoriesOptions;
 
+    [Header("Appearance - Gender")]
+    [Range(0f, 1f)]
+    [Tooltip("Probability that a spawned NPC is Female. Rolled once per NPC (spawn / pool reuse). " +
+             "0 = always Male, 0.5 = even split, 1 = always Female.")]
+    public float femaleProbability = 0.5f;
+
     [Header("Collision / NavMesh")]
     public float agentRadius = 0.3f;
     public float agentHeight = 1.8f;
 
     /// <summary>
+    /// Roll a gender for one NPC. Called once per NPC by AppearanceController.ApplyProfile.
+    /// Uses the same (unseeded) UnityEngine.Random source as the rest of the appearance system.
+    /// </summary>
+    public AgentGender ChooseGender()
+    {
+        return (Random.value < femaleProbability) ? AgentGender.Female : AgentGender.Male;
+    }
+
+    /// <summary>
     /// Choose one PartOption from an array using weights. Returns null if none available.
+    /// Unchanged public behaviour: no gender filtering (equivalent to every option being Unisex).
     /// </summary>
     public PartOption ChooseWeightedOption(PartOption[] options)
+    {
+        return ChooseWeightedOptionInternal(options, null);
+    }
+
+    /// <summary>
+    /// Choose one PartOption using weights, considering ONLY options that are valid for the
+    /// given gender (Unisex options always qualify). Used for Hair / Top / Bottom so a
+    /// male NPC can never receive a female option and vice-versa. Returns null if the array
+    /// is empty OR if no option matches the requested gender.
+    /// </summary>
+    public PartOption ChooseWeightedOption(PartOption[] options, AgentGender gender)
+    {
+        return ChooseWeightedOptionInternal(options, gender);
+    }
+
+    /// <summary>
+    /// Shared weighted-random implementation. When genderFilter is null, every non-null option
+    /// is eligible (original behaviour). When set, only options with AvailableTo(gender) == true
+    /// contribute to the weight sum and can be picked.
+    /// </summary>
+    private PartOption ChooseWeightedOptionInternal(PartOption[] options, AgentGender? genderFilter)
     {
         if (options == null || options.Length == 0) return null;
 
@@ -81,7 +169,9 @@ public class AgentProfile : ScriptableObject
         for (int i = 0; i < options.Length; i++)
         {
             var o = options[i];
-            if (o != null) total += Mathf.Max(0f, o.weight);
+            if (o == null) continue;
+            if (genderFilter.HasValue && !o.AvailableTo(genderFilter.Value)) continue;
+            total += Mathf.Max(0f, o.weight);
         }
 
         if (total <= 0f) return null;
@@ -92,13 +182,19 @@ public class AgentProfile : ScriptableObject
         {
             var o = options[i];
             if (o == null) continue;
+            if (genderFilter.HasValue && !o.AvailableTo(genderFilter.Value)) continue;
             acc += Mathf.Max(0f, o.weight);
             if (r <= acc) return o;
         }
 
-        // fallback: return last non-null option
+        // fallback: return last eligible non-null option
         for (int i = options.Length - 1; i >= 0; i--)
-            if (options[i] != null) return options[i];
+        {
+            var o = options[i];
+            if (o == null) continue;
+            if (genderFilter.HasValue && !o.AvailableTo(genderFilter.Value)) continue;
+            return o;
+        }
 
         return null;
     }

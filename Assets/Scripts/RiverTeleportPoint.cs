@@ -12,6 +12,13 @@
 // - This script does NOT change AutoGroundAlign or MoveToTarget/NavMeshAgent state; it only repositions the
 //   player rig Transform.
 //
+// Exploration Area boundary (Part 2), additive:
+// - When ExplorationBoundary protection is active (default: during Part 2) this point refuses to teleport the
+//   participant if the destination lies outside the Exploration Area. Purely a guard clause in Select();
+//   outside Part 2, or if no ExplorationBoundary exists, or if 'respectExplorationBoundary' is false, the
+//   teleport behaves exactly as before. The scripted experiment teleport (ExperimentManager.TeleportPlayerTo)
+//   is unaffected.
+//
 // All comments are in English per project convention.
 
 using System;
@@ -47,6 +54,17 @@ public class RiverTeleportPoint : MonoBehaviour, IPointerClickHandler
     [Tooltip("Minimum time (seconds) between two teleports triggered by this script, to avoid immediate " +
              "back-and-forth teleporting if points are placed very close to each other.")]
     public float teleportCooldown = 0.5f;
+
+    [Header("Exploration Area boundary (Part 2)")]
+    [Tooltip("If true, this teleport point consults ExplorationBoundary before moving the participant. " +
+             "While boundary protection is active (default: during Part 2) a teleport whose destination is " +
+             "outside the Exploration Area is refused. Has no effect outside the gated part, or if there is " +
+             "no ExplorationBoundary in the scene.")]
+    public bool respectExplorationBoundary = true;
+
+    [Tooltip("Gate diagnostic logging for this component (project convention). Only the new boundary-related " +
+             "log is gated by this; the existing teleport log is unchanged.")]
+    public bool enableDebugLogs = false;
 
     // Fired after a successful teleport; other systems (e.g. the data-capture layer) can subscribe to this
     // to record river-crossing events without modifying this script.
@@ -114,6 +132,23 @@ public class RiverTeleportPoint : MonoBehaviour, IPointerClickHandler
         if (Time.time - lastTeleportTime < teleportCooldown)
         {
             return;
+        }
+
+        // Exploration Area boundary (Part 2): refuse a participant-triggered teleport whose destination lies
+        // outside the allowed area while boundary protection is active. No-op if the system is absent or
+        // protection is not currently active (IsTeleportDestinationAllowed returns true in those cases).
+        if (respectExplorationBoundary && ExplorationBoundary.Instance != null)
+        {
+            Vector3 destinationWorldPos = pairedPoint.position + Vector3.up * verticalOffset;
+            if (!ExplorationBoundary.Instance.IsTeleportDestinationAllowed(destinationWorldPos))
+            {
+                if (enableDebugLogs)
+                {
+                    Debug.Log($"RiverTeleportPoint ({gameObject.name}): teleport to '{pairedPoint.name}' " +
+                              $"blocked - destination is outside the Exploration Area.");
+                }
+                return;
+            }
         }
 
         TeleportPlayerTo(pairedPoint);

@@ -61,9 +61,34 @@ public class UncertainBehavior : MonoBehaviour
     [Tooltip("NavMesh sampling radius used when trying to snap candidate to NavMesh (usually similar to detourRadius)")]
     public float detourNavMeshSampleDistance = 2.0f;
 
-    [Header("Turn settings")]
-    [Tooltip("Angular speed (deg/s) when doing in-place turn")]
+    [Header("Turn settings (legacy - no longer read)")]
+    [Tooltip("No longer used: Hesitate used to rotate the ROOT by +/- this many deg/s with a new random sign " +
+             "every frame (rapid shaking, and it fought MoveToTarget's facing). Hesitate is now a smooth, " +
+             "target-based head look-around - see 'Look-around (Hesitate)'. Kept only so this Inspector value " +
+             "is not silently dropped from the prefab.")]
     public float turnSpeedDeg = 120f;
+
+    [Header("Look-around (Hesitate)")]
+    [Tooltip("If false, Hesitate is a plain soft pause with no look-around motion.")]
+    public bool lookAroundEnabled = true;
+    [Tooltip("Minimum yaw (deg) of a look target away from the walking direction.")]
+    public float lookAngleMin = 25f;
+    [Tooltip("Maximum yaw (deg) of a look target away from the walking direction.")]
+    public float lookAngleMax = 45f;
+    [Tooltip("Minimum / maximum time (s) of one turn to a look target. Turns across the forward direction " +
+             "(left <-> right) are stretched up to 1.6x so the angular speed stays gentle.")]
+    public float lookTurnDurationMin = 0.5f;
+    public float lookTurnDurationMax = 1.2f;
+    [Tooltip("Minimum / maximum time (s) the gaze is held on a look target before turning to the other side.")]
+    public float lookHoldMin = 0.4f;
+    public float lookHoldMax = 1.0f;
+    [Tooltip("Time (s) to ease the head back to the walking direction after Hesitate ends.")]
+    public float lookReturnDuration = 0.7f;
+    [Tooltip("A full look-around (left, hold, right, hold) needs more time than hesitateMin/Max (0.5-1.2 s on the " +
+             "current prefab). Hesitate is only a soft pause - the NPC keeps walking - so its duration is raised " +
+             "to at least this value when look-around is active. Set to 0 to keep hesitateMin/Max unchanged " +
+             "(the look-around is then simply cut short and eased back).")]
+    public float hesitateLookAroundMinDuration = 3.0f;
 
     [Header("Arrival detection (legacy - no longer read)")]
     [Tooltip("No longer used after Stage 4: arrival is now detected exclusively via MoveToTarget.OnArrived. " +
@@ -102,6 +127,22 @@ public class UncertainBehavior : MonoBehaviour
 
     // Flag: when true, uncertain behavior is suspended because we've arrived at the main target
     bool suspendedBecauseArrived = false;
+
+    // ---- Look-around (Hesitate) runtime state ----
+    // The look-around only offsets the yaw of the head/neck bone in LateUpdate (on top of the animated pose).
+    // The root Transform is never rotated here, so MoveToTarget stays the sole writer of root rotation.
+    enum LookPhase { Idle, Turning, Holding, Returning }
+    LookPhase lookPhase = LookPhase.Idle;
+    Transform lookBone;                 // head/neck bone, resolved lazily
+    bool lookBoneResolved = false;
+    float lookYaw;                      // current yaw offset in degrees (+ = right, - = left)
+    float lookYawVelocity;              // SmoothDamp state (keeps angular velocity continuous across targets)
+    float lookTargetYaw;                // current look target, stable for the whole turn + hold
+    float lookSmoothTime;               // SmoothDamp time derived from the chosen turn duration
+    float lookPhaseTimer;               // time left in the current Turning / Holding phase
+    float lookSide = 1f;                // side of the current target (+1 right, -1 left)
+    const float k_LookReferenceArc = 40f;
+    const float k_LookSmoothDampFactor = 2.4f; // critically damped: ~95% of the way after 2.4 * smoothTime
 
     void Start()
     {
@@ -155,6 +196,7 @@ public class UncertainBehavior : MonoBehaviour
         haveSavedMainTarget = false;
         mainTargetOnDetourStart = Vector3.zero;
         suspendedBecauseArrived = false;
+        ResetLookAroundImmediate();
 
         // Re-subscribe the main-arrival handler for this life (idempotent: only subscribes if not already).
         if (moveController != null && onMainArrivalHandler == null)
@@ -226,6 +268,7 @@ public class UncertainBehavior : MonoBehaviour
 
     void EnterPause()
     {
+        EndLookAround(); // safety: external Trigger*Now() can enter a state without leaving Hesitate first
         state = State.Pause;
         stateTimer = UnityEngine.Random.Range(pauseMin, pauseMax);
         stateStartTime = Time.time;
@@ -250,6 +293,11 @@ public class UncertainBehavior : MonoBehaviour
         stateTimer = UnityEngine.Random.Range(hesitateMin, hesitateMax);
         stateStartTime = Time.time;
 
+        // Start the smooth look-around. Only when it can actually run (a head bone exists) is the soft-pause
+        // duration raised to fit a full left/hold/right/hold sequence.
+        if (BeginLookAround() && hesitateLookAroundMinDuration > stateTimer)
+            stateTimer = hesitateLookAroundMinDuration;
+
         if (moveController != null)
         {
             // Hesitate uses a "soft pause": don't halt movement and don't freeze animator.
@@ -265,6 +313,7 @@ public class UncertainBehavior : MonoBehaviour
 
     void EnterSlow()
     {
+        EndLookAround();
         state = State.Slow;
         stateTimer = UnityEngine.Random.Range(slowMin, slowMax);
         stateStartTime = Time.time;
@@ -285,6 +334,7 @@ public class UncertainBehavior : MonoBehaviour
 
     void EnterDetour()
     {
+        EndLookAround();
         state = State.Detour;
 
         // Try to sample a detour target that:
@@ -457,6 +507,9 @@ public class UncertainBehavior : MonoBehaviour
     {
         // Called when a non-walking state expires and we should restore normal walking behavior.
 
+        // Ease any look-around offset back to the walking direction (no-op if none is active).
+        EndLookAround();
+
         // If we were in a detour and subscribed to MoveToTarget.OnArrived, unsubscribe now.
         if (moveController != null && onMoveToArrivedHandler != null)
         {
@@ -513,12 +566,134 @@ public class UncertainBehavior : MonoBehaviour
 
     // ---- Per-frame behaviors for certain states ----
 
+    // Hesitate = the pedestrian briefly looks around while still walking: turn to one side, hold the gaze,
+    // turn to the other side, hold, ... and ease back to forward when the state ends (EndLookAround()).
+    // This method only advances the sequence timers and picks a NEW target at the end of each hold; the
+    // actual smoothing and bone write happen in LateUpdate(). Nothing here touches the root rotation.
     void DoHesitate(float dt)
     {
-        // Rotate in place with small jitter to simulate looking around
-        float ang = turnSpeedDeg * dt;
-        float dir = (UnityEngine.Random.value > 0.5f) ? 1f : -1f;
-        transform.Rotate(Vector3.up, dir * ang);
+        if (lookPhase != LookPhase.Turning && lookPhase != LookPhase.Holding)
+            return;
+
+        lookPhaseTimer -= dt;
+        if (lookPhaseTimer > 0f)
+            return;
+
+        if (lookPhase == LookPhase.Turning)
+        {
+            lookPhase = LookPhase.Holding;
+            lookPhaseTimer = RandomRange(lookHoldMin, lookHoldMax);
+        }
+        else
+        {
+            StartLookTurn(-lookSide); // alternate sides
+        }
+    }
+
+    // ---- Look-around helpers ----
+
+    // Starts the sequence (first side random). Returns false if look-around is disabled or no head bone exists,
+    // in which case Hesitate stays a plain soft pause.
+    bool BeginLookAround()
+    {
+        if (!lookAroundEnabled) return false;
+        if (!ResolveLookBone()) return false;
+
+        StartLookTurn(UnityEngine.Random.value < 0.5f ? -1f : 1f);
+        return true;
+    }
+
+    void StartLookTurn(float side)
+    {
+        lookSide = side;
+        float a0 = Mathf.Min(lookAngleMin, lookAngleMax);
+        float a1 = Mathf.Max(lookAngleMin, lookAngleMax);
+        lookTargetYaw = side * RandomRange(a0, a1);
+
+        // Longer travel (e.g. left -> right) gets a proportionally longer turn, capped, to keep speed gentle.
+        float stretch = Mathf.Clamp(Mathf.Abs(lookTargetYaw - lookYaw) / k_LookReferenceArc, 1f, 1.6f);
+        float duration = RandomRange(lookTurnDurationMin, lookTurnDurationMax) * stretch;
+
+        lookPhase = LookPhase.Turning;
+        lookPhaseTimer = duration;
+        lookSmoothTime = Mathf.Max(0.05f, duration / k_LookSmoothDampFactor);
+    }
+
+    // Hesitate (or any other state change) is over: ease the head back to forward from wherever it currently is.
+    // SmoothDamp keeps the angular velocity continuous, so there is no snap even if this happens mid-turn.
+    void EndLookAround()
+    {
+        if (lookPhase == LookPhase.Idle || lookPhase == LookPhase.Returning) return;
+
+        lookPhase = LookPhase.Returning;
+        lookTargetYaw = 0f;
+        lookSmoothTime = Mathf.Max(0.05f, lookReturnDuration / k_LookSmoothDampFactor);
+    }
+
+    // Hard reset (pool reuse / disable): no residual offset, velocity or phase is carried into the next life.
+    void ResetLookAroundImmediate()
+    {
+        lookPhase = LookPhase.Idle;
+        lookYaw = 0f;
+        lookYawVelocity = 0f;
+        lookTargetYaw = 0f;
+        lookPhaseTimer = 0f;
+    }
+
+    bool ResolveLookBone()
+    {
+        if (lookBoneResolved) return lookBone != null;
+        lookBoneResolved = true;
+
+        // Humanoid avatar first (the NPC avatar maps its "Neck" transform to Head), then name-based fallback.
+        Animator anim = GetComponentInChildren<Animator>();
+        if (anim != null && anim.isHuman)
+            lookBone = anim.GetBoneTransform(HumanBodyBones.Head);
+
+        if (lookBone == null)
+        {
+            foreach (Transform t in GetComponentsInChildren<Transform>(true))
+            {
+                if (t.name == "Neck" || t.name == "Head") { lookBone = t; if (t.name == "Neck") break; }
+            }
+        }
+
+        if (lookBone == null && enableLogging)
+            Debug.LogWarning($"[UncertainBehavior] [{gameObject.name}] No head/neck bone found; Hesitate will not look around.");
+
+        return lookBone != null;
+    }
+
+    // Runs after the Animator (and Animation Rigging) have posed the skeleton this frame, so the yaw offset is
+    // applied on top of the animated pose and never accumulates. Runs even while uncertain behaviour is
+    // suspended, so the return-to-forward always completes.
+    void LateUpdate()
+    {
+        if (lookPhase == LookPhase.Idle) return;
+
+        if (lookBone == null)
+        {
+            ResetLookAroundImmediate();
+            return;
+        }
+
+        lookYaw = Mathf.SmoothDamp(lookYaw, lookTargetYaw, ref lookYawVelocity, lookSmoothTime,
+                                   Mathf.Infinity, Time.deltaTime);
+
+        if (lookPhase == LookPhase.Returning &&
+            Mathf.Abs(lookYaw) < 0.05f && Mathf.Abs(lookYawVelocity) < 0.05f)
+        {
+            ResetLookAroundImmediate();
+            return;
+        }
+
+        // Yaw about the NPC's up axis (world space), so it is independent of the bone's local axes.
+        lookBone.rotation = Quaternion.AngleAxis(lookYaw, transform.up) * lookBone.rotation;
+    }
+
+    static float RandomRange(float a, float b)
+    {
+        return UnityEngine.Random.Range(Mathf.Min(a, b), Mathf.Max(a, b));
     }
 
     // ---- External triggers ----
@@ -626,6 +801,9 @@ public class UncertainBehavior : MonoBehaviour
 
     void OnDisable()
     {
+        // Drop any look-around state so a re-enabled (pooled) NPC never resumes a stale offset.
+        ResetLookAroundImmediate();
+
         // Ensure we clean up subscription if object disabled unexpectedly
         if (moveController != null && onMoveToArrivedHandler != null)
         {

@@ -11299,7 +11299,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!4 &101799188
 Transform:
   m_ObjectHideFlags: 0
@@ -118428,7 +118428,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!4 &1110960458
 Transform:
   m_ObjectHideFlags: 0
@@ -154071,7 +154071,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!114 &1476784966
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -202147,7 +202147,7 @@ MonoBehaviour:
   agentFactory: {fileID: 2139592827}
   defaultProfile: {fileID: 11400000, guid: 8ec1ac8d266554c54874ed3d7f9ce83e, type: 2}
   spawnInterval: 0.5
-  maxAgents: 5
+  maxAgents: 50
   minAttractorsPerAgent: 1
   maxAttractorsPerAgent: 4
   dwellTimeSec: {x: 5, y: 15}
@@ -202165,7 +202165,7 @@ MonoBehaviour:
   - 0
   - -1
   usePooling: 1
-  poolPrewarm: 10
+  poolPrewarm: 50
   navmeshWaitTimeout: 5
   experimentManager: {fileID: 0}
   gateSpawningByTrialState: 1

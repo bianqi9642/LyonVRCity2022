@@ -149,6 +149,10 @@ public class ExperimentManager : MonoBehaviour
     public float part1Duration = 60f;
     public float part2FirstDuration = 60f;
     public float part2SecondDuration = 60f;
+    [Tooltip("Maximum time (seconds) to search for Destination 1, measured from when its instruction panel is confirmed. Protocol: 600 (10 minutes).")]
+    public float part3Destination1MaxSeconds = 600f;
+    [Tooltip("Maximum total Phase 3 duration (seconds), measured from when the Start panel is confirmed. Protocol: 900 (15 minutes).")]
+    public float part3TotalMaxSeconds = 900f;
 
     [Header("Part 1 Configuration")]
     [Tooltip("NPC presence, movement mode and per-stream capture for Part 1. Defaults reproduce the previous " +
@@ -249,12 +253,6 @@ public class ExperimentManager : MonoBehaviour
     public Part3ZoneTargets part3ZoneGU = new Part3ZoneTargets();
     public Part3ZoneTargets part3ZoneOE = new Part3ZoneTargets();
     public Part3ZoneTargets part3ZoneOU = new Part3ZoneTargets();
-
-    [Header("Part3 - timing")]
-    [Tooltip("Maximum time (seconds) to search for Destination 1, measured from when its instruction panel is confirmed. Protocol: 600 (10 minutes).")]
-    public float part3Destination1MaxSeconds = 600f;
-    [Tooltip("Maximum total Phase 3 duration (seconds), measured from when the Start panel is confirmed. Protocol: 900 (15 minutes).")]
-    public float part3TotalMaxSeconds = 900f;
 
     [Serializable]
     public class Part2Group

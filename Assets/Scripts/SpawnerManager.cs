@@ -1,88 +1,48 @@
 // SpawnerManager.cs
-// Extended SpawnerManager that supports:
-// - Applying AgentProfile via optional AgentFactory when creating or reusing agents.
-// - Minimal, non-invasive changes so existing behaviors remain unchanged if new features are not used.
 //
-// This version fixes compile errors caused by previous MoveToTarget refactor that removed the
-// public 'useNavMeshAgent' field. All references to mt.useNavMeshAgent have been removed and
-// logging/decisions now rely on the actual NavMeshAgent state (nav != null && nav.enabled && nav.isOnNavMesh).
+// Spawns, pools and recycles the pedestrian NPC population and decides HOW each NPC will move.
 //
-// NEW (trial-state gating): SpawnLoop() previously ran continuously for the lifetime of the scene,
-// independent of ExperimentManager.OnTrialStart/OnTrialEnd. This meant pedestrian presence before a
-// trial officially started (or after it ended) was not delineated from "in-trial" pedestrian presence,
-// which could confound the recorded trial window with a continuous, ungated pedestrian stimulus.
-// SpawnerManager now optionally subscribes to ExperimentManager.OnTrialStart/OnTrialEnd and:
-//   - only spawns NEW agents while a trial is active (gates SpawnLoop/SpawnAgent), and
-//   - optionally pauses/resumes movement of agents that are already alive when a trial ends/starts,
-//     and/or force-finishes them, so that "trial recording window" and "pedestrian stimulus window"
-//     can be made to coincide exactly.
-// This is opt-in via 'gateSpawningByTrialState' (default true) so it fixes the confound by default,
-// but can be switched off to restore the previous continuous-spawning behaviour if that is intentional
-// (e.g. for ambient background population that is not meant to be the manipulated stimulus).
+// ---------------------------------------------------------------------------------------------------------------
+// WHAT THIS CLASS DOES (in execution order)
 //
-// NEW (Quest logging fix): SpawnerManager previously logged unconditionally and verbosely on every
-// spawn/despawn (LogAgentItinerary builds a multi-line StringBuilder per spawn),
-// with no build-time or runtime gate - unlike MoveToTarget, which already has an 'enableDebugLogs' toggle.
-// On Quest, this string-heavy per-spawn logging is a known performance drain that scales with
-// maxAgents/spawnInterval. SpawnerManager now has its own 'enableDebugLogs' flag (mirroring MoveToTarget's),
-// defaulting to true so existing Editor workflows are unaffected, and every Debug.Log/LogWarning/LogError
-// call in this script is gated behind it so it can be switched off for Quest builds.
+//   Start()                          resolve ExperimentManager, subscribe to its events, start the pool coroutine
+//   InitializePoolThenSpawn()        wait for the NavMesh, prewarm 'poolPrewarm' inactive NPCs, then start SpawnLoop()
+//   SpawnLoop()                      every 'spawnInterval': if ShouldSpawnNow() -> SpawnAgent()
+//   SpawnAgent()                     the orchestrator; one NPC per call, in four steps:
+//       1. DECIDE   ChooseEntrance / ResolveSpawnPosition / ActiveMovementMode / BuildItinerary
+//       2. ACQUIRE  TakeFromPool or InstantiateNewAgent (placed on the NavMesh), then ApplyAgentProfile / BindMover
+//       3. INIT     InitializeAgentMovement -> PedestrianAgent.Initialize(...)
+//       4. REGISTER RegisterSpawnedAgent (population accounting + data-capture event)
+//   OnAgentFinished()                an NPC completed its itinerary (or was force-finished): return it to the pool
 //
-// NEW (NPC warm-up): SpawnLoop()'s spawning gate previously had exactly one "open" condition while gating
-// is enabled: trialActive (set by HandleTrialStart/HandleTrialEnd, which are themselves driven only by
-// ExperimentManager.OnTrialStart/OnTrialEnd). That meant NPCs could never spawn before the very first
-// participant trial of a Part. ExperimentManager now runs an explicit NPC warm-up window BEFORE the
-// participant-facing Start panel is shown (and therefore before OnTrialStart fires), during which it wants
-// SpawnerManager to spawn and move NPCs using its completely normal runtime behaviour - same spawnInterval,
-// maxAgents, itinerary generation, AttractorDwell, UncertainBehavior, MoveToTarget, and pooling - so the NPC
-// population has time to form and spread out before the participant's trial begins. SpawnerManager exposes
-// this as a second, independent gate flag ('npcWarmupActive', opened/closed only via the new
-// BeginNpcWarmup()/EndNpcWarmup() public methods) rather than overloading 'trialActive', because the two
-// represent different experimental semantics (pre-trial population settling vs. the participant's actual
-// trial window) and must be distinguishable by any observer (see DataCaptureManager.NpcCaptureActive, which
-// must NOT treat warm-up NPC activity as trial data). ExperimentManager sequences the two so they never
-// overlap and there is no gap in spawning at the warm-up -> trial boundary. This change touches ONLY the
-// spawning gate; it does not add, remove, or alter any movement/itinerary/pooling logic.
+// MOVEMENT MODES  (NpcMovementMode, chosen per spawn from ExperimentManager.CurrentPartConfig)
 //
-// NEW (per-Part NPC control, supersedes the Stage-6 SetNpcsEnabledForPart mechanism): whether NPCs may
-// operate for the Part currently running is now PULLED directly from
-// ExperimentManager.CurrentPartConfig.npcEnabled every SpawnLoop tick (NpcsEnabledForActivePart()), instead
-// of being pushed into a locally-cached field via a dedicated method call. This removes a second,
-// independently-updated copy of the same boolean - ExperimentManager remains the single source of truth for
-// all per-Part NPC/capture configuration, and every other system (this one included) merely reads it.
+//   Part3AttractorItinerary   Entrance -> 1..4 attractors -> Exit        BuildAttractorItinerary()
+//   Part2WanderingItinerary   Entrance -> 1..4 wandering points -> Exit  BuildWanderingItinerary()
 //
-// NEW (End Panel hard stop): ExperimentManager now raises OnEndPanelShown immediately before a Part's End
-// Panel is shown to the participant - strictly before part_end (raised only once the participant confirms
-// the panel). SpawnerManager subscribes unconditionally (regardless of gateSpawningByTrialState) to: close
-// the spawning gate (endPanelActive, ANDed into SpawnLoop's gate the same way NpcsEnabledForActivePart() is)
-// and freeze every currently-active agent using ONLY existing public APIs - MoveToTarget.PauseExternal() and
-// disabling UncertainBehavior (see HardStopAgent()). Because a one-shot freeze is not airtight against
-// PedestrianAgent's own dwell coroutines (independent of MoveToTarget's paused state), the freeze is
-// continuously re-applied every frame for as long as endPanelActive is true (see Update()). The hard stop is
-// cleared only when the NEXT Part's NPC lifecycle begins (ResetForNewPart(), called unconditionally from
-// ExperimentManager.RunNpcWarmup()). None of this touches NavMeshAgent directly, and none of it changes the
-// Stage 4 architecture (UncertainBehavior -> MoveToTarget -> NavMeshAgent).
+//   Both are finite, pre-generated ONCE per NPC life and handed to PedestrianAgent, which walks them and finishes
+//   at the exit (-> OnAgentFinished -> pool). How each kind of waypoint is completed (arrival event + dwell for
+//   Part 3 attractors; 1.5 m look-ahead without dwell for Part 2 wandering points) is PedestrianAgent's job.
 //
-// NEW (Part 2 continuous undirected wandering): SpawnAgent() now reads
-// ExperimentManager.CurrentPartConfig.npcDirectedMovement (via DirectedMovementForActivePart(), mirroring
-// NpcsEnabledForActivePart()'s pull pattern exactly) to decide, per spawn, whether to build a directed
-// itinerary (BuildItinerary() - unchanged, Part 3's existing behaviour) or initialize the agent for
-// undirected wandering instead (PedestrianAgent.Initialize(SpawnerManager, float, Transform) - no
-// itinerary, no attractors, no exit). The new 'wanderingPoints' array is a plain Transform[], declared and
-// used exactly like the existing entrances/exits/attractors arrays, and is NEVER referenced by
-// BuildItinerary() or any other Part 3 code path. Population accounting
-// (liveAgents/activeAgents/maxAgents/spawnInterval) is completely unconditional and shared between both
-// modes, unchanged - this is what guarantees Part 2 and Part 3 draw from the exact same population source
-// of truth.
+// SPAWN GATES  (all ANDed in ShouldSpawnNow(), evaluated every tick)
+//   - End-Panel hard stop not active, NPCs enabled for the active Part (ExperimentManager.CurrentPartConfig),
+//     and (if gateSpawningByTrialState) a trial or the NPC warm-up window is open, and liveAgents < maxAgents.
+//   - ExperimentManager is the single source of truth for per-Part NPC settings; this class only READS them
+//     (NpcsEnabledForActivePart / ActiveMovementMode) rather than caching copies.
 //
-// NEW (Part 2 shares Part 3's spawn origin and initial-Entrance draw): the physical spawn position
-// (samplingOrigin/spawnPos, startTransform-priority) is computed ONCE, unconditionally, identically for
-// BOTH modes - exactly as it always was, before ANY Part 2 wandering work. 'chosenEntrance' - the SAME
-// Random.Range(0, entrances.Length) draw Part 3 already made - is passed into the undirected
-// Initialize(...) overload as a one-time initial movement target: an undirected agent spawns at the shared
-// startTransform-based origin, walks to chosenEntrance using MoveToTarget's normal arrival behaviour, and
-// only then begins continuous wandering through wanderingPoints[]. chosenEntrance is NEVER used as the
-// undirected agent's physical spawn position, and is NEVER added to any itinerary.
+// INTERACTIONS
+//   ExperimentManager  -> BeginNpcWarmup / EndNpcWarmup / ResetForNewPart (public), OnTrialStart/End, OnEndPanelShown
+//   AgentFactory       <- ApplyProfileToInstance (speed, appearance, NavMeshAgent shape, UncertainBehavior roll)
+//   PedestrianAgent    <- Initialize; -> OnAgentFinished, TryEnterAttractor / ReleaseAttractor / FindAttractorInfo
+//   MoveToTarget       <- PauseExternal / ResumeExternal (trial pause, End-Panel hard stop)
+//   DataCaptureManager <- AgentSpawned / AgentDespawned / ActiveAgents (observer only)
+//
+// HISTORY OF NOTE (kept short; see the methods for details)
+//   - Trial-state gating and the NPC warm-up window are two independent flags (trialActive, npcWarmupActive)
+//     because they carry different experimental meaning; ExperimentManager sequences them so they never overlap.
+//   - The End-Panel hard stop is re-asserted every frame (Update) because PedestrianAgent's dwell coroutines can
+//     otherwise un-pause an agent between frames. It is cleared only by ResetForNewPart().
+//   - All Debug logging is gated by 'enableDebugLogs' (inline `if`, so no strings are built when disabled).
 //
 // All comments in English.
 
@@ -103,50 +63,80 @@ public class AttractorInfo
 
 public class SpawnerManager : MonoBehaviour
 {
+    // =================================================================================================================
+    #region 1. Serialized configuration (field names/types are scene-serialized: do not rename)
+    // =================================================================================================================
+
+    // Inspector order = declaration order. Sections, top to bottom:
+    //   References | Part 3 Itinerary Stops | Part 2 Itinerary Stops | Spawn Configuration & Population Limit |
+    //   Spawn Interval & Position Sampling | Object Pooling & Prewarm | Agent Profile & NPC Configuration |
+    //   Experiment / Trial Spawn Gates | Debug & Diagnostics
+    // The movement mode (Part 2 vs Part 3 itinerary) is NOT a field here: it is pulled per Part from
+    // ExperimentManager.CurrentPartConfig.npcDirectedMovement (see ActiveMovementMode()). Attractor capacity is a
+    // per-element field of 'attractors' (AttractorInfo.capacity). Part 1 spawns no NPCs by default, so no setting here
+    // is Part 1-specific. Only the order/headers/tooltips are presentation; names, types and defaults are unchanged.
+
     [Header("References")]
-    // NEW: spawn start point (drag a transform in inspector). If provided, agents will spawn at/near this transform.
-    // The itinerary's first entry (itinerary[0]) will be chosen randomly from `entrances` regardless of this startTransform.
+    [Tooltip("Spawn start point. If assigned, agents spawn at/near this transform (NavMesh-sampled). The itinerary's " +
+             "first entry (itinerary[0]) is chosen randomly from 'Entrances' regardless of this transform.")]
     public Transform startTransform;
 
+    [Tooltip("Candidate entrances. One is drawn per spawn and becomes itinerary[0] (Part 3: the first waypoint; " +
+             "Part 2: the instant placement point).")]
     public Transform[] entrances;
+    [Tooltip("Candidate exits. One is chosen per itinerary as its last entry; reaching it finishes the NPC and " +
+             "returns it to the pool.")]
     public Transform[] exits;
+
+    [Header("Part 3 Itinerary Stops (Attractors)")]
+    [Tooltip("Part 3 only (Entrance -> attractors -> Exit). Intermediate stops with dwell. Each element has its " +
+             "own Capacity (max simultaneous occupants; <= 0 = unlimited). Not used by Part 1 or Part 2.")]
     public AttractorInfo[] attractors;
-
-    [Header("Wandering Points (Part 2 - undirected mode only)")]
-    [Tooltip("Predefined, experimenter-placed Transforms used ONLY by undirected (Part 2) NPCs as continuous " +
-             "wandering destinations. Anonymous movement waypoints - NOT attractors, NOT exits, and never " +
-             "referenced by BuildItinerary() or any directed (Part 3) code path. Place them on/near the " +
-             "walkable NavMesh, spread across the area NPCs should wander, forming a plausible low-density " +
-             "pedestrian movement network rather than a random scatter. At runtime each candidate is " +
-             "validated with NavMesh.CalculatePath before being accepted as a target - an unreachable point " +
-             "is skipped (with a warning), never silently replaced by a generated position.")]
-    public Transform[] wanderingPoints;
-
-    [Tooltip("Distance (metres) at which an undirected (Part 2) NPC selects its NEXT wandering point, " +
-             "before MoveToTarget's own (much tighter) arriveThreshold would otherwise bring it to a full " +
-             "stop. Must be larger than MoveToTarget.arriveThreshold (0.2 by default) by a comfortable " +
-             "margin - see the implementation notes shipped with this feature for the reasoning. Tune " +
-             "visually in Play mode: too small and NPCs visibly stop-start at every point; too large and " +
-             "NPCs change direction while still far from the point they were walking toward.")]
-    public float wanderLookAheadDistance = 1.5f;
-
-    [Header("Prefab & Spawn")]
-    public GameObject agentPrefab;
-    public AgentFactory agentFactory;           // optional factory to create/apply profile
-    public AgentProfile defaultProfile;         // optional default profile applied at spawn
-    public float spawnInterval = 0.5f; // seconds between spawns
-    public int maxAgents = 200;
-
-    [Header("Itinerary / Behavior")]
+    [Tooltip("Part 3 only: minimum number of distinct attractors per itinerary (inclusive).")]
     public int minAttractorsPerAgent = 1;
+    [Tooltip("Part 3 only: maximum number of distinct attractors per itinerary (inclusive).")]
     public int maxAttractorsPerAgent = 4;
+    [Tooltip("Part 3 only: attractor dwell time in seconds, as a range (x = min, y = max). One value is drawn per NPC " +
+             "when it spawns and is used for EVERY attractor visit of that NPC. NPCs never dwell at the entrance or " +
+             "the exit, and Part 2 does not use this setting.")]
     public Vector2 dwellTimeSec = new Vector2(5f, 15f); // min/max dwell
 
-    [Header("Spawn Sampling")]
+    [Header("Part 2 Itinerary Stops (Wandering Points)")]
+    [Tooltip("Predefined, experimenter-placed Transforms used ONLY as the intermediate stops of Part 2 " +
+             "(Part2WanderingItinerary) routes: Entrance -> wandering points -> Exit. Anonymous movement waypoints - " +
+             "NOT attractors, NOT exits, never referenced by BuildAttractorItinerary() and never given dwell or " +
+             "capacity logic. Place them on/near the walkable NavMesh, spread across the area NPCs should cover. " +
+             "When a route is generated, every leg is validated with NavMesh.CalculatePath; a point that cannot be " +
+             "reached from the previous stop is skipped (never silently replaced by a generated position).")]
+    public Transform[] wanderingPoints;
+    [Tooltip("Part 2 only: minimum number of distinct wandering points per itinerary (inclusive). Defaults mirror " +
+             "Part 3's attractor counts.")]
+    public int minWanderingPointsPerAgent = 1;
+    [Tooltip("Part 2 only: maximum number of distinct wandering points per itinerary (inclusive), capped by the " +
+             "number of valid points available.")]
+    public int maxWanderingPointsPerAgent = 4;
+    [Tooltip("Part 2 only. Distance (metres) at which an NPC moves on to the NEXT entry of its itinerary while " +
+             "travelling between wandering points, before MoveToTarget's own (much tighter) arriveThreshold would " +
+             "bring it to a full stop. It is a transition rule for intermediate stops only - the entrance placement and " +
+             "the exit still use the normal arrival event. Must be larger than MoveToTarget.arriveThreshold (0.2 by " +
+             "default) by a comfortable margin. Too small: stop-start at every point; too large: early direction changes.")]
+    public float wanderLookAheadDistance = 1.5f;
+
+    [Header("Spawn Configuration & Population Limit")]
+    [Tooltip("The NPC prefab that is pooled/instantiated. Must carry PedestrianAgent, MoveToTarget and a NavMeshAgent.")]
+    public GameObject agentPrefab;
+    [Tooltip("Maximum number of simultaneously alive NPCs. Spawning pauses while this many are alive.")]
+    public int maxAgents = 200;
+
+    [Header("Spawn Interval & Position Sampling")]
+    [Tooltip("Seconds between spawn attempts (at most one NPC per attempt).")]
+    public float spawnInterval = 0.5f; // seconds between spawns
+    [Tooltip("Radius (metres) on the horizontal plane around the spawn origin used to sample a NavMesh position.")]
     public float spawnSampleRadius = 1.0f; // sample radius around entrance on the horizontal plane
+    [Tooltip("Number of random NavMesh sampling attempts before falling back to the spawn origin.")]
     public int spawnSampleMaxAttempts = 8;
 
-    // New fields to control ground projection behaviour:
+    // Ground projection behaviour:
     [Tooltip("Layer(s) considered ground for projection raycasts. Default = Everything.")]
     public LayerMask groundLayers = ~0;
     [Tooltip("Maximum distance used when raycasting down to find ground from a sampling height.")]
@@ -156,14 +146,22 @@ public class SpawnerManager : MonoBehaviour
     [Tooltip("Vertical offsets (relative to entrance Y) to try when NavMesh.SamplePosition fails to find a NavMesh from the projected ground point.")]
     public float[] verticalOffsets = new float[] { 2.0f, 1.0f, 0.5f, 0.0f, -1.0f };
 
-    [Header("Pooling")]
+    [Header("Object Pooling & Prewarm")]
+    [Tooltip("Reuse NPC instances instead of destroying them when they finish.")]
     public bool usePooling = true;
+    [Tooltip("Number of inactive NPC instances created up front, before spawning starts.")]
     public int poolPrewarm = 50;
-
+    [Tooltip("Seconds to wait for the NavMesh to become available before pool prewarm / first spawns proceed anyway.")]
     // time to wait for NavMesh availability before giving up (seconds)
     public float navmeshWaitTimeout = 5f;
 
-    [Header("Trial State Gating (NEW)")]
+    [Header("Agent Profile & NPC Configuration")]
+    [Tooltip("Optional factory that applies the profile (appearance, speed, NavMeshAgent shape, UncertainBehavior roll) to each NPC.")]
+    public AgentFactory agentFactory;           // optional factory to create/apply profile
+    [Tooltip("Default AgentProfile applied at spawn. ExperimentManager.currentProfile overwrites this at the start of each NPC-enabled Part.")]
+    public AgentProfile defaultProfile;         // optional default profile applied at spawn
+
+    [Header("Experiment / Trial Spawn Gates")]
     [Tooltip("Optional: assign the scene's ExperimentManager. If left empty, it will be auto-found via " +
              "FindObjectOfType at Start() (same pattern used elsewhere in this project, e.g. TargetSelectable).")]
     public ExperimentManager experimentManager;
@@ -186,26 +184,38 @@ public class SpawnerManager : MonoBehaviour
              "simply wait, frozen, until the next trial resumes them.")]
     public bool despawnLiveAgentsOnTrialEnd = false;
 
-    [Header("Debug")]
-    [Tooltip("NEW: mirrors MoveToTarget.enableDebugLogs. When true (default), SpawnerManager logs " +
+    [Header("Debug & Diagnostics")]
+    [Tooltip("Mirrors MoveToTarget.enableDebugLogs. When true (default), SpawnerManager logs " +
              "per-spawn/per-despawn itinerary details and warnings/errors via Debug.Log(...). Disable this " +
              "for Quest/device builds to avoid the string-building + logging cost scaling with " +
-             "maxAgents/spawnInterval - it is purely a diagnostic aid and has no effect on spawn behaviour.")]
+             "maxAgents/spawnInterval - it is purely a diagnostic aid and has no effect on spawn behavior.")]
     public bool enableDebugLogs = true;
 
-    // internal
-    private List<GameObject> pool = new List<GameObject>();
-    private int liveAgents = 0;
+    #endregion
 
-    // NEW: tracks currently-alive (spawned, not yet finished) agent GameObjects so they can be
-    // paused/resumed/force-finished as a group when trial state changes.
+    // =================================================================================================================
+    #region 2. Runtime state and public observers
+    // =================================================================================================================
+
+    // Inactive, ready-to-reuse NPC instances.
+    private List<GameObject> pool = new List<GameObject>();
+
+    // Population accounting: 'liveAgents' counts spawned-and-not-yet-finished NPCs (the maxAgents cap);
+    // 'activeAgents' is the same set as GameObjects, so trial-state pause/resume/despawn can act on them as a group.
+    private int liveAgents = 0;
     private List<GameObject> activeAgents = new List<GameObject>();
 
-    // ---------------------------------------------------------------------------------------------
-    // Data-capture (Revision 2) - OBSERVER hooks. These do NOT change spawning, pooling, itinerary,
-    // movement, timing, or randomisation. They only expose the currently-alive agent list and fire
-    // spawn/despawn notifications AFTER the internal list has already been mutated.
-    // ---------------------------------------------------------------------------------------------
+    // Spawn-gate flags (see section 4). All are written only by this class's event handlers / public methods.
+    private bool trialActive = false;
+    private bool npcWarmupActive = false;
+    private bool endPanelActive = false;
+
+    // The spawn loop must not run before the NavMesh wait + prewarm finished.
+    private bool poolInitializationComplete = false;
+
+    // Reused buffer for BuildWanderingItinerary()'s leg reachability checks (created lazily on first use).
+    private NavMeshPath routeCheckPath;
+    private float nextRouteWarnTime = 0f;
 
     /// <summary>Read-only view of the currently-alive (spawned, not finished) agent GameObjects.</summary>
     public IReadOnlyList<GameObject> ActiveAgents => activeAgents;
@@ -216,6 +226,14 @@ public class SpawnerManager : MonoBehaviour
     /// <summary>Raised right after an agent has been removed from the active list (finished / force-finished).</summary>
     public event System.Action<PedestrianAgent> AgentDespawned;
 
+    /// <summary>Read-only: whether an NPC warm-up window is currently open.</summary>
+    public bool NpcWarmupActive => npcWarmupActive;
+
+    /// <summary>Read-only: whether the End-Panel hard stop is currently in effect.</summary>
+    public bool EndPanelActive => endPanelActive;
+
+    // Data-capture OBSERVER hooks: they never change spawning, pooling, itinerary, movement, timing or
+    // randomisation. They only notify AFTER the internal list has already been mutated.
     private void RaiseAgentSpawned(PedestrianAgent pa)
     {
         try { AgentSpawned?.Invoke(pa); }
@@ -228,70 +246,22 @@ public class SpawnerManager : MonoBehaviour
         catch (System.Exception e) { if (enableDebugLogs) Debug.LogWarning("[SpawnerManager] AgentDespawned observer threw: " + e.Message); }
     }
 
-    // NEW: whether a trial is currently active. When gateSpawningByTrialState == false this flag
-    // is ignored entirely (SpawnLoop behaves exactly as it did before this change).
-    private bool trialActive = false;
+    #endregion
 
-    // NEW (NPC warm-up): whether an NPC warm-up window is currently open. Independent of 'trialActive' -
-    // ExperimentManager sequences the two so they never overlap (EndNpcWarmup() is always called immediately
-    // before OnTrialStart fires), but they are tracked as two separate flags because they represent
-    // different experimental semantics: pre-trial population settling vs. the participant's actual trial
-    // window. Only ExperimentManager (via BeginNpcWarmup/EndNpcWarmup) ever sets this.
-    private bool npcWarmupActive = false;
-
-    /// <summary>Read-only: whether an NPC warm-up window is currently open.</summary>
-    public bool NpcWarmupActive => npcWarmupActive;
-
-    // NEW (Part-scoped NPC control, Requirement 1/7): whether the NPC system is permitted to operate for the
-    // Part currently running is now PULLED directly from ExperimentManager.CurrentPartConfig.npcEnabled every
-    // SpawnLoop tick (see NpcsEnabledForActivePart() below), rather than pushed/cached via a dedicated
-    // SetNpcsEnabledForPart() call (the Stage-6 mechanism this supersedes). This removes a second,
-    // independently-updated copy of the same boolean - ExperimentManager.CurrentPartConfig remains the sole
-    // source of truth, and SpawnerManager merely reads it. Falls back to "enabled" (true) if no
-    // ExperimentManager/CurrentPartConfig is available, so a scene that never configures per-Part NPC control
-    // keeps unrestricted spawning (matching the behaviour of any other field left at its default).
-    private bool NpcsEnabledForActivePart()
-    {
-        if (experimentManager == null) return true;
-        var cfg = experimentManager.CurrentPartConfig;
-        return cfg == null || cfg.npcEnabled;
-    }
-
-    // NEW (Part 2 undirected wandering): mirrors NpcsEnabledForActivePart() exactly - PULLED, not pushed,
-    // from the same single source of truth (ExperimentManager.CurrentPartConfig.npcDirectedMovement).
-    // Falls back to "directed" (true) if no ExperimentManager/CurrentPartConfig is available, so a scene
-    // that never configures per-Part movement mode reproduces the original (pre-undirected-wandering)
-    // behaviour exactly.
-    private bool DirectedMovementForActivePart()
-    {
-        if (experimentManager == null) return true;
-        var cfg = experimentManager.CurrentPartConfig;
-        return cfg == null || cfg.npcDirectedMovement;
-    }
-
-    // NEW (End Panel hard stop, Requirement 2): true from the moment ExperimentManager.OnEndPanelShown fires
-    // for the current Part until SpawnerManager.ResetForNewPart() is called at the start of the NEXT Part's
-    // NPC lifecycle (see RunNpcWarmup()). Closes the spawning gate unconditionally (regardless of
-    // gateSpawningByTrialState) and drives the continuous per-frame freeze in Update() below.
-    private bool endPanelActive = false;
-
-    /// <summary>Read-only: whether the End-Panel hard stop is currently in effect.</summary>
-    public bool EndPanelActive => endPanelActive;
-
-    // state to ensure we don't spawn before prewarm/initialization finished
-    bool poolInitializationComplete = false;
+    // =================================================================================================================
+    #region 3. Unity lifecycle and event subscriptions
+    // =================================================================================================================
 
     void Start()
     {
-        // NEW: resolve ExperimentManager unconditionally (not just when gateSpawningByTrialState is true) -
-        // it is now also needed for the per-Part NPC-enable/movement-mode pulls and for the End-Panel
-        // hard-stop subscription below, all of which must work regardless of trial-state gating.
+        // ExperimentManager is needed regardless of gateSpawningByTrialState: it also supplies the per-Part
+        // NPC-enable / movement-mode settings and the End-Panel hard-stop event.
         if (experimentManager == null)
         {
             experimentManager = FindObjectOfType<ExperimentManager>();
         }
 
-        // Existing trial-state gating subscription - unchanged logic, just using the reference resolved above.
+        // Trial-state gating subscription.
         if (gateSpawningByTrialState)
         {
             if (experimentManager != null)
@@ -309,9 +279,8 @@ public class SpawnerManager : MonoBehaviour
             }
         }
 
-        // NEW (End Panel hard stop): subscribed unconditionally - the hard stop must apply even in scenes
-        // that run with gateSpawningByTrialState == false (continuous spawning), where trialActive alone
-        // would otherwise never close the spawning gate at the End Panel boundary.
+        // End-Panel hard stop: subscribed unconditionally - it must apply even with gateSpawningByTrialState == false
+        // (continuous spawning), where trialActive alone would never close the spawning gate at that boundary.
         if (experimentManager != null)
         {
             experimentManager.OnEndPanelShown += HandleEndPanelShown;
@@ -323,7 +292,7 @@ public class SpawnerManager : MonoBehaviour
 
     void OnDestroy()
     {
-        // NEW: unsubscribe to avoid referencing a destroyed SpawnerManager from ExperimentManager's event.
+        // Unsubscribe to avoid referencing a destroyed SpawnerManager from ExperimentManager's events.
         if (experimentManager != null)
         {
             experimentManager.OnTrialStart -= HandleTrialStart;
@@ -334,26 +303,137 @@ public class SpawnerManager : MonoBehaviour
 
     void Update()
     {
-        // NEW (End Panel hard stop): continuously re-assert the freeze on every active agent, every frame,
-        // for as long as endPanelActive is true. A single one-shot freeze (applied once in
-        // HandleEndPanelShown()) is not airtight: PedestrianAgent's own dwell coroutines
-        // (WaitAtAttractor/PollForCapacity/SimpleDwellThenAdvance) run independently of MoveToTarget's
-        // paused state, and MoveToTarget.MoveTo(...) unconditionally un-stops the NavMeshAgent regardless of
-        // externallyPaused - so an agent whose dwell timer happens to elapse while the End Panel is visible
-        // would otherwise resume moving until the next OnTrialStart. Re-applying the freeze every frame
-        // (cheap early-return when not needed) bounds any such escape to a single frame. See
-        // HardStopAllActiveAgents() for what "freeze" means and why (existing public APIs only).
+        // End-Panel hard stop: continuously re-assert the freeze on every active agent, every frame, for as long as
+        // endPanelActive is true. A one-shot freeze is not airtight: PedestrianAgent's dwell coroutines run
+        // independently of MoveToTarget's paused state, and MoveToTarget.MoveTo(...) unconditionally un-stops the
+        // NavMeshAgent, so an agent whose timer elapses while the End Panel is visible would otherwise resume moving
+        // until the next OnTrialStart. Re-applying every frame (cheap early-out when not needed) bounds any such
+        // escape to a single frame. See HardStopAgent().
         if (endPanelActive) HardStopAllActiveAgents();
     }
 
+    #endregion
+
+    // =================================================================================================================
+    #region 4. Experiment / Part configuration and spawn gates
+    // =================================================================================================================
+
+    // Whether the NPC system may operate for the Part currently running. PULLED from
+    // ExperimentManager.CurrentPartConfig.npcEnabled every tick (single source of truth, no cached copy). Falls back
+    // to "enabled" when no ExperimentManager / config is available.
+    private bool NpcsEnabledForActivePart()
+    {
+        if (experimentManager == null) return true;
+        var cfg = experimentManager.CurrentPartConfig;
+        return cfg == null || cfg.npcEnabled;
+    }
+
+    // Which itinerary type new spawns get. PULLED from ExperimentManager.CurrentPartConfig.npcDirectedMovement
+    // (the serialized bool: true = Part 3 attractor itinerary, false = Part 2 wandering itinerary). Falls back to
+    // Part 3 when unavailable, which reproduces the original default behaviour.
+    private NpcMovementMode ActiveMovementMode()
+    {
+        if (experimentManager == null) return NpcMovementMode.Part3AttractorItinerary;
+        var cfg = experimentManager.CurrentPartConfig;
+        bool part3 = cfg == null || cfg.npcDirectedMovement;
+        return part3 ? NpcMovementMode.Part3AttractorItinerary : NpcMovementMode.Part2WanderingItinerary;
+    }
+
+    // The single "may a new NPC be created right now?" decision. Separate from HOW an NPC is created (SpawnAgent).
+    //   - End-Panel hard stop and per-Part npcEnabled apply regardless of gateSpawningByTrialState.
+    //   - With gating on, spawning needs an open trial OR an open NPC warm-up window.
+    //   - The population cap applies last.
+    private bool ShouldSpawnNow()
+    {
+        bool gateOpen = !endPanelActive && NpcsEnabledForActivePart() &&
+            ((!gateSpawningByTrialState) || trialActive || npcWarmupActive);
+
+        return gateOpen && liveAgents < maxAgents;
+    }
+
     /// <summary>
-    /// NEW (End Panel hard stop). Called when ExperimentManager raises OnEndPanelShown for the Part currently
-    /// running - i.e. immediately before that Part's End Panel is instantiated/shown to the participant
-    /// (strictly before part_end, which only fires later once the participant confirms the panel). Closes
-    /// the spawning gate (via endPanelActive, checked in SpawnLoop) and immediately freezes every
-    /// currently-active agent. Unconditional: applies regardless of gateSpawningByTrialState,
-    /// pauseLiveAgentsOutsideTrial, or despawnLiveAgentsOnTrialEnd - none of those existing toggles are
-    /// modified.
+    /// Called when ExperimentManager fires OnTrialStart. Opens the spawning gate and, if configured,
+    /// resumes any agents that were paused when the previous trial ended.
+    /// </summary>
+    private void HandleTrialStart()
+    {
+        trialActive = true;
+        if (enableDebugLogs) Debug.Log("[SpawnerManager] Trial started -> NPC spawning enabled.");
+
+        if (pauseLiveAgentsOutsideTrial)
+        {
+            ResumeAllActiveAgents();
+        }
+    }
+
+    /// <summary>
+    /// Called when ExperimentManager fires OnTrialEnd. Closes the spawning gate so no new agents
+    /// are created outside the trial window, and optionally pauses and/or clears agents that are still
+    /// alive from the trial that just ended.
+    /// </summary>
+    private void HandleTrialEnd()
+    {
+        trialActive = false;
+        if (enableDebugLogs) Debug.Log("[SpawnerManager] Trial ended -> NPC spawning disabled.");
+
+        if (despawnLiveAgentsOnTrialEnd)
+        {
+            ForceFinishAllActiveAgents();
+        }
+        else if (pauseLiveAgentsOutsideTrial)
+        {
+            PauseAllActiveAgents();
+        }
+    }
+
+    /// <summary>
+    /// NPC warm-up. Called by ExperimentManager at the start of a Part, BEFORE the participant-facing Start panel is
+    /// shown and BEFORE OnTrialStart fires. Opens the spawning gate exactly like a trial does (ShouldSpawnNow() ORs
+    /// this flag with trialActive) using the normal spawn machinery, so the NPC population can form and spread out
+    /// before the trial. Does NOT fire OnTrialStart, does NOT touch trialActive, and does NOT pause/resume/despawn
+    /// any agent - it only flips the spawning gate.
+    /// </summary>
+    public void BeginNpcWarmup()
+    {
+        npcWarmupActive = true;
+        if (enableDebugLogs) Debug.Log("[SpawnerManager] NPC warm-up started -> NPC spawning enabled (pre-trial).");
+    }
+
+    /// <summary>
+    /// Called by ExperimentManager once the warm-up duration has elapsed, immediately before OnTrialStart is
+    /// invoked. Closes the warm-up gate. Deliberately does NOT pause, resume, or despawn any live agent. Because
+    /// ExperimentManager calls this and then invokes OnTrialStart in the same breath (no yield in between), the
+    /// combined gate never goes false in between, so there is no gap in spawning across the boundary.
+    /// </summary>
+    public void EndNpcWarmup()
+    {
+        npcWarmupActive = false;
+        if (enableDebugLogs) Debug.Log("[SpawnerManager] NPC warm-up ended.");
+    }
+
+    /// <summary>
+    /// Called by ExperimentManager (RunNpcWarmup(), unconditionally, at the very start of every Part's NPC
+    /// lifecycle) to clear any End-Panel hard stop left over from whichever Part ran previously. Must happen before
+    /// the new Part's own warm-up/trial spawning decisions are evaluated - resetting only on OnTrialStart would be
+    /// too late, since warm-up spawning happens BEFORE OnTrialStart.
+    /// </summary>
+    public void ResetForNewPart()
+    {
+        endPanelActive = false;
+        if (enableDebugLogs) Debug.Log("[SpawnerManager] New Part starting -> End-Panel hard stop cleared.");
+    }
+
+    #endregion
+
+    // =================================================================================================================
+    #region 5. Live-agent control: trial pause, End-Panel hard stop, despawn
+    // =================================================================================================================
+
+    /// <summary>
+    /// Called when ExperimentManager raises OnEndPanelShown for the Part currently running - immediately before that
+    /// Part's End Panel is shown (strictly before part_end). Closes the spawning gate (endPanelActive, checked in
+    /// ShouldSpawnNow) and immediately freezes every active agent. Unconditional: applies regardless of
+    /// gateSpawningByTrialState, pauseLiveAgentsOutsideTrial, or despawnLiveAgentsOnTrialEnd.
     /// </summary>
     private void HandleEndPanelShown()
     {
@@ -363,34 +443,14 @@ public class SpawnerManager : MonoBehaviour
     }
 
     /// <summary>
-    /// NEW (End Panel hard stop). Called by ExperimentManager (via RunNpcWarmup(), unconditionally, at the
-    /// very start of every Part's NPC lifecycle) to clear any End-Panel hard stop left over from whichever
-    /// Part ran previously. Must happen before that new Part's own warm-up/trial spawning decisions are
-    /// evaluated - resetting only on the new Part's OnTrialStart would be too late, since NPC warm-up
-    /// spawning happens BEFORE OnTrialStart.
-    /// </summary>
-    public void ResetForNewPart()
-    {
-        endPanelActive = false;
-        if (enableDebugLogs) Debug.Log("[SpawnerManager] New Part starting -> End-Panel hard stop cleared.");
-    }
-
-    /// <summary>
-    /// NEW (End Panel hard stop). Freezes one active agent using ONLY existing public APIs - never touches
-    /// NavMeshAgent directly, and does not modify the Stage 4 movement architecture
-    /// (UncertainBehavior -> MoveToTarget -> NavMeshAgent):
-    ///   - MoveToTarget.PauseExternal(true, true): halts NavMeshAgent movement and freezes the animator -
-    ///     the same mechanism already used by PauseAllActiveAgents()/HandleTrialEnd().
+    /// Freezes one active agent using ONLY existing public APIs - never touches NavMeshAgent directly:
+    ///   - MoveToTarget.PauseExternal(true, true): halts NavMeshAgent movement and freezes the animator - the same
+    ///     mechanism used by PauseAllActiveAgents()/HandleTrialEnd().
     ///   - Disabling UncertainBehavior (if present): stops ITS OWN per-second-probability state machine
-    ///     (Pause/Hesitate/Slow/Detour), which would otherwise independently call
-    ///     MoveToTarget.ResumeExternal()/SetTemporarySpeed() on its own timer regardless of the pause above.
-    ///     UncertainBehavior.OnDisable() only unsubscribes its own event handlers - no movement side effect.
-    ///     A pooled agent's UncertainBehavior is unconditionally re-enabled/re-rolled by
-    ///     AgentFactory.ApplyProfileToInstance() on its next spawn, so disabling it here has no lasting effect
-    ///     beyond the current (ending) Part.
-    /// Applies identically to directed and undirected agents - it only touches MoveToTarget/UncertainBehavior,
-    /// neither of which differs between the two movement modes.
-    /// Idempotent and cheap - safe to call every frame (see Update() above).
+    ///     (Pause/Hesitate/Slow/Detour), which would otherwise independently call MoveToTarget.ResumeExternal()/
+    ///     SetTemporarySpeed() on its own timer regardless of the pause above. A pooled agent's UncertainBehavior is
+    ///     re-enabled/re-rolled by AgentFactory.ApplyProfileToInstance() on its next spawn.
+    /// Applies identically to both movement modes. Idempotent and cheap - safe to call every frame (see Update()).
     /// </summary>
     private void HardStopAgent(GameObject go)
     {
@@ -412,72 +472,7 @@ public class SpawnerManager : MonoBehaviour
     }
 
     /// <summary>
-    /// NEW: called when ExperimentManager fires OnTrialStart. Opens the spawning gate and, if configured,
-    /// resumes any agents that were paused when the previous trial ended.
-    /// </summary>
-    private void HandleTrialStart()
-    {
-        trialActive = true;
-        if (enableDebugLogs) Debug.Log("[SpawnerManager] Trial started -> NPC spawning enabled.");
-
-        if (pauseLiveAgentsOutsideTrial)
-        {
-            ResumeAllActiveAgents();
-        }
-    }
-
-    /// <summary>
-    /// NEW: called when ExperimentManager fires OnTrialEnd. Closes the spawning gate so no new agents
-    /// are created outside the trial window, and optionally pauses and/or clears agents that are still
-    /// alive from the trial that just ended.
-    /// </summary>
-    private void HandleTrialEnd()
-    {
-        trialActive = false;
-        if (enableDebugLogs) Debug.Log("[SpawnerManager] Trial ended -> NPC spawning disabled.");
-
-        if (despawnLiveAgentsOnTrialEnd)
-        {
-            ForceFinishAllActiveAgents();
-        }
-        else if (pauseLiveAgentsOutsideTrial)
-        {
-            PauseAllActiveAgents();
-        }
-    }
-
-    /// <summary>
-    /// NEW (NPC warm-up). Called by ExperimentManager at the start of a Part, BEFORE the participant-facing
-    /// Start panel is shown and BEFORE OnTrialStart fires. Opens the spawning gate exactly like a trial does
-    /// (SpawnLoop below simply OR's this flag together with trialActive), using the existing
-    /// spawnInterval/maxAgents/itinerary-generation-or-undirected-wandering/pooling machinery completely
-    /// unchanged, so the NPC population can begin forming and distributing itself before the participant's
-    /// trial is officially under way. Does NOT fire OnTrialStart, does NOT touch trialActive, and does NOT
-    /// pause/resume/despawn any agent - it only flips the spawning gate.
-    /// </summary>
-    public void BeginNpcWarmup()
-    {
-        npcWarmupActive = true;
-        if (enableDebugLogs) Debug.Log("[SpawnerManager] NPC warm-up started -> NPC spawning enabled (pre-trial).");
-    }
-
-    /// <summary>
-    /// NEW (NPC warm-up). Called by ExperimentManager once the configured warm-up duration has elapsed,
-    /// immediately before OnTrialStart is invoked. Closes the warm-up gate. Deliberately does NOT pause,
-    /// resume, or despawn any currently-alive agent - existing NPCs (walking, dwelling, mid-detour, mid-wander,
-    /// etc.) simply continue exactly as they were. Because ExperimentManager calls this and then invokes
-    /// OnTrialStart in the same breath (no yield in between), SpawnLoop's combined gate
-    /// ('trialActive || npcWarmupActive') never goes false in between, so there is no gap in spawning across
-    /// the warm-up -> trial boundary.
-    /// </summary>
-    public void EndNpcWarmup()
-    {
-        npcWarmupActive = false;
-        if (enableDebugLogs) Debug.Log("[SpawnerManager] NPC warm-up ended.");
-    }
-
-    /// <summary>
-    /// NEW: freezes movement (and animator) of every currently-alive agent via MoveToTarget.PauseExternal,
+    /// Freezes movement (and animator) of every currently-alive agent via MoveToTarget.PauseExternal,
     /// without changing their itinerary state, so they can be resumed exactly where they left off.
     /// </summary>
     private void PauseAllActiveAgents()
@@ -494,9 +489,7 @@ public class SpawnerManager : MonoBehaviour
         }
     }
 
-    /// <summary>
-    /// NEW: resumes movement of every currently-alive agent previously paused by PauseAllActiveAgents.
-    /// </summary>
+    /// <summary>Resumes movement of every currently-alive agent previously paused by PauseAllActiveAgents.</summary>
     private void ResumeAllActiveAgents()
     {
         for (int i = 0; i < activeAgents.Count; i++)
@@ -512,10 +505,9 @@ public class SpawnerManager : MonoBehaviour
     }
 
     /// <summary>
-    /// NEW: immediately terminates every currently-alive agent's itinerary (PedestrianAgent.ForceFinish()),
-    /// which triggers the normal onAgentFinished -> OnAgentFinished(...) pooling/destroy pathway. Iterates
-    /// over a copy of the list because OnAgentFinished mutates activeAgents while we iterate. Works
-    /// identically for directed and undirected agents - ForceFinish() is unconditional in both.
+    /// Immediately terminates every currently-alive agent's itinerary (PedestrianAgent.ForceFinish()), which
+    /// triggers the normal onAgentFinished -> OnAgentFinished(...) pooling/destroy pathway. Iterates over a copy of
+    /// the list because OnAgentFinished mutates activeAgents while we iterate. Works identically in both modes.
     /// </summary>
     private void ForceFinishAllActiveAgents()
     {
@@ -532,18 +524,27 @@ public class SpawnerManager : MonoBehaviour
         }
     }
 
+    #endregion
+
+    // =================================================================================================================
+    #region 6. Pool initialisation (NavMesh wait + prewarm)
+    // =================================================================================================================
+
     IEnumerator InitializePoolThenSpawn()
     {
-        // Wait for NavMesh readiness and prewarm pool if configured
+        // Wait for NavMesh readiness (bounded by navmeshWaitTimeout) and prewarm the pool if configured.
         if (usePooling)
         {
-            yield return StartCoroutine(WaitForNavMeshThenPrewarm());
+            yield return StartCoroutine(WaitForNavMeshAvailability(
+                "Prewarm will still run but any prewarmed agents that cannot find NavMesh will have their NavMeshAgent disabled as a fallback."));
+            yield return StartCoroutine(PrewarmPoolCoroutine());
         }
         else
         {
-            // Non-pooling: we still want to briefly wait for NavMesh availability (bounded by timeout),
-            // so our first spawns have a chance of sampling NavMesh. This is non-blocking if NavMesh is ready.
-            yield return StartCoroutine(WaitForNavMeshAvailability());
+            // Non-pooling: we still briefly wait for NavMesh availability so our first spawns have a chance of
+            // sampling NavMesh. This is non-blocking if NavMesh is ready.
+            yield return StartCoroutine(WaitForNavMeshAvailability(
+                "Spawning will proceed but agents may be fallback to transform mode."));
         }
 
         poolInitializationComplete = true;
@@ -551,59 +552,24 @@ public class SpawnerManager : MonoBehaviour
         StartCoroutine(SpawnLoop());
     }
 
-    IEnumerator WaitForNavMeshAvailability()
+    // Sampling origin for pool initialisation: prefer the user-provided startTransform, then the first entrance,
+    // otherwise world origin.
+    private Vector3 PoolSampleOrigin()
     {
-        float start = Time.time;
-        bool navAvailable = false;
-
-        Vector3 sampleOrigin = Vector3.zero;
-        // Prefer user-provided startTransform as sampling origin if present, else fallback to first entrance.
         if (startTransform != null)
-            sampleOrigin = startTransform.position;
-        else if (entrances != null && entrances.Length > 0 && entrances[0] != null)
-            sampleOrigin = entrances[0].position;
-
-        while (Time.time - start < navmeshWaitTimeout)
-        {
-            Vector3 s = SampleNavMeshNear(sampleOrigin, spawnSampleRadius, spawnSampleMaxAttempts);
-            if (s != Vector3.zero)
-            {
-                navAvailable = true;
-                break;
-            }
-            if (entrances != null)
-            {
-                foreach (var e in entrances)
-                {
-                    if (e == null) continue;
-                    Vector3 ss = SampleNavMeshNear(e.position, spawnSampleRadius, 2);
-                    if (ss != Vector3.zero)
-                    {
-                        navAvailable = true;
-                        break;
-                    }
-                }
-            }
-            if (navAvailable) break;
-            yield return null;
-        }
-
-        if (!navAvailable)
-            if (enableDebugLogs) Debug.LogWarning($"SpawnerManager: NavMesh not found near entrances/startTransform within {navmeshWaitTimeout}s. Spawning will proceed but agents may be fallback to transform mode.");
-        yield break;
+            return startTransform.position;
+        if (entrances != null && entrances.Length > 0 && entrances[0] != null)
+            return entrances[0].position;
+        return Vector3.zero;
     }
 
-    IEnumerator WaitForNavMeshThenPrewarm()
+    // Polls (once per frame, up to navmeshWaitTimeout) until the NavMesh can be sampled near the sample origin or
+    // any entrance. 'failureNote' only customises the warning text when the timeout elapses.
+    IEnumerator WaitForNavMeshAvailability(string failureNote)
     {
         float start = Time.time;
         bool navAvailable = false;
-
-        // If startTransform exists prefer it as the sampling origin, otherwise use first entrance or world origin
-        Vector3 sampleOrigin = Vector3.zero;
-        if (startTransform != null)
-            sampleOrigin = startTransform.position;
-        else if (entrances != null && entrances.Length > 0 && entrances[0] != null)
-            sampleOrigin = entrances[0].position;
+        Vector3 sampleOrigin = PoolSampleOrigin();
 
         while (Time.time - start < navmeshWaitTimeout)
         {
@@ -633,22 +599,15 @@ public class SpawnerManager : MonoBehaviour
             yield return null;
         }
 
-        if (!navAvailable)
-            if (enableDebugLogs) Debug.LogWarning($"SpawnerManager: NavMesh not found near sample origin within {navmeshWaitTimeout}s. Prewarm will still run but any prewarmed agents that cannot find NavMesh will have their NavMeshAgent disabled as a fallback.");
-
-        // now prewarm (coroutine)
-        yield return StartCoroutine(PrewarmPoolCoroutine());
+        if (!navAvailable && enableDebugLogs)
+            Debug.LogWarning($"SpawnerManager: NavMesh not found near sample origin within {navmeshWaitTimeout}s. {failureNote}");
     }
 
+    // Instantiates 'poolPrewarm' inactive NPCs, each placed on the NavMesh near the sample origin (or parked out of
+    // sight with its NavMeshAgent disabled if no NavMesh was found) and configured with the default profile.
     IEnumerator PrewarmPoolCoroutine()
     {
-        // choose a sampling origin: prefer the user-provided startTransform, then the first entrance, otherwise world origin
-        Vector3 sampleOrigin = Vector3.zero;
-        if (startTransform != null)
-            sampleOrigin = startTransform.position;
-        else if (entrances != null && entrances.Length > 0 && entrances[0] != null)
-            sampleOrigin = entrances[0].position;
-
+        Vector3 sampleOrigin = PoolSampleOrigin();
         float sampleRadius = Mathf.Max(0.1f, spawnSampleRadius);
 
         for (int i = 0; i < poolPrewarm; i++)
@@ -677,10 +636,6 @@ public class SpawnerManager : MonoBehaviour
                         placedOnNav = true;
                     }
                 }
-                else
-                {
-                    placedOnNav = false;
-                }
             }
             else
             {
@@ -691,7 +646,6 @@ public class SpawnerManager : MonoBehaviour
                 }
                 // move slightly out of sight instead of extremely far
                 go.transform.position = sampleOrigin + Vector3.down * 5f;
-                placedOnNav = false;
             }
 
             // Apply profile to prewarmed instance if factory/profile available
@@ -700,24 +654,20 @@ public class SpawnerManager : MonoBehaviour
                 agentFactory.ApplyProfileToInstance(go, defaultProfile);
             }
 
-            // Ensure MoveToTarget component knows the runtime agent reference.
-            // Note: MoveToTarget was refactored to be NavMeshAgent-only and no longer exposes useNavMeshAgent;
-            // here we only set the agent reference so the mover can use it.
+            // MoveToTarget is NavMeshAgent-only: just make sure it knows the runtime agent reference.
             MoveToTarget mt = go.GetComponent<MoveToTarget>();
             if (mt != null)
             {
                 mt.agent = (nav != null) ? nav : mt.agent;
-                // previously code set mt.useNavMeshAgent; that field was removed in the NavMesh-only MoveToTarget.
-                // Decisions about whether the agent is on navmesh should be based on nav.enabled && nav.isOnNavMesh below.
             }
 
-            // Try to fetch PedestrianAgent.AgentID (Awake already executed)
-            PedestrianAgent pa = go.GetComponent<PedestrianAgent>();
-            string agentIdStr = pa != null ? pa.AgentID : "n/a";
-
-            // Logging: prewarm instance info (include unique AgentID for traceability)
-            string navState = (nav != null) ? $"nav.enabled={nav.enabled} nav.isOnNavMesh={nav.isOnNavMesh}" : "no NavMeshAgent";
-            if (enableDebugLogs) Debug.Log($"[SpawnerManager][Prewarm] idx={i} placedOnNav={placedOnNav} {navState} pos={go.transform.position} prefab={agentPrefab.name} AgentID={agentIdStr}");
+            if (enableDebugLogs)
+            {
+                PedestrianAgent pa = go.GetComponent<PedestrianAgent>(); // Awake already executed
+                string agentIdStr = pa != null ? pa.AgentID : "n/a";
+                string navState = (nav != null) ? $"nav.enabled={nav.enabled} nav.isOnNavMesh={nav.isOnNavMesh}" : "no NavMeshAgent";
+                Debug.Log($"[SpawnerManager][Prewarm] idx={i} placedOnNav={placedOnNav} {navState} pos={go.transform.position} prefab={agentPrefab.name} AgentID={agentIdStr}");
+            }
 
             // Deactivate and add to pool
             go.SetActive(false);
@@ -726,40 +676,28 @@ public class SpawnerManager : MonoBehaviour
             // yield occasionally to avoid editor freeze
             if (i % 8 == 0) yield return null;
         }
-
-        yield break;
     }
+
+    #endregion
+
+    // =================================================================================================================
+    #region 7. Spawn loop and the SpawnAgent orchestrator
+    // =================================================================================================================
 
     IEnumerator SpawnLoop()
     {
         while (true)
         {
-            // Only allow spawning once initialization (prewarm/wait) is complete.
+            // Only allow spawning once initialization (prewarm / wait) is complete.
             if (!poolInitializationComplete)
             {
                 yield return null;
                 continue;
             }
 
-            // NEW: when gating is enabled, only spawn new agents while a trial is active OR an NPC warm-up
-            // window is open (see BeginNpcWarmup/EndNpcWarmup). The loop keeps running (so it re-checks every
-            // 'spawnInterval') rather than stopping, so spawning resumes automatically as soon as the next
-            // warm-up or OnTrialStart fires.
-            // NEW (Part-scoped NPC control, Requirement 1/3): NpcsEnabledForActivePart() is ANDed in
-            // regardless of gateSpawningByTrialState, so a Part configured with npcEnabled=false in its
-            // ExperimentManager.PartCaptureConfig stays NPC-free even if trialActive happens to be true
-            // (every Part fires OnTrialStart/OnTrialEnd) or if gating is switched off scene-wide.
-            // NEW (End Panel hard stop, Requirement 2/2D): '!endPanelActive' is ALSO ANDed in regardless of
-            // gateSpawningByTrialState, so no new NPC can spawn once the current Part's End Panel has been
-            // shown, even in a continuous-spawning (gateSpawningByTrialState == false) configuration where
-            // trialActive would otherwise never close the gate at that boundary.
-            // NOTE: DirectedMovementForActivePart() (which movement MODE a new spawn gets) is read inside
-            // SpawnAgent() itself, not here - it does not affect whether spawning is allowed, only what kind
-            // of agent gets spawned.
-            bool allowedToSpawn = !endPanelActive && NpcsEnabledForActivePart() &&
-                ((!gateSpawningByTrialState) || trialActive || npcWarmupActive);
-
-            if (allowedToSpawn && liveAgents < maxAgents)
+            // The loop keeps running (re-checking every 'spawnInterval') rather than stopping when the gate is
+            // closed, so spawning resumes automatically as soon as the next warm-up or OnTrialStart opens it.
+            if (ShouldSpawnNow())
             {
                 SpawnAgent();
             }
@@ -767,30 +705,87 @@ public class SpawnerManager : MonoBehaviour
         }
     }
 
+    // Creates ONE NPC. DECIDE (where / which route) -> ACQUIRE (an instance on the NavMesh) -> INIT (hand the route
+    // to PedestrianAgent) -> REGISTER (population accounting). The route is built before an instance is taken from
+    // the pool, so a tick that cannot produce a valid route leaves the pool untouched and simply retries next tick.
     void SpawnAgent()
     {
         // If neither a startTransform nor entrances are available, we cannot spawn.
-        if (startTransform == null && (entrances == null || entrances.Length == 0) || agentPrefab == null)
+        if (!HasSpawnPrerequisites())
             return;
 
-        // Choose a random entrance - the SAME selection, used identically by both modes:
-        // - directed (Part 3): becomes itinerary[0], the first waypoint of BuildItinerary()'s route.
-        // - undirected (Part 2): becomes the agent's one-time INITIAL MOVEMENT TARGET (walked to from the
-        //   shared startTransform-based spawn position, via PedestrianAgent's new initial-Entrance leg -
-        //   see the branch inside each reuse/instantiate path below), never the physical spawn position and
-        //   never added to any itinerary. Entrance selection itself is completely unconditional and shared
-        //   between both modes - there is only ever one random-entrance draw per spawn.
-        int entranceIndex = -1;
-        Transform chosenEntrance = null;
-        if (entrances != null && entrances.Length > 0)
+        // 1. DECIDE -------------------------------------------------------------------------------------------
+        int entranceIndex;
+        Transform chosenEntrance = ChooseEntrance(out entranceIndex);
+        Vector3 spawnPos = ResolveSpawnPosition(chosenEntrance);
+        NpcMovementMode mode = ActiveMovementMode();
+
+        // Part 3 only: attractor dwell time, drawn once per NPC (before the route) and reused for each of its
+        // attractor visits. Entrances and exits never dwell.
+        float dwell = (mode == NpcMovementMode.Part3AttractorItinerary)
+            ? Random.Range(dwellTimeSec.x, dwellTimeSec.y)
+            : 0f;
+
+        List<Transform> itinerary = BuildItinerary(mode, chosenEntrance);
+        if (itinerary == null)
+            return; // no valid route this tick (already reported)
+
+        // 2. ACQUIRE ------------------------------------------------------------------------------------------
+        bool reused = usePooling && pool.Count > 0;
+        GameObject go = reused ? TakeFromPool(spawnPos) : InstantiateNewAgent(spawnPos);
+        if (go == null)
+            return;
+
+        PedestrianAgent agentScript = go.GetComponent<PedestrianAgent>();
+
+        ApplyAgentProfile(go);
+        BindMoverToAgent(go);
+
+        if (reused)
         {
-            entranceIndex = Random.Range(0, entrances.Length);
-            chosenEntrance = entrances[entranceIndex];
+            // Pooled instances are inactive until now. A fresh Instantiate()d instance is already active.
+            go.transform.rotation = Quaternion.identity;
+            go.SetActive(true);
         }
 
-        // Determine spawn sampling origin:
-        // - If user provided startTransform, sample around it (this is the new dragged-in start point).
-        // - Otherwise fallback to the chosen entrance position (legacy behavior).
+        // 3. INIT ---------------------------------------------------------------------------------------------
+        InitializeAgentMovement(go, agentScript, mode, itinerary, chosenEntrance, dwell);
+
+        // 4. REGISTER -----------------------------------------------------------------------------------------
+        RegisterSpawnedAgent(go, agentScript);
+
+        if (enableDebugLogs)
+            LogSpawn(go, agentScript, mode, reused, entranceIndex, chosenEntrance, itinerary, dwell);
+    }
+
+    private bool HasSpawnPrerequisites()
+    {
+        // (no startTransform AND no entrances) OR no prefab -> cannot spawn
+        return !((startTransform == null && (entrances == null || entrances.Length == 0)) || agentPrefab == null);
+    }
+
+    #endregion
+
+    // =================================================================================================================
+    #region 8. Spawn position selection
+    // =================================================================================================================
+
+    // Chooses a random entrance. The SAME draw serves both modes: it becomes itinerary[0] of the route (in Part 3 the
+    // first waypoint, in Part 2 the placement point). Returns null (index -1) if no entrances are configured.
+    private Transform ChooseEntrance(out int entranceIndex)
+    {
+        entranceIndex = -1;
+        if (entrances == null || entrances.Length == 0)
+            return null;
+
+        entranceIndex = Random.Range(0, entrances.Length);
+        return entrances[entranceIndex];
+    }
+
+    // The physical spawn position: NavMesh-sampled around startTransform (priority) or, failing that, around the
+    // chosen entrance (legacy behaviour). Identical for both movement modes.
+    private Vector3 ResolveSpawnPosition(Transform chosenEntrance)
+    {
         Vector3 samplingOrigin = Vector3.zero;
         if (startTransform != null)
             samplingOrigin = startTransform.position;
@@ -805,514 +800,12 @@ public class SpawnerManager : MonoBehaviour
             spawnPos = samplingOrigin;
             if (enableDebugLogs) Debug.LogWarning("SpawnerManager: failed to sample NavMesh near spawn origin. Using sampling origin position as fallback for spawn position.");
         }
-
-        // NEW (Part 2 continuous undirected wandering): resolve the movement mode for THIS spawn, once, up
-        // front. Reused identically by both the pooled-reuse and fresh-instantiate branches below.
-        bool directedMode = DirectedMovementForActivePart();
-
-        GameObject go = null;
-
-        if (usePooling && pool.Count > 0)
-        {
-            // reuse from pool
-            int last = pool.Count - 1;
-            go = pool[last];
-            pool.RemoveAt(last);
-
-            // reactivate and place on navmesh if possible
-            NavMeshAgent nav = go.GetComponent<NavMeshAgent>();
-            MoveToTarget mt = go.GetComponent<MoveToTarget>();
-            PedestrianAgent agentScript = go.GetComponent<PedestrianAgent>();
-
-            // Attempt to sample & warp to a nearby NavMesh position (this is defensive; pooled objects were prewarmed but ensure correctness)
-            NavMeshHit hit;
-            bool placedOnNavMesh = false;
-            if (NavMesh.SamplePosition(spawnPos, out hit, spawnSampleRadius * 1.5f, NavMesh.AllAreas))
-            {
-                if (nav != null)
-                {
-                    if (!nav.enabled) nav.enabled = true;
-                    bool warped = nav.Warp(hit.position);
-                    if (warped && nav.isOnNavMesh)
-                    {
-                        // set transform to sampled nav position
-                        go.transform.position = hit.position;
-                        // reset path safely only if agent is on navmesh
-                        nav.ResetPath();
-                        placedOnNavMesh = true;
-                    }
-                }
-                else
-                {
-                    // no NavMeshAgent: just place transform
-                    go.transform.position = hit.position;
-                    placedOnNavMesh = false;
-                }
-            }
-            else
-            {
-                // If no sample found, place at spawnPos (which at least is near sampling origin) and disable nav as fallback
-                go.transform.position = spawnPos;
-                if (nav != null)
-                {
-                    nav.enabled = false;
-                }
-                placedOnNavMesh = false;
-                if (enableDebugLogs) Debug.LogWarning("SpawnerManager: pooled agent couldn't be sampled on NavMesh at spawnPos; NavMeshAgent disabled as fallback.");
-            }
-
-            // Apply profile to pooled instance if factory/profile available
-            if (agentFactory != null && defaultProfile != null)
-            {
-                agentFactory.ApplyProfileToInstance(go, defaultProfile);
-            }
-            else if (defaultProfile != null)
-            {
-                // best-effort apply NavMeshAgent speed/shape if no factory is present
-                if (nav != null)
-                {
-                    nav.radius = defaultProfile.agentRadius;
-                    nav.height = defaultProfile.agentHeight;
-                    nav.speed = defaultProfile.speed;
-                    nav.acceleration = defaultProfile.acceleration;
-                    nav.angularSpeed = defaultProfile.angularSpeed;
-                    nav.avoidancePriority = Mathf.Clamp(defaultProfile.avoidancePriority, 0, 99);
-                }
-            }
-
-            // Ensure MoveToTarget knows runtime agent by setting the agent reference.
-            if (mt != null)
-            {
-                mt.agent = nav != null ? nav : mt.agent;
-                // NOTE: MoveToTarget no longer exposes a 'useNavMeshAgent' boolean; it is NavMesh-only.
-                // Decisions about whether the agent is active/on-navmesh should be based on the NavMeshAgent component state.
-            }
-
-            // activate
-            go.transform.rotation = Quaternion.identity;
-            go.SetActive(true);
-
-            if (agentScript == null)
-            {
-                if (enableDebugLogs) Debug.LogError("Agent prefab missing PedestrianAgent script");
-                Destroy(go);
-                return;
-            }
-
-            if (directedMode)
-            {
-                // ---------------- EXISTING Part 3 directed path - unchanged ----------------
-                // Build itinerary (Transform-based; BuildItinerary will insert the chosen entrance as itinerary[0]).
-                float dwell = Random.Range(dwellTimeSec.x, dwellTimeSec.y);
-
-                List<Transform> itinerary = BuildItinerary(chosenEntrance);
-
-                // --- ensure MoveToTarget start/target reflect StartTransform -> first itinerary entry ---
-                if (mt != null)
-                {
-                    mt.startTransform = (startTransform != null) ? startTransform : chosenEntrance;
-
-                    if (itinerary != null && itinerary.Count > 0 && itinerary[0] != null)
-                        mt.targetTransform = itinerary[0];
-                    else
-                    {
-                        if (itinerary != null && itinerary.Count > 0)
-                            mt.targetTransform = itinerary[itinerary.Count - 1];
-                        else
-                            mt.targetTransform = null;
-                    }
-
-                    mt.startPosition = go.transform.position;
-                }
-                // --- end ---
-
-                // Log itinerary
-                LogAgentItinerary(go, entranceIndex, chosenEntrance, itinerary, mt, go.GetComponent<NavMeshAgent>(), dwell);
-
-                // Also log AgentID explicitly
-                string aid = agentScript != null ? agentScript.AgentID : "n/a";
-                if (enableDebugLogs) Debug.Log($"[SpawnerManager] Spawned pooled agent AgentID={aid} (pooled reuse) at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}");
-
-                agentScript.Initialize(itinerary, this, dwell);
-            }
-            else
-            {
-                // ---------------- NEW Part 2 undirected wandering path ----------------
-                // Physical spawn position uses the SAME shared startTransform-priority samplingOrigin/spawnPos
-                // as Part 3 (computed once, above, unconditionally for both modes) - NOT chosenEntrance.
-                // chosenEntrance is instead passed into Initialize() below as the agent's one-time initial
-                // movement target: it walks FROM its startTransform-based spawn point TO chosenEntrance first,
-                // then transitions to continuous wandering. It is never added to any itinerary and is never a
-                // wandering destination itself (unless a wanderingPoints[] entry happens to coincide with it).
-                if (mt != null)
-                {
-                    mt.startTransform = (startTransform != null) ? startTransform : chosenEntrance;
-                    mt.startPosition = go.transform.position;
-                }
-
-                string aid = agentScript != null ? agentScript.AgentID : "n/a";
-                string entranceLabel = chosenEntrance != null ? chosenEntrance.name : "none";
-                if (enableDebugLogs) Debug.Log($"[SpawnerManager] Spawned pooled UNDIRECTED (wandering) agent AgentID={aid} (pooled reuse) at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}, initial Entrance target={entranceLabel}");
-
-                agentScript.Initialize(this, wanderLookAheadDistance, chosenEntrance);
-            }
-
-            liveAgents++;
-            activeAgents.Add(go); // NEW: track for trial-state pause/resume/despawn
-            agentScript.onAgentFinished += OnAgentFinished;
-            RaiseAgentSpawned(agentScript); // data-capture observer (after list mutation)
-        }
-        else
-        {
-            // instantiate new on spawnPos
-            go = Instantiate(agentPrefab, spawnPos, Quaternion.identity);
-
-            // After instantiate, ensure NavMeshAgent is placed on NavMesh before invoking any NavMeshAgent methods on it.
-            PedestrianAgent agentScript = go.GetComponent<PedestrianAgent>();
-            if (agentScript == null)
-            {
-                if (enableDebugLogs) Debug.LogError("Agent prefab missing PedestrianAgent script");
-                Destroy(go);
-                return;
-            }
-
-            NavMeshAgent nav = go.GetComponent<NavMeshAgent>();
-            MoveToTarget mt = go.GetComponent<MoveToTarget>();
-
-            // Try to place nav agent on NavMesh if possible
-            NavMeshHit hit;
-            bool placedOnNav = false;
-            if (nav != null)
-            {
-                if (NavMesh.SamplePosition(spawnPos, out hit, spawnSampleRadius * 1.5f, NavMesh.AllAreas))
-                {
-                    if (!nav.enabled) nav.enabled = true;
-                    bool warped = nav.Warp(hit.position);
-                    if (warped && nav.isOnNavMesh)
-                    {
-                        go.transform.position = hit.position;
-                        nav.ResetPath();
-                        placedOnNav = true;
-                    }
-                    else
-                    {
-                        // Warp failed defensively: keep nav disabled to avoid later exceptions
-                        nav.enabled = false;
-                        go.transform.position = spawnPos;
-                        if (enableDebugLogs) Debug.LogWarning("SpawnerManager: Instantiated agent but warp to sampled NavMesh position failed; disabling NavMeshAgent as fallback.");
-                    }
-                }
-                else
-                {
-                    // Could not sample NavMesh near spawnPos: disable agent to avoid exceptions
-                    nav.enabled = false;
-                    go.transform.position = spawnPos;
-                    if (enableDebugLogs) Debug.LogWarning("SpawnerManager: Instantiated agent but could not sample NavMesh near spawnPos; NavMeshAgent disabled on this instance as fallback.");
-                }
-            }
-            else
-            {
-                // no NavMeshAgent on prefab - just place transform
-                go.transform.position = spawnPos;
-            }
-
-            // Apply profile to freshly instantiated instance
-            if (agentFactory != null && defaultProfile != null)
-            {
-                // Let factory create/apply settings: but factory.CreateAgent instantiates a prefab itself.
-                // Here we already instantiated. So call ApplyProfileToInstance.
-                agentFactory.ApplyProfileToInstance(go, defaultProfile);
-            }
-            else if (defaultProfile != null && nav != null)
-            {
-                // best-effort apply profile values to nav if no factory provided
-                nav.radius = defaultProfile.agentRadius;
-                nav.height = defaultProfile.agentHeight;
-                nav.speed = defaultProfile.speed;
-                nav.acceleration = defaultProfile.acceleration;
-                nav.angularSpeed = defaultProfile.angularSpeed;
-                nav.avoidancePriority = Mathf.Clamp(defaultProfile.avoidancePriority, 0, 99);
-            }
-
-            // Ensure MoveToTarget component is updated for runtime agent
-            if (mt != null)
-            {
-                mt.agent = nav != null ? nav : mt.agent;
-                // NOTE: MoveToTarget no longer exposes 'useNavMeshAgent' flag.
-            }
-
-            if (directedMode)
-            {
-                // ---------------- EXISTING Part 3 directed path - unchanged ----------------
-                // Build itinerary and initialize (Transform-based; BuildItinerary inserts the chosen entrance as first entry).
-                float dwell = Random.Range(dwellTimeSec.x, dwellTimeSec.y);
-
-                List<Transform> itinerary = BuildItinerary(chosenEntrance);
-
-                if (mt != null)
-                {
-                    mt.startTransform = (startTransform != null) ? startTransform : chosenEntrance;
-
-                    if (itinerary != null && itinerary.Count > 0 && itinerary[0] != null)
-                        mt.targetTransform = itinerary[0];
-                    else
-                    {
-                        if (itinerary != null && itinerary.Count > 0)
-                            mt.targetTransform = itinerary[itinerary.Count - 1];
-                        else
-                            mt.targetTransform = null;
-                    }
-
-                    mt.startPosition = go.transform.position;
-                }
-
-                // Log itinerary and AgentID
-                string aid = agentScript != null ? agentScript.AgentID : "n/a";
-                LogAgentItinerary(go, entranceIndex, chosenEntrance, itinerary, mt, nav, dwell);
-                if (enableDebugLogs) Debug.Log($"[SpawnerManager] Spawned new agent AgentID={aid} at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}");
-
-                agentScript.Initialize(itinerary, this, dwell);
-            }
-            else
-            {
-                // ---------------- NEW Part 2 undirected wandering path ----------------
-                // Same reasoning as the pooled-reuse branch above: physical spawn stays startTransform-based
-                // (shared, unconditional samplingOrigin/spawnPos), chosenEntrance is passed to Initialize()
-                // as the one-time initial movement target instead.
-                if (mt != null)
-                {
-                    mt.startTransform = (startTransform != null) ? startTransform : chosenEntrance;
-                    mt.startPosition = go.transform.position;
-                }
-
-                string aid = agentScript != null ? agentScript.AgentID : "n/a";
-                string entranceLabel = chosenEntrance != null ? chosenEntrance.name : "none";
-                if (enableDebugLogs) Debug.Log($"[SpawnerManager] Spawned new UNDIRECTED (wandering) agent AgentID={aid} at Start={(startTransform!=null?startTransform.name:"samplingOrigin")} pos={go.transform.position}, initial Entrance target={entranceLabel}");
-
-                agentScript.Initialize(this, wanderLookAheadDistance, chosenEntrance);
-            }
-
-            liveAgents++;
-            activeAgents.Add(go); // NEW: track for trial-state pause/resume/despawn
-            agentScript.onAgentFinished += OnAgentFinished;
-            RaiseAgentSpawned(agentScript); // data-capture observer (after list mutation)
-        }
+        return spawnPos;
     }
 
     /// <summary>
-    /// Log function for the active Transform-based itinerary. DIRECTED MODE ONLY - undirected spawns log a
-    /// simpler one-line message directly at their call sites above instead of calling this.
-    /// </summary>
-    void LogAgentItinerary(GameObject go, int entranceIndex, Transform entrance, List<Transform> itinerary, MoveToTarget mt, NavMeshAgent nav, float dwell)
-    {
-        // NEW: bail out before doing any string work if logging is disabled - this early-return (not
-        // just gating Debug.Log) is the part that actually matters for performance.
-        if (!enableDebugLogs) return;
-
-        // Try to include the unique AgentID in logs if present
-        PedestrianAgent pa = go.GetComponent<PedestrianAgent>();
-        string agentId = pa != null ? pa.AgentID : "n/a";
-        string goId = $"{go.name} AgentID={agentId}";
-        string entranceName = entrance != null ? entrance.name : "null";
-        string entranceInfo = $"Entrance[{entranceIndex}]={entranceName}";
-
-        // Build itinerary description
-        System.Text.StringBuilder sb = new System.Text.StringBuilder();
-        sb.AppendLine($"[SpawnerManager][AgentSpawn] {goId} spawnInfo: {entranceInfo} dwell={dwell:F2}s liveAgents={liveAgents}");
-
-        if (itinerary == null || itinerary.Count == 0)
-        {
-            sb.AppendLine("  Itinerary: EMPTY");
-        }
-        else
-        {
-            for (int i = 0; i < itinerary.Count; i++)
-            {
-                Transform t = itinerary[i];
-                if (t == null)
-                {
-                    sb.AppendLine($"  Itinerary[{i}] = NULL");
-                    continue;
-                }
-
-                // If this is first entry treat it as entrance for clarity
-                if (i == 0)
-                {
-                    sb.AppendLine($"  Itinerary[{i}] = ENTRANCE name='{t.name}'");
-                    continue;
-                }
-
-                // Check if this transform is one of the exits
-                int exitIdx = -1;
-                if (exits != null)
-                {
-                    for (int xi = 0; xi < exits.Length; xi++)
-                    {
-                        if (exits[xi] == t) { exitIdx = xi; break; }
-                    }
-                }
-
-                if (exitIdx >= 0)
-                {
-                    sb.AppendLine($"  Itinerary[{i}] = EXIT   [exits[{exitIdx}]] name='{t.name}'");
-                    continue;
-                }
-
-                // Otherwise check attractors
-                int attractorIdx = -1;
-                if (attractors != null)
-                {
-                    for (int ai = 0; ai < attractors.Length; ai++)
-                    {
-                        var a = attractors[ai];
-                        if (a != null && a.transform == t)
-                        {
-                            attractorIdx = ai;
-                            break;
-                        }
-                    }
-                }
-
-                if (attractorIdx >= 0)
-                {
-                    sb.AppendLine($"  Itinerary[{i}] = ATTRACTOR [attractors[{attractorIdx}]] name='{t.name}' capacity={(attractors[attractorIdx] != null ? attractors[attractorIdx].capacity.ToString() : "n/a")}");
-                    continue;
-                }
-
-                // Unknown transform (could be custom, or reused)
-                sb.AppendLine($"  Itinerary[{i}] = UNKNOWN name='{t.name}'");
-            }
-        }
-
-        // Print runtime nav and MoveToTarget info
-        string navInfo = nav != null ? $"NavMeshAgent(enabled={nav.enabled}, isOnNavMesh={nav.isOnNavMesh}, speed={nav.speed:F2})" : "NavMeshAgent=null";
-        // Replace useNavMesh with agentAssigned status for MoveToTarget
-        string mtInfo = mt != null ? $"MoveToTarget(start={(mt.startTransform!=null?mt.startTransform.name:"null")}, target={(mt.targetTransform!=null?mt.targetTransform.name:"null")}, agentAssigned={(mt.agent!=null? "yes":"no")})" : "MoveToTarget=null";
-
-        sb.AppendLine($"  Runtime: {navInfo} | {mtInfo} | prefab={agentPrefab.name}");
-
-        // Output the composed log
-        if (enableDebugLogs) Debug.Log(sb.ToString());
-    }
-
-    /// <summary>
-    /// Transform-based itinerary builder (the active DIRECTED itinerary system - Part 3 only).
-    /// The chosen 'entrance' transform is inserted as the first itinerary element (itinerary[0]).
-    /// The rest of the logic (n attractors then exit) is preserved. NEVER called for undirected (Part 2)
-    /// spawns, and never reads SpawnerManager.wanderingPoints.
-    /// </summary>
-    List<Transform> BuildItinerary(Transform entrance)
-    {
-        List<Transform> list = new List<Transform>();
-
-        int num = Random.Range(minAttractorsPerAgent, maxAttractorsPerAgent + 1);
-
-        if (attractors != null && attractors.Length > 0)
-        {
-            List<int> indices = new List<int>();
-            for (int i = 0; i < attractors.Length; i++) indices.Add(i);
-            for (int k = 0; k < num && indices.Count > 0; k++)
-            {
-                int iSel = Random.Range(0, indices.Count);
-                int idx = indices[iSel];
-                indices.RemoveAt(iSel); // avoid visiting same attractor twice
-                if (attractors[idx] != null && attractors[idx].transform != null)
-                    list.Add(attractors[idx].transform);
-            }
-        }
-
-        // finally pick an exit
-        if (exits != null && exits.Length > 0)
-        {
-            Transform exit = exits[Random.Range(0, exits.Length)];
-            list.Add(exit);
-        }
-
-        // Insert the chosen entrance as the first element so itinerary[0] is an entrance.
-        if (entrance != null)
-            list.Insert(0, entrance);
-
-        return list;
-    }
-
-    public void OnAgentFinished(PedestrianAgent agent)
-    {
-        agent.onAgentFinished -= OnAgentFinished;
-
-        liveAgents--;
-        activeAgents.Remove(agent.gameObject); // NEW: stop tracking this agent for trial-state pause/despawn
-        RaiseAgentDespawned(agent); // data-capture observer (after list mutation)
-
-        if (usePooling)
-        {
-            GameObject go = agent.gameObject;
-
-            // Defensive: if the NavMeshAgent is present but not in a good state, ensure it's left enabled if on NavMesh.
-            NavMeshAgent nav = go.GetComponent<NavMeshAgent>();
-            if (nav != null)
-            {
-                if (!nav.enabled && nav.isOnNavMesh)
-                {
-                    nav.enabled = true;
-                }
-            }
-
-            // ensure MoveToTarget state is consistent
-            MoveToTarget mt = go.GetComponent<MoveToTarget>();
-            if (mt != null)
-            {
-                mt.agent = nav != null ? nav : mt.agent;
-                // previously code set mt.useNavMeshAgent; that field no longer exists.
-                // The MoveToTarget component is expected to be NavMeshAgent-only; runtime behavior will reflect nav state.
-            }
-
-            // Log agent finishing and pooling info (include AgentID)
-            string agentId = agent != null ? agent.AgentID : "n/a";
-            string goId = $"{go.name} AgentID={agentId}";
-            string navState = nav != null ? $"nav.enabled={nav.enabled} nav.isOnNavMesh={nav.isOnNavMesh}" : "no NavMeshAgent";
-            if (enableDebugLogs) Debug.Log($"[SpawnerManager][OnAgentFinished] {goId} returning to pool. liveAgents={liveAgents} {navState}");
-
-            go.SetActive(false);
-            pool.Add(go);
-        }
-        else
-        {
-            Destroy(agent.gameObject);
-        }
-    }
-
-    public bool TryEnterAttractor(AttractorInfo info, PedestrianAgent agent)
-    {
-        if (info == null || info.transform == null) return true;
-        if (info.capacity <= 0)
-        {
-            if (!info.occupants.Contains(agent)) info.occupants.Add(agent);
-            return true;
-        }
-        if (info.occupants.Count < info.capacity)
-        {
-            if (!info.occupants.Contains(agent)) info.occupants.Add(agent);
-            return true;
-        }
-        return false;
-    }
-
-    public void ReleaseAttractor(AttractorInfo info, PedestrianAgent agent)
-    {
-        if (info == null) return;
-        if (info.occupants.Contains(agent)) info.occupants.Remove(agent);
-    }
-
-    public AttractorInfo FindAttractorInfo(Transform t)
-    {
-        if (attractors == null) return null;
-        foreach (var a in attractors)
-            if (a != null && a.transform == t) return a;
-        return null;
-    }
-
-    /// <summary>
-    /// Improved sampling routine (kept from original script).
+    /// Improved NavMesh sampling routine: random horizontal offsets around 'origin', projected onto the ground, then
+    /// sampled onto the NavMesh at several vertical offsets. Returns Vector3.zero if nothing was found.
     /// </summary>
     Vector3 SampleNavMeshNear(Vector3 origin, float radius, int attempts)
     {
@@ -1416,4 +909,625 @@ public class SpawnerManager : MonoBehaviour
 
         return false;
     }
+
+    #endregion
+
+    // =================================================================================================================
+    #region 9. Itinerary construction (one route per NPC life)
+    // =================================================================================================================
+
+    // Builds the route for the given mode, or returns null when no valid route could be produced this tick.
+    // In both modes list[0] is the placement point (the entrance), the LAST entry is the exit, and the list is
+    // handed to PedestrianAgent unchanged for the NPC's whole life.
+    private List<Transform> BuildItinerary(NpcMovementMode mode, Transform entrance)
+    {
+        return mode == NpcMovementMode.Part2WanderingItinerary
+            ? BuildWanderingItinerary(entrance)
+            : BuildAttractorItinerary(entrance);
+    }
+
+    /// <summary>
+    /// Part 3 route: Entrance -> 'num' distinct attractors (minAttractorsPerAgent..maxAttractorsPerAgent) -> Exit.
+    /// The chosen 'entrance' is inserted as the first element so itinerary[0] is an entrance. Never reads
+    /// wanderingPoints.
+    /// </summary>
+    List<Transform> BuildAttractorItinerary(Transform entrance)
+    {
+        List<Transform> list = new List<Transform>();
+
+        int num = Random.Range(minAttractorsPerAgent, maxAttractorsPerAgent + 1);
+
+        if (attractors != null && attractors.Length > 0)
+        {
+            List<int> indices = new List<int>();
+            for (int i = 0; i < attractors.Length; i++) indices.Add(i);
+            for (int k = 0; k < num && indices.Count > 0; k++)
+            {
+                int iSel = Random.Range(0, indices.Count);
+                int idx = indices[iSel];
+                indices.RemoveAt(iSel); // avoid visiting same attractor twice
+                if (attractors[idx] != null && attractors[idx].transform != null)
+                    list.Add(attractors[idx].transform);
+            }
+        }
+
+        // finally pick an exit
+        if (exits != null && exits.Length > 0)
+        {
+            Transform exit = exits[Random.Range(0, exits.Length)];
+            list.Add(exit);
+        }
+
+        // Insert the chosen entrance as the first element so itinerary[0] is an entrance.
+        if (entrance != null)
+            list.Insert(0, entrance);
+
+        return list;
+    }
+
+    /// <summary>
+    /// Part 2 route: Entrance -> ordered, distinct wandering points -> Exit.
+    ///
+    /// Selection (all bounded, nothing is retried indefinitely):
+    ///   1. Candidates = the non-null wanderingPoints. The target count is Random.Range(minWanderingPointsPerAgent,
+    ///      maxWanderingPointsPerAgent + 1), capped by the number of candidates.
+    ///   2. Points are drawn at random WITHOUT replacement, so no point repeats within one itinerary. Each draw is
+    ///      accepted only if NavMesh.CalculatePath from the previous stop (starting at the entrance) is PathComplete;
+    ///      an unreachable candidate is dropped and never tried again. Fewer valid points than wanted simply yields a
+    ///      shorter route.
+    ///   3. The exit is a random non-null exit reachable from the last stop; if none is, trailing stops are removed
+    ///      one by one until some exit is reachable.
+    ///   4. If no valid route exists at all (no usable points and/or no reachable exit) this returns null: the spawn
+    ///      is skipped this tick (with a throttled warning) rather than creating an NPC whose next destination is
+    ///      known to be unreachable. If 'exits' is empty the last wandering point is the route's end.
+    ///
+    /// Index 0 is the entrance (or startTransform if there are no entrances): the NPC is placed there instantly by
+    /// PedestrianAgent, so no leg to it is validated.
+    /// </summary>
+    List<Transform> BuildWanderingItinerary(Transform entrance)
+    {
+        Transform origin = entrance != null ? entrance : startTransform;
+        if (origin == null)
+            return null;
+
+        // 1. Valid candidate stops
+        List<Transform> candidates = new List<Transform>();
+        if (wanderingPoints != null)
+        {
+            for (int i = 0; i < wanderingPoints.Length; i++)
+                if (wanderingPoints[i] != null) candidates.Add(wanderingPoints[i]);
+        }
+
+        int lo = Mathf.Max(0, minWanderingPointsPerAgent);
+        int hi = Mathf.Max(lo, maxWanderingPointsPerAgent);
+        int wanted = Mathf.Min(Random.Range(lo, hi + 1), candidates.Count);
+
+        // 2. Ordered, distinct, leg-validated stops
+        List<Transform> stops = new List<Transform>(wanted);
+        Vector3 cursor = origin.position;
+        while (stops.Count < wanted && candidates.Count > 0)
+        {
+            int pick = Random.Range(0, candidates.Count);
+            Transform candidate = candidates[pick];
+            candidates.RemoveAt(pick); // each candidate is considered at most once -> bounded
+
+            if (!IsLegReachable(cursor, candidate.position))
+                continue;
+
+            stops.Add(candidate);
+            cursor = candidate.position;
+        }
+
+        // 3. Exit reachable from the last stop (dropping trailing stops if necessary)
+        Transform exit = null;
+        bool hasExits = false;
+        if (exits != null)
+        {
+            for (int i = 0; i < exits.Length; i++)
+                if (exits[i] != null) { hasExits = true; break; }
+        }
+
+        if (hasExits)
+        {
+            exit = PickReachableExit(cursor);
+            while (exit == null && stops.Count > 0)
+            {
+                stops.RemoveAt(stops.Count - 1);
+                cursor = stops.Count > 0 ? stops[stops.Count - 1].position : origin.position;
+                exit = PickReachableExit(cursor);
+            }
+
+            if (exit == null)
+            {
+                WarnNoValidRoute("no exit is reachable from the entrance/stops");
+                return null;
+            }
+        }
+        else if (stops.Count == 0)
+        {
+            WarnNoValidRoute("no usable wanderingPoints and no exits configured");
+            return null;
+        }
+
+        // 4. Assemble: [origin, stops..., exit]
+        List<Transform> list = new List<Transform>(stops.Count + 2);
+        list.Add(origin);
+        list.AddRange(stops);
+        if (exit != null) list.Add(exit);
+
+        if (list.Count < 2)
+        {
+            WarnNoValidRoute("route has no destination");
+            return null;
+        }
+
+        return list;
+    }
+
+    // A random non-null exit reachable from 'from' (each exit tried at most once), or null.
+    private Transform PickReachableExit(Vector3 from)
+    {
+        List<Transform> remaining = new List<Transform>(exits.Length);
+        for (int i = 0; i < exits.Length; i++)
+            if (exits[i] != null) remaining.Add(exits[i]);
+
+        while (remaining.Count > 0)
+        {
+            int pick = Random.Range(0, remaining.Count);
+            Transform candidate = remaining[pick];
+            remaining.RemoveAt(pick);
+            if (IsLegReachable(from, candidate.position))
+                return candidate;
+        }
+        return null;
+    }
+
+    // True if the NavMesh has a complete path between the two positions (point-to-point, independent of any NPC).
+    private bool IsLegReachable(Vector3 from, Vector3 to)
+    {
+        if (routeCheckPath == null) routeCheckPath = new NavMeshPath();
+        return NavMesh.CalculatePath(from, to, NavMesh.AllAreas, routeCheckPath)
+               && routeCheckPath.status == NavMeshPathStatus.PathComplete;
+    }
+
+    // Throttled (the spawn loop ticks every 'spawnInterval'): at most one warning per 5 s.
+    private void WarnNoValidRoute(string reason)
+    {
+        if (!enableDebugLogs || Time.time < nextRouteWarnTime) return;
+        nextRouteWarnTime = Time.time + 5f;
+        Debug.LogWarning($"[SpawnerManager] No valid Part 2 itinerary this tick ({reason}); spawn skipped, will retry. " +
+            "Check that wanderingPoints, entrances and exits lie on/near a connected walkable NavMesh.");
+    }
+
+    #endregion
+
+    // =================================================================================================================
+    #region 10. Acquiring an instance: pool reuse / instantiate, NavMesh placement, profile
+    // =================================================================================================================
+
+    // Pops an inactive instance from the pool and places it on the NavMesh. Returns null (and discards the instance)
+    // if the prefab lacks PedestrianAgent.
+    private GameObject TakeFromPool(Vector3 spawnPos)
+    {
+        int last = pool.Count - 1;
+        GameObject go = pool[last];
+        pool.RemoveAt(last);
+
+        if (go.GetComponent<PedestrianAgent>() == null)
+        {
+            if (enableDebugLogs) Debug.LogError("Agent prefab missing PedestrianAgent script");
+            Destroy(go);
+            return null;
+        }
+
+        PlacePooledAgent(go, spawnPos);
+        return go;
+    }
+
+    // Pooled placement (the instance is still INACTIVE here; it is activated by SpawnAgent afterwards): sample and
+    // warp; the transform is only moved when the warp succeeded. Without any NavMesh near spawnPos the instance is
+    // put at spawnPos and its NavMeshAgent disabled as a fallback.
+    private void PlacePooledAgent(GameObject go, Vector3 spawnPos)
+    {
+        NavMeshAgent nav = go.GetComponent<NavMeshAgent>();
+
+        NavMeshHit hit;
+        if (NavMesh.SamplePosition(spawnPos, out hit, spawnSampleRadius * 1.5f, NavMesh.AllAreas))
+        {
+            if (nav != null)
+            {
+                if (!nav.enabled) nav.enabled = true;
+                bool warped = nav.Warp(hit.position);
+                if (warped && nav.isOnNavMesh)
+                {
+                    // set transform to sampled nav position
+                    go.transform.position = hit.position;
+                    // reset path safely only if agent is on navmesh
+                    nav.ResetPath();
+                }
+            }
+            else
+            {
+                // no NavMeshAgent: just place transform
+                go.transform.position = hit.position;
+            }
+        }
+        else
+        {
+            // If no sample found, place at spawnPos (which at least is near sampling origin) and disable nav as fallback
+            go.transform.position = spawnPos;
+            if (nav != null)
+            {
+                nav.enabled = false;
+            }
+            if (enableDebugLogs) Debug.LogWarning("SpawnerManager: pooled agent couldn't be sampled on NavMesh at spawnPos; NavMeshAgent disabled as fallback.");
+        }
+    }
+
+    // Instantiates a fresh (active) instance and places it on the NavMesh. Returns null (and destroys the instance)
+    // if the prefab lacks PedestrianAgent.
+    private GameObject InstantiateNewAgent(Vector3 spawnPos)
+    {
+        GameObject go = Instantiate(agentPrefab, spawnPos, Quaternion.identity);
+
+        if (go.GetComponent<PedestrianAgent>() == null)
+        {
+            if (enableDebugLogs) Debug.LogError("Agent prefab missing PedestrianAgent script");
+            Destroy(go);
+            return null;
+        }
+
+        PlaceNewAgent(go, spawnPos);
+        return go;
+    }
+
+    // Fresh-instance placement (already active, so Warp works immediately). A failed sample or warp disables the
+    // NavMeshAgent on this instance to avoid later exceptions.
+    private void PlaceNewAgent(GameObject go, Vector3 spawnPos)
+    {
+        NavMeshAgent nav = go.GetComponent<NavMeshAgent>();
+        if (nav == null)
+        {
+            // no NavMeshAgent on prefab - just place transform
+            go.transform.position = spawnPos;
+            return;
+        }
+
+        NavMeshHit hit;
+        if (NavMesh.SamplePosition(spawnPos, out hit, spawnSampleRadius * 1.5f, NavMesh.AllAreas))
+        {
+            if (!nav.enabled) nav.enabled = true;
+            bool warped = nav.Warp(hit.position);
+            if (warped && nav.isOnNavMesh)
+            {
+                go.transform.position = hit.position;
+                nav.ResetPath();
+            }
+            else
+            {
+                // Warp failed defensively: keep nav disabled to avoid later exceptions
+                nav.enabled = false;
+                go.transform.position = spawnPos;
+                if (enableDebugLogs) Debug.LogWarning("SpawnerManager: Instantiated agent but warp to sampled NavMesh position failed; disabling NavMeshAgent as fallback.");
+            }
+        }
+        else
+        {
+            // Could not sample NavMesh near spawnPos: disable agent to avoid exceptions
+            nav.enabled = false;
+            go.transform.position = spawnPos;
+            if (enableDebugLogs) Debug.LogWarning("SpawnerManager: Instantiated agent but could not sample NavMesh near spawnPos; NavMeshAgent disabled on this instance as fallback.");
+        }
+    }
+
+    // Applies the default AgentProfile (appearance, speed, NavMeshAgent shape, UncertainBehavior roll) via the
+    // factory; without a factory only the NavMeshAgent values are applied (best effort).
+    private void ApplyAgentProfile(GameObject go)
+    {
+        if (agentFactory != null && defaultProfile != null)
+        {
+            // We already instantiated/reused the GameObject, so use ApplyProfileToInstance (not a create method).
+            agentFactory.ApplyProfileToInstance(go, defaultProfile);
+        }
+        else if (defaultProfile != null)
+        {
+            NavMeshAgent nav = go.GetComponent<NavMeshAgent>();
+            if (nav != null)
+            {
+                nav.radius = defaultProfile.agentRadius;
+                nav.height = defaultProfile.agentHeight;
+                nav.speed = defaultProfile.speed;
+                nav.acceleration = defaultProfile.acceleration;
+                nav.angularSpeed = defaultProfile.angularSpeed;
+                nav.avoidancePriority = Mathf.Clamp(defaultProfile.avoidancePriority, 0, 99);
+            }
+        }
+    }
+
+    // MoveToTarget is NavMeshAgent-only; make sure it references the runtime NavMeshAgent of this instance.
+    private void BindMoverToAgent(GameObject go)
+    {
+        MoveToTarget mt = go.GetComponent<MoveToTarget>();
+        if (mt == null) return;
+
+        NavMeshAgent nav = go.GetComponent<NavMeshAgent>();
+        mt.agent = nav != null ? nav : mt.agent;
+    }
+
+    #endregion
+
+    // =================================================================================================================
+    #region 11. Initialising movement and registering the NPC
+    // =================================================================================================================
+
+    // Hands the generated route to PedestrianAgent in the way the movement mode requires.
+    private void InitializeAgentMovement(GameObject go, PedestrianAgent agentScript, NpcMovementMode mode,
+                                         List<Transform> itinerary, Transform chosenEntrance, float dwell)
+    {
+        if (mode == NpcMovementMode.Part2WanderingItinerary)
+        {
+            // PedestrianAgent places the NPC at itinerary[0] (the entrance) and walks the wandering stops with the
+            // look-ahead rule; no dwell. 'dwell' is unused here.
+            agentScript.Initialize(itinerary, this, mode, 0f, wanderLookAheadDistance);
+            return;
+        }
+
+        PrimeMoverForAttractorItinerary(go, itinerary, chosenEntrance);
+        agentScript.Initialize(itinerary, this, dwell);
+    }
+
+    // Part 3's established mover pre-configuration (start = StartTransform, first target = itinerary[0]). Kept
+    // exactly as before; PedestrianAgent.Initialize()/MoveToCurrent() subsequently re-assign the same fields.
+    private void PrimeMoverForAttractorItinerary(GameObject go, List<Transform> itinerary, Transform chosenEntrance)
+    {
+        MoveToTarget mt = go.GetComponent<MoveToTarget>();
+        if (mt == null) return;
+
+        mt.startTransform = (startTransform != null) ? startTransform : chosenEntrance;
+
+        if (itinerary != null && itinerary.Count > 0 && itinerary[0] != null)
+            mt.targetTransform = itinerary[0];
+        else
+        {
+            if (itinerary != null && itinerary.Count > 0)
+                mt.targetTransform = itinerary[itinerary.Count - 1];
+            else
+                mt.targetTransform = null;
+        }
+
+        mt.startPosition = go.transform.position;
+    }
+
+    // Population accounting + completion hook + data-capture notification (after the list mutation).
+    private void RegisterSpawnedAgent(GameObject go, PedestrianAgent agentScript)
+    {
+        liveAgents++;
+        activeAgents.Add(go); // track for trial-state pause/resume/despawn
+        agentScript.onAgentFinished += OnAgentFinished;
+        RaiseAgentSpawned(agentScript);
+    }
+
+    #endregion
+
+    // =================================================================================================================
+    #region 12. Completion and pool return
+    // =================================================================================================================
+
+    /// <summary>
+    /// Called (via PedestrianAgent.onAgentFinished) when an NPC reached the end of its itinerary or was
+    /// force-finished. Updates the population accounting and returns the instance to the pool (or destroys it when
+    /// pooling is off).
+    /// </summary>
+    public void OnAgentFinished(PedestrianAgent agent)
+    {
+        agent.onAgentFinished -= OnAgentFinished;
+
+        liveAgents--;
+        activeAgents.Remove(agent.gameObject); // stop tracking this agent for trial-state pause/despawn
+        RaiseAgentDespawned(agent); // data-capture observer (after list mutation)
+
+        if (usePooling)
+        {
+            GameObject go = agent.gameObject;
+
+            // Defensive: if the NavMeshAgent is present but not in a good state, ensure it's left enabled if on NavMesh.
+            NavMeshAgent nav = go.GetComponent<NavMeshAgent>();
+            if (nav != null)
+            {
+                if (!nav.enabled && nav.isOnNavMesh)
+                {
+                    nav.enabled = true;
+                }
+            }
+
+            // ensure MoveToTarget state is consistent
+            MoveToTarget mt = go.GetComponent<MoveToTarget>();
+            if (mt != null)
+            {
+                mt.agent = nav != null ? nav : mt.agent;
+            }
+
+            // Log agent finishing and pooling info (include AgentID)
+            if (enableDebugLogs)
+            {
+                string goId = $"{go.name} AgentID={agent.AgentID}";
+                string navState = nav != null ? $"nav.enabled={nav.enabled} nav.isOnNavMesh={nav.isOnNavMesh}" : "no NavMeshAgent";
+                Debug.Log($"[SpawnerManager][OnAgentFinished] {goId} returning to pool. liveAgents={liveAgents} {navState}");
+            }
+
+            go.SetActive(false);
+            pool.Add(go);
+        }
+        else
+        {
+            Destroy(agent.gameObject);
+        }
+    }
+
+    #endregion
+
+    // =================================================================================================================
+    #region 13. Attractor occupancy (Part 3 only; called by PedestrianAgent)
+    // =================================================================================================================
+
+    public bool TryEnterAttractor(AttractorInfo info, PedestrianAgent agent)
+    {
+        if (info == null || info.transform == null) return true;
+        if (info.capacity <= 0)
+        {
+            if (!info.occupants.Contains(agent)) info.occupants.Add(agent);
+            return true;
+        }
+        if (info.occupants.Count < info.capacity)
+        {
+            if (!info.occupants.Contains(agent)) info.occupants.Add(agent);
+            return true;
+        }
+        return false;
+    }
+
+    public void ReleaseAttractor(AttractorInfo info, PedestrianAgent agent)
+    {
+        if (info == null) return;
+        if (info.occupants.Contains(agent)) info.occupants.Remove(agent);
+    }
+
+    public AttractorInfo FindAttractorInfo(Transform t)
+    {
+        if (attractors == null) return null;
+        foreach (var a in attractors)
+            if (a != null && a.transform == t) return a;
+        return null;
+    }
+
+    #endregion
+
+    // =================================================================================================================
+    #region 14. Diagnostics (all gated by enableDebugLogs)
+    // =================================================================================================================
+
+    // One summary line per spawn, plus the multi-line itinerary dump. Callers check enableDebugLogs first.
+    private void LogSpawn(GameObject go, PedestrianAgent agentScript, NpcMovementMode mode, bool reused,
+                          int entranceIndex, Transform chosenEntrance, List<Transform> itinerary, float dwell)
+    {
+        MoveToTarget mt = go.GetComponent<MoveToTarget>();
+        NavMeshAgent nav = go.GetComponent<NavMeshAgent>();
+
+        LogAgentItinerary(go, mode, entranceIndex, chosenEntrance, itinerary, mt, nav, dwell);
+
+        string startName = startTransform != null ? startTransform.name : "samplingOrigin";
+        Debug.Log($"[SpawnerManager] Spawned {(reused ? "pooled" : "new")} {mode} agent AgentID={agentScript.AgentID} " +
+                  $"{(reused ? "(pooled reuse) " : "")}at Start={startName} pos={go.transform.position}, itinerary entries={itinerary.Count}");
+    }
+
+    /// <summary>Log function for the Transform-based itinerary (both movement modes).</summary>
+    void LogAgentItinerary(GameObject go, NpcMovementMode mode, int entranceIndex, Transform entrance,
+                           List<Transform> itinerary, MoveToTarget mt, NavMeshAgent nav, float dwell)
+    {
+        // Bail out before doing any string work if logging is disabled - this early-return (not just gating
+        // Debug.Log) is the part that actually matters for performance.
+        if (!enableDebugLogs) return;
+
+        // Try to include the unique AgentID in logs if present
+        PedestrianAgent pa = go.GetComponent<PedestrianAgent>();
+        string agentId = pa != null ? pa.AgentID : "n/a";
+        string goId = $"{go.name} AgentID={agentId}";
+        string entranceName = entrance != null ? entrance.name : "null";
+        string entranceInfo = $"Entrance[{entranceIndex}]={entranceName}";
+
+        // Build itinerary description
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        sb.AppendLine($"[SpawnerManager][AgentSpawn] {goId} mode={mode} spawnInfo: {entranceInfo} dwell={dwell:F2}s liveAgents={liveAgents}");
+
+        if (itinerary == null || itinerary.Count == 0)
+        {
+            sb.AppendLine("  Itinerary: EMPTY");
+        }
+        else
+        {
+            for (int i = 0; i < itinerary.Count; i++)
+            {
+                Transform t = itinerary[i];
+                if (t == null)
+                {
+                    sb.AppendLine($"  Itinerary[{i}] = NULL");
+                    continue;
+                }
+
+                // If this is first entry treat it as entrance for clarity
+                if (i == 0)
+                {
+                    sb.AppendLine($"  Itinerary[{i}] = ENTRANCE name='{t.name}'");
+                    continue;
+                }
+
+                // Check if this transform is one of the exits
+                int exitIdx = -1;
+                if (exits != null)
+                {
+                    for (int xi = 0; xi < exits.Length; xi++)
+                    {
+                        if (exits[xi] == t) { exitIdx = xi; break; }
+                    }
+                }
+
+                if (exitIdx >= 0)
+                {
+                    sb.AppendLine($"  Itinerary[{i}] = EXIT   [exits[{exitIdx}]] name='{t.name}'");
+                    continue;
+                }
+
+                // Otherwise check attractors
+                int attractorIdx = -1;
+                if (attractors != null)
+                {
+                    for (int ai = 0; ai < attractors.Length; ai++)
+                    {
+                        var a = attractors[ai];
+                        if (a != null && a.transform == t)
+                        {
+                            attractorIdx = ai;
+                            break;
+                        }
+                    }
+                }
+
+                if (attractorIdx >= 0)
+                {
+                    sb.AppendLine($"  Itinerary[{i}] = ATTRACTOR [attractors[{attractorIdx}]] name='{t.name}' capacity={(attractors[attractorIdx] != null ? attractors[attractorIdx].capacity.ToString() : "n/a")}");
+                    continue;
+                }
+
+                // Part 2 intermediate stops
+                int wanderIdx = -1;
+                if (wanderingPoints != null)
+                {
+                    for (int wi = 0; wi < wanderingPoints.Length; wi++)
+                    {
+                        if (wanderingPoints[wi] == t) { wanderIdx = wi; break; }
+                    }
+                }
+
+                if (wanderIdx >= 0)
+                {
+                    sb.AppendLine($"  Itinerary[{i}] = WANDERING_POINT [wanderingPoints[{wanderIdx}]] name='{t.name}'");
+                    continue;
+                }
+
+                // Unknown transform (could be custom, or reused)
+                sb.AppendLine($"  Itinerary[{i}] = UNKNOWN name='{t.name}'");
+            }
+        }
+
+        // Print runtime nav and MoveToTarget info
+        string navInfo = nav != null ? $"NavMeshAgent(enabled={nav.enabled}, isOnNavMesh={nav.isOnNavMesh}, speed={nav.speed:F2})" : "NavMeshAgent=null";
+        string mtInfo = mt != null ? $"MoveToTarget(start={(mt.startTransform!=null?mt.startTransform.name:"null")}, target={(mt.targetTransform!=null?mt.targetTransform.name:"null")}, agentAssigned={(mt.agent!=null? "yes":"no")})" : "MoveToTarget=null";
+
+        sb.AppendLine($"  Runtime: {navInfo} | {mtInfo} | prefab={agentPrefab.name}");
+
+        // Output the composed log
+        Debug.Log(sb.ToString());
+    }
+
+    #endregion
 }

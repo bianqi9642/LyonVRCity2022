@@ -50,8 +50,8 @@ using UnityEngine;
 ///  - Each Part (part1Config/part2Config/part3Config, a PartCaptureConfig) now independently declares, via
 ///    the Inspector: whether NPCs exist at all (npcEnabled), whether NPC telemetry is written
 ///    (npcCaptureEnabled), whether gaze is recorded (gazeCaptureEnabled), whether participant trajectory
-///    is recorded (trajectoryCaptureEnabled), and (NEW) whether NPCs use directed itinerary movement or
-///    continuous undirected wandering (npcDirectedMovement). This is the SINGLE authoritative source for
+///    is recorded (trajectoryCaptureEnabled), and which itinerary type NPCs walk: the Part 3 attractor
+///    itinerary or the Part 2 wandering-point itinerary (npcDirectedMovement). This is the SINGLE authoritative source for
 ///    all five settings - SpawnerManager and DataCaptureManager / GazeRecorder all read it via
 ///    ExperimentManager.CurrentPartConfig rather than holding their own copies. CurrentPartConfig is set
 ///    once, at the very top of each RunPartX(), before part_start is even raised.
@@ -60,14 +60,13 @@ using UnityEngine;
 ///    Part2Config default rather than special-cased code). npcEnabled=false + npcCaptureEnabled=true is
 ///    accepted (not blocked) but produces empty npc_state.csv/npc_events.csv content for that Part, since no
 ///    NPC can ever exist to capture; DataCaptureManager logs a one-time warning for this combination.
-///  - npcDirectedMovement (NEW): when true (Part3's default), SpawnerManager.SpawnAgent() builds a directed
-///    itinerary (BuildItinerary: entrance -> attractors -> exit) exactly as before. When false (Part2's
-///    default), SpawnerManager skips itinerary construction entirely and spawns the NPC in PedestrianAgent's
-///    new continuous undirected-wandering mode instead (see SpawnerManager.wanderingPoints /
-///    PedestrianAgent.Initialize(SpawnerManager, float)). Only meaningful when npcEnabled is also true.
-///  - Default values reproduce the exact pre-undirected-wandering behaviour: Part1 = everything off;
-///    Part2 = NPCs on (now undirected), NPC capture off, gaze+trajectory on; Part3 = everything on
-///    (directed, as it always was).
+///  - npcDirectedMovement: selects the itinerary type SpawnerManager builds for each NPC (the serialized bool is
+///    kept for scene compatibility; SpawnerManager maps it to NpcMovementMode). When true (Part3's default):
+///    Part3AttractorItinerary, entrance -> attractors -> exit. When false (Part2's default):
+///    Part2WanderingItinerary, entrance -> SpawnerManager.wanderingPoints -> exit, with no dwell. Both are
+///    finite itineraries generated once per NPC life. Only meaningful when npcEnabled is also true.
+///  - Defaults: Part1 = everything off; Part2 = NPCs on (wandering itinerary), NPC capture off, gaze+trajectory
+///    on; Part3 = everything on (attractor itinerary, as it always was).
 ///
 /// END PANEL HARD STOP (additive):
 ///  - OnEndPanelShown is a new event, raised immediately before uiManager.ShowPartXEndPanel(...) is called
@@ -114,10 +113,9 @@ public class ExperimentManager : MonoBehaviour
                  "capture flags below.")]
         public bool npcEnabled = true;
 
-        [Tooltip("Whether NPCs use directed itinerary movement (entrance -> attractors -> exit, existing " +
-                 "Part 3 behaviour) when true, or continuous undirected wandering (SpawnerManager." +
-                 "wanderingPoints, no attractors, no exit, no dwell) when false. Only meaningful while " +
-                 "'Npc Enabled' is true.")]
+        [Tooltip("Itinerary type for NPCs: true = Part 3 attractor itinerary (entrance -> attractors -> exit, " +
+                 "with dwell), false = Part 2 wandering itinerary (entrance -> SpawnerManager.wanderingPoints -> " +
+                 "exit, no dwell). Both are generated once per NPC. Only meaningful while 'Npc Enabled' is true.")]
         public bool npcDirectedMovement = true;
 
         [Tooltip("Whether NPC telemetry (npc_state.csv / npc_events.csv) is written during this Part's " +
@@ -167,8 +165,8 @@ public class ExperimentManager : MonoBehaviour
     };
 
     [Header("Part 2 Configuration")]
-    [Tooltip("NPC presence, movement mode and per-stream capture for Part 2. Defaults: NPCs on, UNDIRECTED " +
-             "continuous wandering, NPC telemetry off, gaze + trajectory on.")]
+    [Tooltip("NPC presence, movement mode and per-stream capture for Part 2. Defaults: NPCs on, wandering " +
+             "itinerary (entrance -> wandering points -> exit), NPC telemetry off, gaze + trajectory on.")]
     public PartCaptureConfig part2Config = new PartCaptureConfig
     {
         npcEnabled = true,
@@ -210,7 +208,7 @@ public class ExperimentManager : MonoBehaviour
              "Part Configuration above, after the participant is teleported to the Part's start position but " +
              "BEFORE the participant-facing Start panel is shown and BEFORE OnTrialStart fires. During " +
              "warm-up, SpawnerManager spawns and moves NPCs using its completely normal runtime behaviour " +
-             "(same spawnInterval, maxAgents, itinerary generation OR undirected wandering, pooling) so the " +
+             "(same spawnInterval, maxAgents, itinerary generation, pooling) so the " +
              "NPC population has time to spawn and spread out through the environment before the participant " +
              "can begin the actual trial. This single duration applies to every NPC-enabled Part - there is " +
              "no separate per-Part duration field. Set to 0 to skip only the WAIT (the Start panel is then " +
@@ -397,8 +395,8 @@ public class ExperimentManager : MonoBehaviour
     /// toggles SpawnerManager's existing spawning gates via its public API and raises two observer events for
     /// DataCaptureManager. When npcWarmupDuration &lt;= 0 this only skips the WAIT (NPCs are still enabled
     /// for the Part and can spawn once OnTrialStart fires, via SpawnerManager's own trialActive gate).
-    /// cfg.npcDirectedMovement decides, inside SpawnerManager.SpawnAgent(), whether spawned NPCs get a
-    /// directed itinerary or continuous undirected wandering - this method does not need to know which.
+    /// cfg.npcDirectedMovement decides, inside SpawnerManager.SpawnAgent(), whether spawned NPCs get the Part 3
+    /// attractor itinerary or the Part 2 wandering-point itinerary - this method does not need to know which.
     /// </summary>
     private IEnumerator RunNpcWarmup(PartCaptureConfig cfg, string partLabel)
     {

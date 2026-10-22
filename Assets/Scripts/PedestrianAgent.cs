@@ -1,83 +1,67 @@
 // PedestrianAgent.cs
-// Runtime component that drives a pedestrian along a pre-built Transform-based itinerary.
-// This modified version exclusively delegates movement to MoveToTarget and removes direct NavMeshAgent usage.
-// Arrival detection and pause/resume use MoveToTarget APIs.
+// Runtime component that drives a pedestrian along a pre-built, Transform-based itinerary.
+// Movement is delegated exclusively to MoveToTarget (the single NavMeshAgent controller); this script decides
+// WHERE to go next and what to do on arrival.
 //
-// Change: When an agent arrives at an attractor and is waiting/dwelling (including polling for capacity),
-// the agent now freezes its animator (freezeAnimator = true) so it does not "step" while waiting.
-// This is implemented by passing freezeAnimator:true to MoveToTarget.PauseExternal in waiting coroutines.
+// Both Parts now use a pre-generated itinerary that SpawnerManager builds ONCE per NPC life:
 //
-// Improvements in this file:
-// - Subscribe to MoveToTarget.OnArrived when instructing movement, so arrival is handled immediately via the event.
-// - Arrival at a directed waypoint is decided in ONE place: MoveToTarget (OnArrived), using the per-leg radius
-//   set from 'arriveTolerance' in MoveToCurrent(). Update() no longer polls the waypoint distance when a
-//   MoveToTarget exists (that second, independent 0.6 m check used to pre-empt the mover's 0.2 m arrival, so
-//   UncertainBehavior never received OnArrived before a dwell). A distance check remains only for a prefab
-//   without MoveToTarget.
-// - Preserves attractor capacity/dwell semantics and all existing public APIs.
+//   NpcMovementMode.Part3AttractorItinerary   Entrance -> attractors -> Exit
+//     - Every waypoint is completed through MoveToTarget.OnArrived (single arrival path, 'arriveTolerance' radius).
+//     - ONLY attractors start a dwell (WaitAtAttractor, or PollForCapacity first when the attractor is full);
+//       attractor capacity is managed by SpawnerManager. The entrance (and any other non-attractor, non-exit
+//       waypoint) is passed through with no dwell (PassThroughWaypoint), and the last entry (the exit) finishes
+//       the NPC immediately - neither the entrance nor the exit ever dwells.
+//
+//   NpcMovementMode.Part2WanderingItinerary   Entrance -> wandering points -> Exit
+//     - Index 0 (the entrance) is only the placement point: the NPC is relocated there instantly
+//       (MoveToTarget.TeleportTo) - not walked - and immediately continues to the first wandering point.
+//     - Intermediate wandering points are NOT completed by an arrival event and have no dwell: as soon as the NPC
+//       is within 'wanderLookAheadDistance' of the current stop, the next list entry is issued (before the
+//       mover's own tighter arrival threshold would bring the NPC to a stop), so movement reads as continuous.
+//     - Only the last entry (the exit) is completed through MoveToTarget.OnArrived, exactly like Part 3, and
+//       finishes the NPC. No AttractorDwell / capacity logic is ever applied to wandering points.
+//
+// Shared rules (both modes):
+//   - Arrival is decided in ONE place per waypoint type: the mover's OnArrived event (Part 3 waypoints, Part 2
+//     exit) or the look-ahead (Part 2 intermediate stops) - never both for the same leg. OnMoveToArrived()
+//     ignores events while UncertainBehavior is detouring and suspends UncertainBehavior BEFORE a dwell begins.
+//   - The authoritative main target is 'itineraryTransforms[currentIndex]'. UncertainBehavior Detours replace
+//     MoveToTarget's destination temporarily but never change the itinerary or currentIndex; while a Detour is
+//     active the Part 2 look-ahead is suspended (IsDetouring guard) and, when it ends, UncertainBehavior asks
+//     ResumeWanderTargetAfterDetour() to re-issue the CURRENT itinerary target (Part 3 keeps UncertainBehavior's
+//     original snapshot restore).
+//   - The finite lifecycle is identical in both modes: Finish() -> onAgentFinished -> SpawnerManager returns the
+//     NPC to the pool. ForceFinish() remains the external termination path.
+//
+// Part 3 only (additive, does NOT touch route generation):
+//   * When the current waypoint is an Attractor Plane carrying an AttractorDwell component, the PHYSICAL
+//     destination for that leg is an independent random point inside that Plane (vertically projected onto the
+//     NavMesh). The itinerary list, waypoint Transforms and currentIndex progression are unchanged.
+//   * While dwelling, the agent turns yaw-only to face AttractorDwell.facingTarget (if assigned).
+//   * Random sampling happens in AttractorDwell via a private System.Random, so UnityEngine.Random is not perturbed.
 //
 // Notes:
-// - Each instance still gets a persistent unique ID assigned in Awake() (NPC-000001).
-// - If MoveToTarget is not present, the agent will still use simple distance checks to consider arrival,
-//   but will not attempt to move itself (so in practice you should attach MoveToTarget to the prefab).
-// - Attractor capacity semantics are preserved: when arriving at an attractor the agent requests entry from SpawnerManager.
-//
-// -------------------------------------------------------------------------------------------------------
-// ADDITIVE CHANGE (Attractor stop position + dwell facing) - does NOT touch route generation:
-//   * When the current itinerary waypoint is an Attractor Plane carrying an AttractorDwell component,
-//     the PHYSICAL movement destination for that leg is overridden with an independent random point
-//     inside that Plane (vertically projected onto the NavMesh, X/Z preserved). The itinerary list, the
-//     waypoint Transforms, currentIndex progression, entrance/attractor/exit selection and order are all
-//     unchanged - only where the agent physically stops for this one Attractor visit differs.
-//   * While dwelling, the agent turns yaw-only to face AttractorDwell.facingTarget (if assigned).
-//   * All random sampling happens in AttractorDwell via a private System.Random, so the global
-//     UnityEngine.Random sequence used by SpawnerManager route generation is never perturbed.
-// -------------------------------------------------------------------------------------------------------
-//
-// -------------------------------------------------------------------------------------------------------
-// ADDITIVE CHANGE (Part 2 continuous undirected wandering, with an instant initial-Entrance relocation) -
-// does NOT touch any of the above:
-//   * A second, completely separate initialization path - Initialize(SpawnerManager, float, Transform) -
-//     puts the agent into 'undirectedMode'. In this mode the agent NEVER builds or consumes an itinerary,
-//     NEVER calls MoveToCurrent()/OnReachedWaypoint()/AdvanceItinerary()/WaitAtAttractor()/
-//     SimpleDwellThenAdvance()/Finish(), and NEVER references attractors or exits. It stays in
-//     State.Moving for its entire life and only ever ends via the EXISTING external ForceFinish() path
-//     (called by SpawnerManager when the trial/Part/End-Panel lifecycle requires it) - it never
-//     self-terminates.
-//   * The agent's physical spawn position is the SAME startTransform-based origin SpawnerManager already
-//     uses for Part 3 (unchanged - see SpawnerManager.SpawnAgent()). Immediately after spawning, exactly
-//     like Part 3, it is INSTANTLY relocated to a randomly-chosen entrance (the 'initialEntrance' parameter
-//     - the SAME Random.Range(0, entrances.Length) draw Part 3 uses for itinerary[0]) via
-//     MoveToTarget.TeleportTo() - NOT walked there. TeleportTo() sets transform.position directly and warps
-//     the NavMeshAgent in the same call, so no path is queued and no transit is ever visible to the
-//     participant; the agent simply appears already standing at its Entrance. Once relocated, the Entrance
-//     has no further role whatsoever - not added to any itinerary, never revisited deliberately, no dwell,
-//     no Finish() - and the agent goes straight into continuous wandering the same frame.
-//   * From that point, Update() repeatedly picks a random Transform from SpawnerManager.wanderingPoints
-//     (excluding, where possible, the immediately-previous point), validates it with
-//     NavMesh.CalculatePath, and hands it to the SAME MoveToTarget.MoveTo(Transform) overload directed mode
-//     uses. The NEXT point is selected as soon as the agent comes within 'wanderLookAheadDistance' of its
-//     current one - BEFORE MoveToTarget's own (much tighter) arriveThreshold triggers a full stop - so
-//     movement reads as continuous wandering, never a deliberate dwell.
-//   * Arrival at each wandering leg is detected purely by comparing transform.position against a LOCALLY
-//     REMEMBERED Transform reference ('currentWanderPoint') - never by reading MoveToTarget.OnArrived/
-//     IsArrived back. This is deliberate: UncertainBehavior may temporarily redirect MoveToTarget's live
-//     target during a Detour, and this locally-remembered reference must stay correct regardless of that
-//     temporary substitution (UncertainBehavior itself already saves/restores the real target correctly via
-//     its own GetCurrentMainTarget()/mainTargetOnDetourStart mechanism - see UncertainBehavior.cs,
-//     unmodified).
-//   * UncertainBehavior is not modified and is not duplicated: it continues to read/restore whatever
-//     MoveToTarget's current target is, so Pause/Hesitate/Slow/Detour all keep working unchanged during
-//     continuous wandering, exactly as they do under the directed itinerary. The one-time entrance
-//     relocation happens via TeleportTo() before any wandering target is ever set, so it is never subject
-//     to a Detour redirect in the first place.
-// -------------------------------------------------------------------------------------------------------
+// - Each instance gets a persistent unique ID assigned in Awake() (NPC-000001).
+// - If MoveToTarget is not present, Part 3 falls back to a simple distance check and no movement is issued.
 
 using System;
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.AI;
+
+/// <summary>
+/// How an NPC walks its pre-generated itinerary. Selected per spawn by SpawnerManager from the active Part's
+/// configuration (ExperimentManager.PartCaptureConfig.npcDirectedMovement: true = Part 3, false = Part 2).
+/// </summary>
+public enum NpcMovementMode
+{
+    /// <summary>Part 2: Entrance -> ordered wandering points -> Exit. Intermediate stops advance by look-ahead, no dwell.</summary>
+    Part2WanderingItinerary,
+
+    /// <summary>Part 3: Entrance -> attractors -> Exit. Waypoints complete on arrival; entrance/attractors dwell.</summary>
+    Part3AttractorItinerary
+}
 
 [DisallowMultipleComponent]
 public class PedestrianAgent : MonoBehaviour
@@ -93,8 +77,7 @@ public class PedestrianAgent : MonoBehaviour
     // Core references
     MoveToTarget moveToTarget; // The single authority for movement in this modified script
 
-    // Itinerary (Transform-based; the entrance/attractor/exit sequence built by SpawnerManager.BuildItinerary()).
-    // Null while in undirected mode - see the ADDITIVE CHANGE block above.
+    // Itinerary (Transform-based: entrance, intermediate stops, exit), built once per life by SpawnerManager.
     List<Transform> itineraryTransforms;
 
     int currentIndex = 0;
@@ -102,14 +85,19 @@ public class PedestrianAgent : MonoBehaviour
     SpawnerManager manager;
     float dwellTime = 5f;
 
+    // How this life walks its itinerary. Set by Initialize(); never changes mid-life.
+    NpcMovementMode movementMode = NpcMovementMode.Part3AttractorItinerary;
+    bool IsWanderingItinerary => movementMode == NpcMovementMode.Part2WanderingItinerary;
+
     // tuning
-    [Tooltip("Canonical arrival radius (m) for directed itinerary waypoints. Handed to MoveToTarget as the per-leg " +
-             "arrival radius (MoveToTarget.SetLegArriveRadius), so MoveToTarget's OnArrived event fires at this " +
-             "distance. Not used by undirected wandering (wanderLookAheadDistance) or by UncertainBehavior detours.")]
+    [Tooltip("Canonical arrival radius (m) for itinerary waypoints that complete on arrival (every Part 3 waypoint " +
+             "and the Part 2 exit). Handed to MoveToTarget as the per-leg arrival radius " +
+             "(MoveToTarget.SetLegArriveRadius), so MoveToTarget's OnArrived event fires at this distance. Not used by " +
+             "the Part 2 look-ahead (wanderLookAheadDistance) or by UncertainBehavior detours.")]
     public float arriveTolerance = 0.6f; // consider arrived if within this distance
 
     // -----------------------------------------------------------------------------------------------
-    // Attractor stop override + dwell facing (additive; does NOT change route generation)
+    // Part 3: attractor stop override + dwell facing (additive; does NOT change route generation)
     // -----------------------------------------------------------------------------------------------
     // Physical movement destination for the CURRENT leg when that leg targets an Attractor Plane that
     // carries an AttractorDwell component. null for every other leg (entrance, exit, plain waypoint), in
@@ -122,51 +110,27 @@ public class PedestrianAgent : MonoBehaviour
     Coroutine facingCoroutine = null;
 
     // -----------------------------------------------------------------------------------------------
-    // Part 2 continuous undirected wandering (additive - see ADDITIVE CHANGE block at top of file).
+    // Part 2: wandering-itinerary state
     // -----------------------------------------------------------------------------------------------
 
-    /// <summary>True when this agent is in continuous undirected-wandering mode (Part 2), false for the
-    /// existing directed itinerary mode (Part 3). Set exclusively by whichever Initialize() overload is
-    /// called; never changes mid-life.</summary>
-    bool undirectedMode = false;
-
-    /// <summary>The wandering point (a Transform from SpawnerManager.wanderingPoints) this agent is
-    /// currently walking toward, in undirected mode. Locally remembered - never re-read from
-    /// MoveToTarget - so a temporary UncertainBehavior Detour cannot desynchronise it. Null only before
-    /// the first point has ever been selected, or if a selection attempt failed (see SelectNextWanderPoint).</summary>
-    Transform currentWanderPoint = null;
-
-    /// <summary>NEW: the one-time initial Entrance target for an undirected (Part 2) agent, set once at
-    /// Initialize() from the same random-entrance draw SpawnerManager already uses for Part 3
-    /// (chosenEntrance). Consumed and cleared to null the moment BeginUndirectedMovement() runs (the agent
-    /// is INSTANTLY relocated there via MoveToTarget.TeleportTo() - not walked - before continuous wandering
-    /// begins), so it is never read again after that point. Null immediately if Initialize() was given a
-    /// null entrance (see Requirement: no valid Entrance -&gt; do not crash, start wandering from the spawn
-    /// position instead).</summary>
-    Transform initialEntranceTarget = null;
-
-    /// <summary>Inspector-tunable distance (copied from SpawnerManager.wanderLookAheadDistance at
-    /// Initialize time) at which the agent picks its NEXT wandering point, before MoveToTarget's own
-    /// (tighter) arriveThreshold would otherwise bring it to a full stop.</summary>
+    /// <summary>Distance (copied from SpawnerManager.wanderLookAheadDistance at Initialize time) at which the NPC
+    /// advances to the NEXT itinerary entry, before MoveToTarget's own (tighter) arrival threshold would otherwise
+    /// bring it to a full stop. Only used for intermediate Part 2 stops.</summary>
     float wanderLookAheadDistance = 1.5f;
 
-    /// <summary>Time.time before which UpdateUndirectedWandering() will not attempt another
-    /// SelectNextWanderPoint() call. Used both as a defensive backoff when no reachable candidate was
-    /// found, and as a brief grace period after being forced to reselect the same point (the
-    /// single-valid-point case) - in both cases it prevents NavMesh.CalculatePath from being invoked
-    /// every single frame.</summary>
+    /// <summary>True once BeginWanderingItinerary() has placed the NPC at its entrance and issued the first leg.
+    /// Until then (e.g. while waiting for the mover to become ready) the look-ahead and Detour restore are inert.</summary>
+    bool wanderingStarted = false;
+
+    /// <summary>Time.time before which AdvanceWanderingItinerary() will not run again. A defensive back-off applied
+    /// when no reachable next entry was found, so NavMesh.CalculatePath is never invoked every single frame.</summary>
     float nextWanderRetryTime = -1f;
 
-    /// <summary>One-time guard so "no wandering points configured" is logged once per agent life, not
-    /// every retry.</summary>
-    bool warnedNoWanderingPoints = false;
-
-    /// <summary>Reused NavMeshPath buffer for SelectNextWanderPoint()'s NavMesh.CalculatePath validation,
-    /// so repeated candidate checks do not allocate a new NavMeshPath each time.</summary>
+    /// <summary>Reused NavMeshPath buffer for the reachability validation, so repeated checks do not allocate.</summary>
     NavMeshPath wanderPathBuffer;
 
-    /// <summary>Backoff applied after a failed/degenerate wander-point selection (see nextWanderRetryTime).
-    /// Not Inspector-exposed - this is an internal pacing safeguard, not a behavioural tuning parameter.</summary>
+    /// <summary>Back-off after a failed next-entry selection (see nextWanderRetryTime). Not Inspector-exposed - an
+    /// internal pacing safeguard, not a behavioural tuning parameter.</summary>
     const float k_WanderRetryBackoffSeconds = 0.5f;
 
     // -----------------------------
@@ -190,7 +154,7 @@ public class PedestrianAgent : MonoBehaviour
     UncertainBehavior uncertainBehavior = null;
 
     // Cached delegate for UncertainBehavior.SetMainTargetRestorer(), created once in Awake() so registering it on
-    // every Initialize() does not allocate. Only registered in undirected mode - see Initialize(SpawnerManager, ...).
+    // every Initialize() does not allocate. Only registered in Part 2 mode.
     Func<bool> detourRestorer = null;
 
     // NEW (fix for pooled-agent reactivation race): tracks the coroutine started by BeginMovementWhenReady()
@@ -198,7 +162,7 @@ public class PedestrianAgent : MonoBehaviour
     Coroutine startMovementCoroutine = null;
 
     [Tooltip("NEW: maximum time (seconds, unscaled) to wait for MoveToTarget.IsReadyToMove() to report true " +
-             "before issuing the first MoveToCurrent() command anyway. This bounds how long a spawn can be " +
+             "before issuing the first movement command anyway. This bounds how long a spawn can be " +
              "delayed if the mover never becomes ready (e.g. genuinely off NavMesh), so an agent is never " +
              "blocked forever - MoveToTarget's own defensive logging still applies if it truly cannot move.")]
     public float moveReadyPollTimeout = 3f;
@@ -235,28 +199,40 @@ public class PedestrianAgent : MonoBehaviour
         uncertainBehavior = GetComponent<UncertainBehavior>();
         detourRestorer = ResumeWanderTargetAfterDetour;
 
-        // Part 2 undirected wandering: allocate once, reused across every SelectNextWanderPoint() call
-        // for the lifetime of this instance (including pooled reuse) to avoid per-call allocation.
+        // Part 2: allocate once, reused across every reachability check for the lifetime of this instance
+        // (including pooled reuse) to avoid per-call allocation.
         wanderPathBuffer = new NavMeshPath();
     }
 
+    // ===============================================================================================
+    // Initialisation
+    // ===============================================================================================
+
     /// <summary>
-    /// Initialize called by SpawnerManager when spawning / reusing agent with a Transform-based itinerary.
-    /// Movement is handled exclusively via MoveToTarget. This is the DIRECTED (Part 3) initialization path -
-    /// completely unchanged except for the two new lines at the top that reset undirected-mode state, so a
-    /// pooled instance previously used for Part 2 wandering starts this life cleanly in directed mode.
+    /// Part 3 initialisation (existing signature, kept for compatibility): walks 'itinerary' as an
+    /// Entrance -> attractors -> Exit route. Equivalent to Initialize(itinerary, mgr, Part3AttractorItinerary, ...).
     /// </summary>
     public void Initialize(List<Transform> itinerary, SpawnerManager mgr, float dwellSeconds)
     {
-        // Part 2/Part 3 pooling hygiene (Requirement: a pooled instance must not retain undirected-mode
-        // state when reused for a directed spawn). Everything below this block is the ORIGINAL,
-        // unmodified directed-mode initialization.
-        this.undirectedMode = false;
-        this.currentWanderPoint = null;
-        this.initialEntranceTarget = null;
+        Initialize(itinerary, mgr, NpcMovementMode.Part3AttractorItinerary, dwellSeconds, 0f);
+    }
 
+    /// <summary>
+    /// Called by SpawnerManager when spawning / reusing an agent. Hands over the itinerary that was generated ONCE
+    /// for this life and the mode that decides how it is walked (see the file header). Movement is handled
+    /// exclusively via MoveToTarget.
+    /// </summary>
+    /// <param name="itinerary">Entrance (index 0), intermediate stops, exit (last index).</param>
+    /// <param name="mgr">The owning SpawnerManager (attractor occupancy, pooling).</param>
+    /// <param name="mode">Part 2 wandering itinerary or Part 3 attractor itinerary.</param>
+    /// <param name="dwellSeconds">Dwell at the entrance/attractors (Part 3 only; ignored in Part 2).</param>
+    /// <param name="lookAheadDistance">Part 2 only: distance at which the next itinerary entry is issued.</param>
+    public void Initialize(List<Transform> itinerary, SpawnerManager mgr, NpcMovementMode mode,
+                           float dwellSeconds, float lookAheadDistance)
+    {
         if (itinerary == null) itinerary = new List<Transform>();
 
+        this.movementMode = mode;
         this.itineraryTransforms = new List<Transform>(itinerary);
 
         this.manager = mgr;
@@ -264,9 +240,13 @@ public class PedestrianAgent : MonoBehaviour
         this.currentIndex = 0;
         this.state = State.Moving;
 
-        // Additive: a pooled instance may still hold a stop override from its previous life. Clear it so
-        // the first leg (always the entrance) starts on the unchanged code path.
+        // Pooling hygiene: a pooled instance may hold per-leg state from its previous life (possibly in the other
+        // mode). Clear it so the first leg starts clean.
         this.currentLegStopOverride = null;
+        this.wanderingStarted = false;
+        this.nextWanderRetryTime = -1f;
+        if (IsWanderingItinerary)
+            this.wanderLookAheadDistance = Mathf.Max(0.01f, lookAheadDistance);
 
         // Configure MoveToTarget runtime parameters if available
         if (moveToTarget != null)
@@ -280,109 +260,44 @@ public class PedestrianAgent : MonoBehaviour
 
         // Stage 4: fully reset UncertainBehavior's per-life runtime state (state machine, saved detour
         // target, retry count, suspend flag, event subscriptions) so a reused pooled instance starts this
-        // life clean, then re-enable it for the new itinerary. (ResumeAfterArrival() remains used for the
-        // lighter-weight per-dwell resume in the WaitAtAttractor/PollForCapacity/SimpleDwellThenAdvance
-        // coroutines below - this call site needs the full reset instead.)
+        // life clean. (ResumeAfterArrival() remains used for the lighter-weight per-dwell resume in the
+        // dwell coroutines below - this call site needs the full reset instead.)
         if (uncertainBehavior != null)
         {
             uncertainBehavior.ResetForReuse();
 
-            // Directed mode keeps UncertainBehavior's original snapshot-based main-target restoration: clear any
-            // restorer left over from a previous undirected life of this pooled instance.
-            uncertainBehavior.SetMainTargetRestorer(null);
+            // Part 2: the authoritative main target is itinerary[currentIndex] (not a snapshot taken at Detour
+            // entry), so a Detour that ends must resume towards it - see ResumeWanderTargetAfterDetour().
+            // Part 3 keeps UncertainBehavior's original snapshot-based restoration (and clears any restorer left
+            // over from a previous Part 2 life of this pooled instance).
+            uncertainBehavior.SetMainTargetRestorer(IsWanderingItinerary ? detourRestorer : null);
         }
 
-        // NEW (fix for pooled-agent reactivation race): rather than calling MoveToCurrent() synchronously
-        // here (which could race with MoveToTarget's own pooled-reuse re-warp onto the NavMesh, see
+        // NEW (fix for pooled-agent reactivation race): rather than issuing the first leg synchronously here
+        // (which could race with MoveToTarget's own pooled-reuse re-warp onto the NavMesh, see
         // MoveToTarget.IsReadyToMove() docs), defer the first movement command until the mover reports
         // it is actually ready, or a bounded timeout elapses.
         BeginMovementWhenReady();
     }
 
-    /// <summary>
-    /// NEW: Initialize called by SpawnerManager when spawning / reusing agent for Part 2's continuous
-    /// UNDIRECTED wandering mode. No itinerary is built or consumed - instead the agent is INSTANTLY
-    /// RELOCATED (teleported, not walked) to a single one-time 'initialEntrance' target (the SAME random
-    /// entrance draw SpawnerManager already makes for Part 3 - see SpawnerManager.SpawnAgent()) via
-    /// MoveToTarget.TeleportTo() (an existing public API - see BeginUndirectedMovement()), then immediately
-    /// transitions into the existing continuous-wandering loop: repeatedly picking a random point from
-    /// 'mgr.wanderingPoints', walking to it, and immediately picking another, indefinitely, until
-    /// externally stopped (ForceFinish(), called by SpawnerManager's existing trial-end / End-Panel
-    /// hard-stop mechanisms - never by this agent itself). The Entrance has no role whatsoever once the
-    /// teleport happens: it is not added to any itinerary, never revisited deliberately, and never
-    /// triggers attractor dwell, exit logic, or Finish(). See the ADDITIVE CHANGE block at the top of this
-    /// file for the full design rationale.
-    /// </summary>
-    /// <param name="mgr">The SpawnerManager that owns wanderingPoints and this agent's pooling lifecycle.</param>
-    /// <param name="lookAheadDistance">Copied from SpawnerManager.wanderLookAheadDistance at spawn time.</param>
-    /// <param name="initialEntrance">The randomly-chosen entrance (SpawnerManager's existing
-    /// Random.Range(0, entrances.Length) draw - the SAME one Part 3 uses for itinerary[0]) this agent
-    /// should be instantly relocated to before beginning continuous wandering. Pass null if no valid
-    /// entrance is available (e.g. entrances[] is empty) - the agent then skips the teleport entirely and
-    /// starts wandering from wherever it was spawned, rather than crashing.</param>
-    public void Initialize(SpawnerManager mgr, float lookAheadDistance, Transform initialEntrance)
-    {
-        // Directed-mode pooling hygiene, mirrored: a pooled instance previously used for Part 3 must not
-        // retain its itinerary/index when reused for Part 2 undirected wandering.
-        this.itineraryTransforms = null;
-        this.currentIndex = 0;
-        this.currentLegStopOverride = null;
-
-        this.undirectedMode = true;
-        this.manager = mgr;
-        this.dwellTime = 0f; // unused in undirected mode - SimpleDwellThenAdvance()/WaitAtAttractor() are never called
-        this.state = State.Moving;
-        this.currentWanderPoint = null;
-        this.wanderLookAheadDistance = Mathf.Max(0.01f, lookAheadDistance);
-        this.nextWanderRetryTime = -1f;
-        this.warnedNoWanderingPoints = false;
-
-        // NEW: the one-time initial-Entrance teleport target, consumed by BeginUndirectedMovement() once
-        // MoveToTarget is confirmed ready. If null (no valid entrance was supplied), the teleport is simply
-        // skipped there and wandering starts from the spawn position instead.
-        this.initialEntranceTarget = initialEntrance;
-
-        if (moveToTarget != null)
-        {
-            moveToTarget.startTransform = null;
-            moveToTarget.startPosition = transform.position;
-            try { moveToTarget.SetMoveSpeed(moveToTarget.speed); } catch (Exception) { /* ignore if missing */ }
-        }
-
-        // Same full per-life reset as directed mode - a reused pooled instance starts this life clean.
-        if (uncertainBehavior != null)
-        {
-            uncertainBehavior.ResetForReuse();
-
-            // currentWanderPoint (not a snapshot taken at Detour entry) is the authoritative main target in
-            // undirected mode, so a Detour that ends must resume towards it - see ResumeWanderTargetAfterDetour().
-            uncertainBehavior.SetMainTargetRestorer(detourRestorer);
-        }
-
-        // Same "wait for mover ready" deferral as directed mode (see WaitUntilMoverReadyThenMove below),
-        // just branching to the initial-Entrance leg (or straight to SelectNextWanderPoint() if there is
-        // none) instead of MoveToCurrent() once ready.
-        BeginMovementWhenReady();
-    }
-
     void Update()
     {
-        // Part 2 continuous undirected wandering has its own, completely separate update path. It never
-        // falls through into the directed itinerary logic below (MoveToCurrent/OnReachedWaypoint/
-        // AdvanceItinerary/WaitAtAttractor/SimpleDwellThenAdvance/Finish are never reached from here).
-        if (undirectedMode)
-        {
-            UpdateUndirectedWandering();
-            return;
-        }
-
-        // ---------------- Everything below this point is the ORIGINAL, unmodified directed-mode logic ----------------
-
-        // Only perform arrival detection while moving
+        // Only perform leg progression while moving
         if (state != State.Moving)
             return;
 
         if (itineraryTransforms == null || currentIndex >= itineraryTransforms.Count) return;
+
+        // Part 2 has its own, completely separate progression path (look-ahead for intermediate stops). It never
+        // falls through into the Part 3 attractor logic below.
+        if (IsWanderingItinerary)
+        {
+            UpdateWanderingItinerary();
+            return;
+        }
+
+        // ---------------- Part 3 attractor itinerary ----------------
+
         Transform t = itineraryTransforms[currentIndex];
         if (t == null)
         {
@@ -404,215 +319,199 @@ public class PedestrianAgent : MonoBehaviour
             OnReachedWaypoint();
     }
 
-    // -----------------------------------------------------------------------------------------------
-    // Part 2 continuous undirected wandering - implementation (additive; never called in directed mode).
-    // -----------------------------------------------------------------------------------------------
+    // ===============================================================================================
+    // Part 2: wandering itinerary
+    // ===============================================================================================
 
     /// <summary>
-    /// Per-frame undirected-mode update. Never touches itineraryTransforms/currentIndex, never calls
-    /// MoveToCurrent()/OnReachedWaypoint()/AdvanceItinerary()/Finish(). The one-time initial Entrance
-    /// relocation is an instant teleport handled entirely in BeginUndirectedMovement() (called once, before
-    /// this method ever runs for a given life) - by the time this method first executes, the agent is
-    /// already at the Entrance (or its spawn position, if no entrance was supplied) and purely in the
-    /// continuous-wandering phase. Wandering-leg arrival is detected by comparing transform.position
-    /// directly against 'currentWanderPoint' - deliberately NOT via MoveToTarget.OnArrived/IsArrived (see
-    /// the ADDITIVE CHANGE block at the top of this file for why).
+    /// Per-frame Part 2 progression for INTERMEDIATE stops (the caller already checked state and bounds).
+    /// The last entry (the exit) is never advanced here - it completes through MoveToTarget.OnArrived - and no
+    /// stop is ever drawn at random: progression only moves to the next entry of the pre-generated itinerary.
     /// </summary>
-    void UpdateUndirectedWandering()
+    void UpdateWanderingItinerary()
     {
-        // Defensive - an undirected agent should always be State.Moving (it never transitions to
-        // WaitingAtAttractor or Finished on its own), but guard in case ForceFinish() ran this frame.
-        if (state != State.Moving)
+        // Not placed / first leg not issued yet (e.g. still waiting for the mover to become ready).
+        if (!wanderingStarted)
+            return;
+
+        // The final leg (exit) is completed by the arrival event, not by the look-ahead.
+        if (currentIndex >= itineraryTransforms.Count - 1)
             return;
 
         // While an UncertainBehavior Detour is in progress, MoveToTarget's destination belongs to the temporary
-        // detour point. Do not select a new wandering point (which would call MoveTo() and overwrite it) - and
-        // keep currentWanderPoint untouched so it stays the authoritative main target. When the Detour ends,
-        // UncertainBehavior calls ResumeWanderTargetAfterDetour() and normal selection resumes from here.
+        // detour point. Do not issue the next entry (which would call MoveTo() and overwrite it); the itinerary
+        // index stays untouched so itinerary[currentIndex] remains the authoritative main target. When the Detour
+        // ends, UncertainBehavior calls ResumeWanderTargetAfterDetour() and progression resumes from here.
         if (uncertainBehavior != null && uncertainBehavior.IsDetouring)
             return;
 
-        // Cooldown gate: prevents SelectNextWanderPoint() (and therefore NavMesh.CalculatePath) from being
-        // invoked every single frame, both when no reachable candidate was found and in the degenerate
-        // single-valid-point case (see SelectNextWanderPoint).
+        // Back-off gate: prevents NavMesh.CalculatePath from being invoked every frame after a failed advance.
         if (Time.time < nextWanderRetryTime)
             return;
 
-        if (currentWanderPoint == null)
+        Transform stop = itineraryTransforms[currentIndex];
+        if (stop == null || Vector3.Distance(transform.position, stop.position) <= wanderLookAheadDistance)
         {
-            // No point selected yet (first frame after BeginUndirectedMovement()'s teleport, or a previous
-            // point was destroyed at runtime and Unity's null-comparison correctly caught it) - select one now.
-            SelectNextWanderPoint();
-            return;
-        }
-
-        float d = Vector3.Distance(transform.position, currentWanderPoint.position);
-        if (d <= wanderLookAheadDistance)
-        {
-            // Close enough to retarget NOW, before MoveToTarget's own (tighter) arriveThreshold would
-            // otherwise bring the NavMeshAgent to a full stop. See wanderLookAheadDistance doc comment.
-            SelectNextWanderPoint();
+            // Close enough to move on NOW, before MoveToTarget's own (tighter) arrival threshold would otherwise
+            // bring the NavMeshAgent to a full stop. A destroyed stop is skipped the same way.
+            AdvanceWanderingItinerary();
         }
     }
 
     /// <summary>
-    /// Selects the next wandering target from SpawnerManager.wanderingPoints and immediately issues it to
-    /// MoveToTarget, or applies a short defensive backoff if no valid candidate could be found this
-    /// attempt. Never generates a random position - the candidate is always one of the predefined
-    /// Transforms; NavMesh.SamplePosition is not used at all here (only NavMesh.CalculatePath, purely to
-    /// validate reachability of an already-chosen candidate).
-    ///
-    /// Algorithm (matches SpawnerManager.BuildItinerary()'s existing "pick without replacement" style):
-    ///   1. Candidate index list = every non-null entry in wanderingPoints, excluding the entry equal to
-    ///      currentWanderPoint if any OTHER valid entry exists (so A-&gt;A repeats are avoided whenever
-    ///      possible, but a single-point list is still usable - see step 1b).
-    ///   1b. If step 1 leaves zero candidates (either the array is entirely null/empty, or the ONLY valid
-    ///       entry IS currentWanderPoint), rebuild the candidate list WITHOUT excluding currentWanderPoint.
-    ///       If it is still empty, there are no configured wandering points at all - warn once and back off.
-    ///   2. Shuffle by repeatedly drawing a random remaining candidate and removing it (Random.Range +
-    ///      RemoveAt), so every remaining candidate is tried at most once per call - never a fixed
-    ///      "max attempts" counter with possible repeats.
-    ///   3. For each shuffled candidate, validate with NavMesh.CalculatePath(currentPos, candidate.position,
-    ///      NavMesh.AllAreas, ...) and require NavMeshPathStatus.PathComplete. Accept the first that passes.
-    ///   4. If none pass, apply a short backoff (k_WanderRetryBackoffSeconds) and warn - UpdateUndirectedWandering()
-    ///      will try again after the cooldown, never in a tight per-frame loop.
+    /// Part 2: first movement command of a life, issued once MoveToTarget is ready. Index 0 is the entrance the
+    /// route was generated from: the NPC is relocated there instantly (TeleportTo sets the transform AND warps
+    /// the NavMeshAgent, so no transit is visible), then immediately continues to the first wandering point. No
+    /// dwell happens at the entrance. This is the existing Part 2 spawn behaviour, kept deliberately.
     /// </summary>
-    void SelectNextWanderPoint()
+    void BeginWanderingItinerary()
     {
-        Transform[] points = (manager != null) ? manager.wanderingPoints : null;
-
-        if (points == null || points.Length == 0)
+        if (itineraryTransforms == null || itineraryTransforms.Count < 2)
         {
-            WarnNoWanderingPointsOnce();
-            nextWanderRetryTime = Time.time + k_WanderRetryBackoffSeconds;
+            // Nothing to walk (SpawnerManager never generates this) - end the life instead of idling forever.
+            Finish();
             return;
         }
 
-        // Step 1: candidates excluding the current point where possible.
-        List<int> candidates = new List<int>(points.Length);
-        for (int i = 0; i < points.Length; i++)
+        Transform entrance = itineraryTransforms[0];
+        if (moveToTarget != null && entrance != null)
         {
-            if (points[i] == null) continue;
-            if (points[i] == currentWanderPoint) continue;
-            candidates.Add(i);
+            moveToTarget.TeleportTo(entrance.position);
+            SyncMoverStartToCurrentPosition();
         }
 
-        // Step 1b: fallback when the only valid point IS the current one (or nothing was excluded because
-        // currentWanderPoint was null and everything else is also null).
-        bool forcedSameCandidate = false;
-        if (candidates.Count == 0)
-        {
-            for (int i = 0; i < points.Length; i++)
-                if (points[i] != null) candidates.Add(i);
+        wanderingStarted = true;
+        AdvanceWanderingItinerary(); // currentIndex 0 (entrance) -> first reachable stop
+    }
 
-            if (candidates.Count == 0)
+    /// <summary>
+    /// Part 2: moves currentIndex to the next usable entry AFTER the current one and issues that leg.
+    /// Reuses the original path validation: an entry is only issued if NavMesh.CalculatePath from the NPC's current
+    /// position returns PathComplete. A destroyed or unreachable INTERMEDIATE stop is skipped (bounded: each entry
+    /// is tried at most once). If the exit itself is destroyed the NPC finishes; if it is unreachable the NPC keeps
+    /// its current target and retries after k_WanderRetryBackoffSeconds - never every frame.
+    /// </summary>
+    void AdvanceWanderingItinerary()
+    {
+        int last = itineraryTransforms.Count - 1;
+
+        for (int j = currentIndex + 1; j <= last; j++)
+        {
+            Transform candidate = itineraryTransforms[j];
+
+            if (candidate == null)
             {
-                // Every entry is null - genuinely nothing configured.
-                WarnNoWanderingPointsOnce();
-                nextWanderRetryTime = Time.time + k_WanderRetryBackoffSeconds;
-                return;
+                if (j == last) { Finish(); return; } // exit destroyed: nothing left to walk to
+                continue;
             }
 
-            // If the only non-null entry is the current point, we are about to reselect it (allowed, per
-            // Requirement 6 - a single-point list must still work). Flag this so the success branch below
-            // applies a short cooldown instead of retriggering on the very next frame.
-            forcedSameCandidate = (candidates.Count == 1 && points[candidates[0]] == currentWanderPoint);
-        }
-
-        // Step 2 + 3: shuffle-and-validate, one attempt per remaining candidate, no repeats.
-        Vector3 fromPos = transform.position;
-        while (candidates.Count > 0)
-        {
-            int pick = UnityEngine.Random.Range(0, candidates.Count);
-            int idx = candidates[pick];
-            candidates.RemoveAt(pick);
-
-            Transform cand = points[idx];
-            if (cand == null) continue; // defensive; already filtered above, but a point could be destroyed mid-loop
-
-            bool reachable = NavMesh.CalculatePath(fromPos, cand.position, NavMesh.AllAreas, wanderPathBuffer)
-                              && wanderPathBuffer.status == NavMeshPathStatus.PathComplete;
+            bool reachable = NavMesh.CalculatePath(transform.position, candidate.position, NavMesh.AllAreas, wanderPathBuffer)
+                             && wanderPathBuffer.status == NavMeshPathStatus.PathComplete;
 
             if (!reachable)
-                continue;
-
-            currentWanderPoint = cand;
-
-            if (moveToTarget != null)
-                moveToTarget.MoveTo(cand); // same MoveToTarget.MoveTo(Transform) overload directed mode uses
-
-            // Mirrors the existing dwell coroutines' defensive call: harmless no-op if UncertainBehavior was
-            // never suspended, but guarantees it cannot get stuck dormant if MoveToTarget.OnArrived ever
-            // fires despite the look-ahead pre-emption (see the ADDITIVE CHANGE block at the top of this file).
-            if (uncertainBehavior != null)
-                uncertainBehavior.ResumeAfterArrival();
-
-            if (forcedSameCandidate)
             {
-                // Degenerate single-point case: give the agent a brief grace period before re-evaluating,
-                // instead of immediately re-triggering SelectNextWanderPoint() (and another
-                // NavMesh.CalculatePath call) on the very next frame while still within look-ahead range
-                // of the point it is already standing next to.
-                nextWanderRetryTime = Time.time + k_WanderRetryBackoffSeconds;
+                if (j == last) break; // the exit is mandatory: back off and retry
+                continue;             // skip an unreachable intermediate stop
             }
 
+            currentIndex = j;
+            IssueWanderingLeg(j);
             return;
         }
 
-        // No candidate validated this attempt (e.g. the agent is in an isolated pocket, or every remaining
-        // point has gone stale after a NavMesh rebake). Back off briefly and let UpdateUndirectedWandering()
-        // retry next eligible frame - never an unbounded loop, never dozens of CalculatePath calls per frame.
-        Debug.LogWarning($"[PedestrianAgent][{agentID}] No reachable wandering point found this attempt " +
-            $"(of {points.Length} configured); retrying in {k_WanderRetryBackoffSeconds:F1}s. If this persists, " +
-            "check that SpawnerManager.wanderingPoints are placed on/near the walkable NavMesh and reachable " +
+        // No usable next entry this attempt (e.g. the agent is in an isolated pocket, or points went stale after a
+        // NavMesh rebake). Back off briefly and let UpdateWanderingItinerary() retry - never a tight loop.
+        Debug.LogWarning($"[PedestrianAgent][{agentID}] No reachable next itinerary entry after index {currentIndex} " +
+            $"(of {itineraryTransforms.Count}); retrying in {k_WanderRetryBackoffSeconds:F1}s. If this persists, " +
+            "check that SpawnerManager.wanderingPoints / exits are placed on/near the walkable NavMesh and reachable " +
             "from this agent's current position.");
         nextWanderRetryTime = Time.time + k_WanderRetryBackoffSeconds;
     }
 
     /// <summary>
-    /// Registered with UncertainBehavior (undirected mode only) and invoked from UncertainBehavior.ExitCurrentState()
-    /// when a Detour ends. Resumes movement towards the CURRENT main wandering target instead of the position
-    /// snapshot UncertainBehavior took when the Detour began (which is stale if a new point was selected in the
-    /// meantime). Returns true if this agent handled the restore, false to let UncertainBehavior fall back to its
-    /// original snapshot restore (directed mode, or no MoveToTarget).
-    ///   - currentWanderPoint valid: re-issue it via the same MoveToTarget.MoveTo(Transform) overload used
-    ///     everywhere else in undirected mode (clears the stopped state, re-targets the Transform).
-    ///   - currentWanderPoint null/destroyed: select a fresh point now; SelectNextWanderPoint() either issues a
-    ///     validated MoveTo() or backs off, and UpdateUndirectedWandering() keeps retrying while
-    ///     currentWanderPoint is null, so the NPC is never left parked on the old detour destination.
-    /// If the NPC is already inside wanderLookAheadDistance of the point, the next Update() simply selects the
-    /// following point as usual.
+    /// Part 2: hands itinerary[index] to MoveToTarget. Intermediate stops use the same MoveTo(Transform) overload as
+    /// before and nothing else (no arrival subscription, no resume - the look-ahead moves the NPC on). The exit leg
+    /// is completed through the mover's single arrival event exactly like a Part 3 waypoint: subscribe BEFORE
+    /// MoveTo, make arrival detection live (ResumeExternal), and set the canonical per-leg radius AFTER MoveTo
+    /// (MoveTo resets it). Also used to re-issue the current target after a Detour.
     /// </summary>
-    bool ResumeWanderTargetAfterDetour()
+    void IssueWanderingLeg(int index)
     {
-        if (!undirectedMode || moveToTarget == null)
-            return false;
+        if (moveToTarget == null) return;
 
-        if (currentWanderPoint != null)
+        Transform target = itineraryTransforms[index];
+        bool isExit = (index == itineraryTransforms.Count - 1);
+
+        if (isExit)
         {
-            moveToTarget.MoveTo(currentWanderPoint);
-            return true;
+            SubscribeToMoveToArrived();
+            moveToTarget.ResumeExternal();
         }
 
-        SelectNextWanderPoint();
-        return true;
-    }
+        moveToTarget.MoveTo(target);
 
-    void WarnNoWanderingPointsOnce()
-    {
-        if (warnedNoWanderingPoints) return;
-        warnedNoWanderingPoints = true;
-        Debug.LogWarning($"[PedestrianAgent][{agentID}] Undirected mode: SpawnerManager.wanderingPoints is " +
-            "empty or unassigned. This agent will remain stationary until wandering points are configured " +
-            "in the Inspector.");
+        if (isExit)
+            moveToTarget.SetLegArriveRadius(arriveTolerance);
+
+        // MoveTo(Transform) records the previous target as startTransform; a first-life MoveToTarget.Start() would
+        // otherwise move the NPC onto it. Keep the mover's start == where the NPC actually is.
+        SyncMoverStartToCurrentPosition();
+
+        // Harmless no-op if UncertainBehavior was never suspended, but guarantees it cannot get stuck dormant if
+        // MoveToTarget.OnArrived ever fires for an intermediate stop despite the look-ahead pre-emption.
+        if (uncertainBehavior != null)
+            uncertainBehavior.ResumeAfterArrival();
     }
 
     /// <summary>
+    /// Keeps MoveToTarget's start fields equal to the NPC's current position, so the one-time first-life
+    /// MoveToTarget.Start() initialisation can never relocate the NPC to a stale start point or a waypoint.
+    /// </summary>
+    void SyncMoverStartToCurrentPosition()
+    {
+        if (moveToTarget == null) return;
+        moveToTarget.startTransform = null;
+        moveToTarget.startPosition = transform.position;
+    }
+
+    /// <summary>
+    /// Registered with UncertainBehavior (Part 2 only) and invoked from UncertainBehavior.ExitCurrentState() when a
+    /// Detour ends. Resumes movement towards the CURRENT itinerary target - itinerary[currentIndex] - instead of the
+    /// position snapshot UncertainBehavior took when the Detour began. Returns true if this agent handled the
+    /// restore, false to let UncertainBehavior fall back to its original snapshot restore (Part 3 / no mover).
+    ///   - Not started yet: nothing to restore (BeginWanderingItinerary() has not issued a leg).
+    ///   - Current entry valid: re-issue it (clears the stopped state, re-targets the Transform; for the exit leg
+    ///     also re-arms the arrival radius). A Detour never changes currentIndex, so this is always the right leg.
+    ///   - Current entry destroyed: advance to the next usable entry (validated, with back-off).
+    /// If the NPC is already inside wanderLookAheadDistance of the stop, the next Update() simply moves on as usual.
+    /// </summary>
+    bool ResumeWanderTargetAfterDetour()
+    {
+        if (!IsWanderingItinerary || moveToTarget == null)
+            return false;
+
+        if (!wanderingStarted || itineraryTransforms == null || currentIndex >= itineraryTransforms.Count)
+            return true;
+
+        if (itineraryTransforms[currentIndex] != null)
+        {
+            IssueWanderingLeg(currentIndex);
+            return true;
+        }
+
+        AdvanceWanderingItinerary();
+        return true;
+    }
+
+    // ===============================================================================================
+    // Start-up and movement commands
+    // ===============================================================================================
+
+    /// <summary>
     /// NEW (fix for pooled-agent reactivation race): starts (or restarts) the coroutine that waits for
-    /// MoveToTarget to report readiness before issuing the first MoveToCurrent() command for this itinerary.
+    /// MoveToTarget to report readiness before issuing the first movement command for this itinerary.
     /// Cancels any previous pending wait first, in case Initialize() is called again
     /// in quick succession (e.g. very fast pool reuse) before the previous wait finished.
-    /// Shared by both directed and undirected Initialize() overloads - see WaitUntilMoverReadyThenMove().
     /// </summary>
     void BeginMovementWhenReady()
     {
@@ -626,7 +525,7 @@ public class PedestrianAgent : MonoBehaviour
         {
             // Cannot start a coroutine on an inactive GameObject. This is not an error: SpawnerManager
             // always calls go.SetActive(true) before Initialize(), so this should
-            // not normally happen, but if it does, MoveToCurrent() will simply run the next time this
+            // not normally happen, but if it does, the first leg will simply run the next time this
             // agent is (re)activated and re-initialized.
             return;
         }
@@ -640,23 +539,18 @@ public class PedestrianAgent : MonoBehaviour
     /// Problem this solves: MoveToTarget.OnEnable() -> ReinitializeAfterEnable() re-warps a pooled agent's
     /// NavMeshAgent onto the NavMesh, but that re-warp is not guaranteed to have completed by the time
     /// SpawnerManager.SpawnAgent() calls PedestrianAgent.Initialize() in the same
-    /// frame as go.SetActive(true). Previously, MoveToCurrent() (-> MoveToTarget.MoveTo(...)) was invoked
-    /// synchronously right there, so it could run before MoveToTarget.IsReadyToMove() was true; MoveTo(...)
-    /// would then silently skip calling agent.SetDestination(...) (only logging a warning), leaving the
-    /// agent internally marked as 'moving' but with no actual NavMesh destination - an intermittently
-    /// "frozen" NPC that is more likely to surface under load (many simultaneous pool reuses) and on Quest,
-    /// where coroutine scheduling latency is more variable than in the Editor.
+    /// frame as go.SetActive(true). Previously, MoveTo(...) was invoked synchronously right there, so it could run
+    /// before MoveToTarget.IsReadyToMove() was true; MoveTo(...) would then silently skip calling
+    /// agent.SetDestination(...) (only logging a warning), leaving the agent internally marked as 'moving' but with
+    /// no actual NavMesh destination - an intermittently "frozen" NPC that is more likely to surface under load
+    /// (many simultaneous pool reuses) and on Quest, where coroutine scheduling latency is more variable than in
+    /// the Editor.
     ///
     /// Fix: poll MoveToTarget.IsReadyToMove() once per frame and only issue the first movement command once
     /// the mover reports it can actually accept a destination, or once 'moveReadyPollTimeout' seconds have
     /// elapsed (whichever comes first). The timeout ensures an agent is never blocked forever waiting - if
     /// the mover genuinely cannot get onto the NavMesh, MoveToTarget's own existing defensive
     /// logging/disable logic still applies exactly as before.
-    ///
-    /// NEW: branches on 'undirectedMode' for which "first movement command" to issue - MoveToCurrent() for
-    /// directed itineraries (unchanged), BeginUndirectedMovement() for Part 2 (instantly teleports to the
-    /// one-time initial Entrance if one was supplied, then starts continuous wandering immediately via
-    /// SelectNextWanderPoint() - see BeginUndirectedMovement()).
     /// </summary>
     IEnumerator WaitUntilMoverReadyThenMove()
     {
@@ -664,8 +558,7 @@ public class PedestrianAgent : MonoBehaviour
         {
             // No MoveToTarget on this prefab: nothing to wait for. Preserve the original fallback
             // behaviour described in Awake() (agent relies on external movement logic).
-            if (undirectedMode) BeginUndirectedMovement();
-            else MoveToCurrent();
+            StartItinerary();
             startMovementCoroutine = null;
             yield break;
         }
@@ -685,43 +578,25 @@ public class PedestrianAgent : MonoBehaviour
             yield return null;
         }
 
-        if (undirectedMode)
-            BeginUndirectedMovement();
-        else
-            MoveToCurrent();
+        StartItinerary();
 
         startMovementCoroutine = null;
     }
 
-    /// <summary>
-    /// NEW: issues the first movement command for undirected (Part 2) mode, once MoveToTarget is confirmed
-    /// ready (see WaitUntilMoverReadyThenMove). Mirrors Part 3's spawn behaviour: the agent is instantiated
-    /// at startTransform and must appear to the participant as already standing at its randomly-chosen
-    /// Entrance - not walk there. If an initial Entrance was supplied to Initialize(), relocates to it
-    /// instantly via MoveToTarget.TeleportTo() (sets transform.position AND warps the NavMeshAgent, so no
-    /// stray path is queued and no walked leg is ever visible). Then, in either case (entrance supplied or
-    /// not - the "no valid Entrance -&gt; do not crash" defensive fallback), goes straight into continuous
-    /// wandering via SelectNextWanderPoint(). There is no more "awaiting arrival" phase to track, since the
-    /// relocation is instantaneous.
-    /// </summary>
-    void BeginUndirectedMovement()
+    /// <summary>Issues the first movement command for this life, according to the movement mode.</summary>
+    void StartItinerary()
     {
-        if (initialEntranceTarget != null && moveToTarget != null)
-        {
-            // Instant relocation - not a walked MoveTo(). TeleportTo() sets transform.position directly and
-            // calls NavMeshAgent.Warp(), so the agent simply appears at the Entrance with no visible transit.
-            moveToTarget.TeleportTo(initialEntranceTarget.position);
-        }
-
-        initialEntranceTarget = null;
-        SelectNextWanderPoint();
+        if (IsWanderingItinerary)
+            BeginWanderingItinerary();
+        else
+            MoveToCurrent();
     }
 
     /// <summary>
     /// MoveToCurrent: instruct MoveToTarget to move to the current waypoint.
     /// This method exclusively calls MoveToTarget.MoveTo(...).
     /// We subscribe to MoveToTarget.OnArrived to get immediate notification when the leg completes.
-    /// DIRECTED MODE ONLY - never called while undirectedMode is true.
+    /// PART 3 ONLY - never called in Part 2 (see IssueWanderingLeg()).
     /// </summary>
     void MoveToCurrent()
     {
@@ -752,7 +627,7 @@ public class PedestrianAgent : MonoBehaviour
 
             // Make MoveToTarget's arrival detection live for this leg. The prefab serialises
             // externallyPaused = true, and a stale pause/halt/freeze flag could also survive from a previous
-            // life of a pooled instance; either would suppress OnArrived, the only arrival path for directed
+            // life of a pooled instance; either would suppress OnArrived, the only arrival path for these
             // waypoints. Dwell completion already calls ResumeExternal() immediately before AdvanceItinerary(),
             // so this changes nothing for later legs.
             moveToTarget.ResumeExternal();
@@ -799,9 +674,13 @@ public class PedestrianAgent : MonoBehaviour
         }
     }
 
+    // ===============================================================================================
+    // Arrival handling
+    // ===============================================================================================
+
     /// <summary>
     /// Subscribe to MoveToTarget.OnArrived if available and not already subscribed.
-    /// The subscribed callback triggers OnReachedWaypoint() which advances the itinerary.
+    /// The subscribed callback triggers OnReachedWaypoint() (Part 3 waypoints, Part 2 exit).
     /// </summary>
     void SubscribeToMoveToArrived()
     {
@@ -828,7 +707,7 @@ public class PedestrianAgent : MonoBehaviour
 
     /// <summary>
     /// Local adapter invoked when MoveToTarget signals arrival.
-    /// We call OnReachedWaypoint() to run the existing attractor/dwell logic.
+    /// We call OnReachedWaypoint() to run the existing attractor/dwell/finish logic.
     /// </summary>
     void OnMoveToArrived()
     {
@@ -855,10 +734,10 @@ public class PedestrianAgent : MonoBehaviour
     }
 
     /// <summary>
-    /// Called when a waypoint is considered reached.
-    /// Handles attractor capacity/dwell or finishing when exit reached.
-    /// DIRECTED MODE ONLY - never called while undirectedMode is true (undirected agents never subscribe
-    /// to MoveToTarget.OnArrived in the first place - see SelectNextWanderPoint).
+    /// Called when a waypoint that completes on arrival is reached.
+    /// Part 3: the exit (last entry) finishes the NPC; an attractor starts its capacity check / dwell; any other
+    /// waypoint (the entrance) is passed through without dwelling.
+    /// Part 2: only the exit subscribes to OnArrived, so this just finishes the life.
     /// </summary>
     void OnReachedWaypoint()
     {
@@ -868,6 +747,14 @@ public class PedestrianAgent : MonoBehaviour
         if (itineraryTransforms == null || currentIndex >= itineraryTransforms.Count) return;
         Transform target = itineraryTransforms[currentIndex];
         bool isExit = (currentIndex == itineraryTransforms.Count - 1);
+
+        // Part 2: wandering points never dwell and are never attractors; the exit ends the life like Part 3's.
+        if (IsWanderingItinerary)
+        {
+            if (isExit)
+                Finish();
+            return;
+        }
 
         if (!isExit)
         {
@@ -888,7 +775,9 @@ public class PedestrianAgent : MonoBehaviour
             }
             else
             {
-                StartCoroutine(SimpleDwellThenAdvance());
+                // Entrance (or any other waypoint that is neither an attractor nor the exit): no dwell, no timer, no
+                // capacity check - go straight on to the next itinerary entry.
+                PassThroughWaypoint();
                 return;
             }
         }
@@ -898,26 +787,24 @@ public class PedestrianAgent : MonoBehaviour
         }
     }
 
-    IEnumerator SimpleDwellThenAdvance()
+    /// <summary>
+    /// Part 3: continue immediately from a waypoint that does not dwell (the entrance). The arrival event was
+    /// already processed exactly once (OnMoveToArrived unsubscribed first). UncertainBehavior was suspended by
+    /// OnMoveToArrived, and nothing will hold this NPC at the waypoint, so re-arm it here - the same call the dwell
+    /// coroutines make when they release the NPC. AdvanceItinerary() then issues the next leg through
+    /// MoveToCurrent(), which also makes the mover's arrival detection live and re-subscribes for that leg.
+    /// </summary>
+    void PassThroughWaypoint()
     {
-        state = State.WaitingAtAttractor;
-
-        // Pause movement via MoveToTarget and freeze animator so agent does not step while waiting.
-        if (moveToTarget != null)
-            moveToTarget.PauseExternal(haltMovement: true, freezeAnimator: true);
-
-        yield return new WaitForSeconds(dwellTime);
-
-        // Resume movement via MoveToTarget (if present)
-        if (moveToTarget != null)
-            moveToTarget.ResumeExternal();
-
-        // Notify UncertainBehavior (if present) that movement has resumed so it can restart its random behaviors.
         if (uncertainBehavior != null)
             uncertainBehavior.ResumeAfterArrival();
 
         AdvanceItinerary();
     }
+
+    // ===============================================================================================
+    // Part 3: attractor dwell coroutines and itinerary progression
+    // ===============================================================================================
 
     IEnumerator WaitAtAttractor(AttractorInfo info)
     {
@@ -996,6 +883,7 @@ public class PedestrianAgent : MonoBehaviour
         AdvanceItinerary();
     }
 
+    /// <summary>Part 3: advance to the next itinerary entry after a dwell (or finish at the end).</summary>
     void AdvanceItinerary()
     {
         currentIndex++;
@@ -1089,11 +977,15 @@ public class PedestrianAgent : MonoBehaviour
         facingCoroutine = null;
     }
 
+    // ===============================================================================================
+    // Completion
+    // ===============================================================================================
+
     /// <summary>
     /// Finish: mark finished, stop movement via MoveToTarget, and notify listeners (SpawnerManager will return to pool).
     /// Also releases any attractor slot currently held by this agent to avoid leaks.
-    /// Only ever reached in directed mode (via AdvanceItinerary()/MoveToCurrent() at the itinerary's last
-    /// index) or externally via ForceFinish() (both modes) - undirected wandering never calls this itself.
+    /// Reached at the itinerary's last entry in both modes (Part 3 via AdvanceItinerary()/OnReachedWaypoint(),
+    /// Part 2 via the exit's arrival event), or externally via ForceFinish().
     /// </summary>
     void Finish()
     {
@@ -1112,10 +1004,8 @@ public class PedestrianAgent : MonoBehaviour
     }
 
     /// <summary>
-    /// ForceFinish: external immediate termination. Releases any claimed attractor slot for the current waypoint if necessary,
-    /// then stops movement and notifies listeners. This is the ONLY way an undirected (Part 2) agent's life
-    /// ends - it is called by SpawnerManager's existing, Part-agnostic external lifecycle mechanisms
-    /// (trial-end despawn, End-Panel hard stop, etc.), never by this agent itself.
+    /// ForceFinish: external immediate termination (SpawnerManager trial-end despawn, etc.). Releases any claimed
+    /// attractor slot for the current waypoint if necessary, then stops movement and notifies listeners.
     /// </summary>
     public void ForceFinish()
     {
@@ -1136,13 +1026,13 @@ public class PedestrianAgent : MonoBehaviour
 
     /// <summary>
     /// Helper: release the attractor slot corresponding to the current waypoint (if any).
-    /// Called from Finish/ForceFinish to avoid leaking a claimed slot. Safe to call in undirected mode:
-    /// itineraryTransforms is null there, so this is a guaranteed no-op (no attractor slot can ever be
-    /// held by an undirected agent, since it never calls TryEnterAttractor()).
+    /// Called from Finish/ForceFinish to avoid leaking a claimed slot. A no-op in Part 2, where no attractor slot
+    /// can ever be held (wandering points are never attractors and never call TryEnterAttractor()).
     /// </summary>
     void ReleaseCurrentAttractorIfAny()
     {
         if (manager == null) return;
+        if (IsWanderingItinerary) return;
 
         if (itineraryTransforms != null && currentIndex < itineraryTransforms.Count)
         {
@@ -1171,13 +1061,10 @@ public class PedestrianAgent : MonoBehaviour
         facingCoroutine = null;
         currentLegStopOverride = null;
 
-        // Part 2 undirected wandering: drop the remembered wander point too, so a stale reference is never
-        // held across a deactivation (the next Initialize() call - directed or undirected - always resets
-        // this explicitly anyway; this is a defensive tidy-up, not load-bearing).
-        currentWanderPoint = null;
-
-        // Same reasoning for the one-time initial-Entrance relocation state.
-        initialEntranceTarget = null;
+        // Part 2: drop the per-life progression state so a stale value is never held across a deactivation (the
+        // next Initialize() call always resets this explicitly anyway; this is a defensive tidy-up).
+        wanderingStarted = false;
+        nextWanderRetryTime = -1f;
     }
 
     void OnDestroy()

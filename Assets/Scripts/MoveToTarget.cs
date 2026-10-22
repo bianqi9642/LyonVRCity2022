@@ -41,6 +41,25 @@ public class MoveToTarget : MonoBehaviour
     // true OR one of SetNormalSpeed()/SetTemporarySpeed()/RestoreNormalSpeed() is called explicitly.
     public float speed = 1.4f;
     public float arriveThreshold = 0.2f;
+
+    // Optional per-leg override of 'arriveThreshold' (0 = none). Set by PedestrianAgent.MoveToCurrent() for
+    // directed itinerary waypoints so this component's single arrival decision uses the itinerary's canonical
+    // radius (PedestrianAgent.arriveTolerance) instead of a second, tighter threshold. Every MoveTo(...) call
+    // clears it, so UncertainBehavior detours, wander legs and any other caller keep using 'arriveThreshold'.
+    float legArriveRadius = 0f;
+
+    /// <summary>Radius currently used for arrival decisions: the per-leg override if set, else 'arriveThreshold'.</summary>
+    public float ArriveRadius => legArriveRadius > 0f ? legArriveRadius : arriveThreshold;
+
+    /// <summary>
+    /// Sets the arrival radius for the CURRENT leg only. Call after MoveTo(...) (which resets it). Pass 0 to
+    /// fall back to 'arriveThreshold'. Cleared again by the next MoveTo(...) and by OnDisable().
+    /// </summary>
+    public void SetLegArriveRadius(float radius)
+    {
+        legArriveRadius = Mathf.Max(0f, radius);
+    }
+
     public bool faceMovementDirection = true;
     public float rotationSpeed = 10f;
 
@@ -452,7 +471,7 @@ public class MoveToTarget : MonoBehaviour
             Vector3 curTarget = GetTargetPosition();
             float distToTarget = Vector3.Distance(transform.position, curTarget);
 
-            if (distToTarget <= Mathf.Max(arriveThreshold, 0.05f))
+            if (distToTarget <= Mathf.Max(ArriveRadius, 0.05f))
             {
                 if (externallyPaused && externallyHaltMovement)
                 {
@@ -569,7 +588,8 @@ public class MoveToTarget : MonoBehaviour
         Vector3 currentTarget = GetTargetPosition();
         float dist = Vector3.Distance(transform.position, currentTarget);
 
-        if (!externallyPaused && (dist <= arriveThreshold || (!agent.pathPending && remainingSafe <= arriveThreshold)))
+        float arriveRadius = ArriveRadius;
+        if (!externallyPaused && (dist <= arriveRadius || (!agent.pathPending && remainingSafe <= arriveRadius)))
         {
             arrived = true;
             moving = false;
@@ -819,6 +839,7 @@ public class MoveToTarget : MonoBehaviour
 
     public void MoveTo(Vector3 newTarget)
     {
+        legArriveRadius = 0f; // a new target never inherits the previous leg's arrival radius
         startTransform = null;
         startPosition = transform.position;
 
@@ -844,6 +865,7 @@ public class MoveToTarget : MonoBehaviour
 
     public void MoveTo(Transform newTargetTransform)
     {
+        legArriveRadius = 0f; // a new target never inherits the previous leg's arrival radius
         if (targetTransform != null)
         {
             startTransform = targetTransform;
@@ -919,6 +941,16 @@ public class MoveToTarget : MonoBehaviour
 
     void OnDisable()
     {
+        legArriveRadius = 0f; // pooled reuse starts without the previous life's per-leg radius
+
+        // Pooled reuse must not inherit a halt/animator-freeze left over from the previous life (e.g. returned
+        // to the pool while paused): a stale externallyFreezeAnimator keeps isWalking forced to false and a stale
+        // externallyHaltMovement keeps re-stopping the agent. Cleared here (end of life), not in
+        // ReinitializeAfterEnable(), so a dwell/pause applied during the new life's first frames is never undone.
+        // externallyPaused is intentionally left alone (it only gates arrival detection).
+        externallyHaltMovement = false;
+        externallyFreezeAnimator = false;
+
         moving = false;
         SafeSetIsStopped(true);
 

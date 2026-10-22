@@ -9,7 +9,11 @@
 //
 // Improvements in this file:
 // - Subscribe to MoveToTarget.OnArrived when instructing movement, so arrival is handled immediately via the event.
-// - Keeps distance-based fallback checks in Update() for robustness if the event is missed.
+// - Arrival at a directed waypoint is decided in ONE place: MoveToTarget (OnArrived), using the per-leg radius
+//   set from 'arriveTolerance' in MoveToCurrent(). Update() no longer polls the waypoint distance when a
+//   MoveToTarget exists (that second, independent 0.6 m check used to pre-empt the mover's 0.2 m arrival, so
+//   UncertainBehavior never received OnArrived before a dwell). A distance check remains only for a prefab
+//   without MoveToTarget.
 // - Preserves attractor capacity/dwell semantics and all existing public APIs.
 //
 // Notes:
@@ -99,6 +103,9 @@ public class PedestrianAgent : MonoBehaviour
     float dwellTime = 5f;
 
     // tuning
+    [Tooltip("Canonical arrival radius (m) for directed itinerary waypoints. Handed to MoveToTarget as the per-leg " +
+             "arrival radius (MoveToTarget.SetLegArriveRadius), so MoveToTarget's OnArrived event fires at this " +
+             "distance. Not used by undirected wandering (wanderLookAheadDistance) or by UncertainBehavior detours.")]
     public float arriveTolerance = 0.6f; // consider arrived if within this distance
 
     // -----------------------------------------------------------------------------------------------
@@ -182,6 +189,10 @@ public class PedestrianAgent : MonoBehaviour
     // Cached reference to UncertainBehavior (if present) so we can notify it to resume after dwell or on reuse
     UncertainBehavior uncertainBehavior = null;
 
+    // Cached delegate for UncertainBehavior.SetMainTargetRestorer(), created once in Awake() so registering it on
+    // every Initialize() does not allocate. Only registered in undirected mode - see Initialize(SpawnerManager, ...).
+    Func<bool> detourRestorer = null;
+
     // NEW (fix for pooled-agent reactivation race): tracks the coroutine started by BeginMovementWhenReady()
     // so a second call (e.g. rapid re-Initialize on quick pool reuse) can safely cancel the previous wait.
     Coroutine startMovementCoroutine = null;
@@ -222,6 +233,7 @@ public class PedestrianAgent : MonoBehaviour
         // Cache UncertainBehavior if present. We'll call ResumeAfterArrival() when movement is resumed
         // or when the agent is reinitialized (pooled reuse).
         uncertainBehavior = GetComponent<UncertainBehavior>();
+        detourRestorer = ResumeWanderTargetAfterDetour;
 
         // Part 2 undirected wandering: allocate once, reused across every SelectNextWanderPoint() call
         // for the lifetime of this instance (including pooled reuse) to avoid per-call allocation.
@@ -272,7 +284,13 @@ public class PedestrianAgent : MonoBehaviour
         // lighter-weight per-dwell resume in the WaitAtAttractor/PollForCapacity/SimpleDwellThenAdvance
         // coroutines below - this call site needs the full reset instead.)
         if (uncertainBehavior != null)
+        {
             uncertainBehavior.ResetForReuse();
+
+            // Directed mode keeps UncertainBehavior's original snapshot-based main-target restoration: clear any
+            // restorer left over from a previous undirected life of this pooled instance.
+            uncertainBehavior.SetMainTargetRestorer(null);
+        }
 
         // NEW (fix for pooled-agent reactivation race): rather than calling MoveToCurrent() synchronously
         // here (which could race with MoveToTarget's own pooled-reuse re-warp onto the NavMesh, see
@@ -333,7 +351,13 @@ public class PedestrianAgent : MonoBehaviour
 
         // Same full per-life reset as directed mode - a reused pooled instance starts this life clean.
         if (uncertainBehavior != null)
+        {
             uncertainBehavior.ResetForReuse();
+
+            // currentWanderPoint (not a snapshot taken at Detour entry) is the authoritative main target in
+            // undirected mode, so a Detour that ends must resume towards it - see ResumeWanderTargetAfterDetour().
+            uncertainBehavior.SetMainTargetRestorer(detourRestorer);
+        }
 
         // Same "wait for mover ready" deferral as directed mode (see WaitUntilMoverReadyThenMove below),
         // just branching to the initial-Entrance leg (or straight to SelectNextWanderPoint() if there is
@@ -358,8 +382,6 @@ public class PedestrianAgent : MonoBehaviour
         if (state != State.Moving)
             return;
 
-        // If we are using the MoveToTarget.OnArrived event we may have already handled arrival.
-        // Keep polling logic as a fallback for robustness.
         if (itineraryTransforms == null || currentIndex >= itineraryTransforms.Count) return;
         Transform t = itineraryTransforms[currentIndex];
         if (t == null)
@@ -368,37 +390,18 @@ public class PedestrianAgent : MonoBehaviour
             return;
         }
 
-        // When a per-leg physical stop override is active (a random point inside an Attractor Plane),
-        // the distance fallback must measure to THAT point, not to the Plane pivot 't.position' -
-        // otherwise it could fire early as the agent passes near the pivot on the way to the random
-        // point. For every non-attractor leg 'currentLegStopOverride' is null and this is unchanged.
-        Vector3 transformFallbackTarget = currentLegStopOverride ?? t.position;
-
+        // With a MoveToTarget, arrival is event-driven only (OnMoveToArrived). Polling the distance here too
+        // would be a second, independent arrival decision that could start a dwell (PauseExternal) before the
+        // mover emitted - and UncertainBehavior received - its arrival notification.
         if (moveToTarget != null)
-        {
-            if (moveToTarget.IsArrived)
-            {
-                OnReachedWaypoint();
-                return;
-            }
+            return;
 
-            // Additional distance fallback
-            float d = Vector3.Distance(transform.position, transformFallbackTarget);
-            if (d <= arriveTolerance)
-            {
-                OnReachedWaypoint();
-                return;
-            }
-        }
-        else
-        {
-            float d = Vector3.Distance(transform.position, transformFallbackTarget);
-            if (d <= arriveTolerance)
-            {
-                OnReachedWaypoint();
-                return;
-            }
-        }
+        // No MoveToTarget on this prefab: nothing can emit an arrival event, so keep the distance check.
+        // When a per-leg physical stop override is active (a random point inside an Attractor Plane), measure
+        // to THAT point, not to the Plane pivot 't.position'. For every other leg it is null and unchanged.
+        Vector3 transformFallbackTarget = currentLegStopOverride ?? t.position;
+        if (Vector3.Distance(transform.position, transformFallbackTarget) <= arriveTolerance)
+            OnReachedWaypoint();
     }
 
     // -----------------------------------------------------------------------------------------------
@@ -420,6 +423,13 @@ public class PedestrianAgent : MonoBehaviour
         // Defensive - an undirected agent should always be State.Moving (it never transitions to
         // WaitingAtAttractor or Finished on its own), but guard in case ForceFinish() ran this frame.
         if (state != State.Moving)
+            return;
+
+        // While an UncertainBehavior Detour is in progress, MoveToTarget's destination belongs to the temporary
+        // detour point. Do not select a new wandering point (which would call MoveTo() and overwrite it) - and
+        // keep currentWanderPoint untouched so it stays the authoritative main target. When the Detour ends,
+        // UncertainBehavior calls ResumeWanderTargetAfterDetour() and normal selection resumes from here.
+        if (uncertainBehavior != null && uncertainBehavior.IsDetouring)
             return;
 
         // Cooldown gate: prevents SelectNextWanderPoint() (and therefore NavMesh.CalculatePath) from being
@@ -557,6 +567,35 @@ public class PedestrianAgent : MonoBehaviour
             "check that SpawnerManager.wanderingPoints are placed on/near the walkable NavMesh and reachable " +
             "from this agent's current position.");
         nextWanderRetryTime = Time.time + k_WanderRetryBackoffSeconds;
+    }
+
+    /// <summary>
+    /// Registered with UncertainBehavior (undirected mode only) and invoked from UncertainBehavior.ExitCurrentState()
+    /// when a Detour ends. Resumes movement towards the CURRENT main wandering target instead of the position
+    /// snapshot UncertainBehavior took when the Detour began (which is stale if a new point was selected in the
+    /// meantime). Returns true if this agent handled the restore, false to let UncertainBehavior fall back to its
+    /// original snapshot restore (directed mode, or no MoveToTarget).
+    ///   - currentWanderPoint valid: re-issue it via the same MoveToTarget.MoveTo(Transform) overload used
+    ///     everywhere else in undirected mode (clears the stopped state, re-targets the Transform).
+    ///   - currentWanderPoint null/destroyed: select a fresh point now; SelectNextWanderPoint() either issues a
+    ///     validated MoveTo() or backs off, and UpdateUndirectedWandering() keeps retrying while
+    ///     currentWanderPoint is null, so the NPC is never left parked on the old detour destination.
+    /// If the NPC is already inside wanderLookAheadDistance of the point, the next Update() simply selects the
+    /// following point as usual.
+    /// </summary>
+    bool ResumeWanderTargetAfterDetour()
+    {
+        if (!undirectedMode || moveToTarget == null)
+            return false;
+
+        if (currentWanderPoint != null)
+        {
+            moveToTarget.MoveTo(currentWanderPoint);
+            return true;
+        }
+
+        SelectNextWanderPoint();
+        return true;
     }
 
     void WarnNoWanderingPointsOnce()
@@ -711,6 +750,13 @@ public class PedestrianAgent : MonoBehaviour
             moveToTarget.startTransform = null;
             moveToTarget.startPosition = transform.position;
 
+            // Make MoveToTarget's arrival detection live for this leg. The prefab serialises
+            // externallyPaused = true, and a stale pause/halt/freeze flag could also survive from a previous
+            // life of a pooled instance; either would suppress OnArrived, the only arrival path for directed
+            // waypoints. Dwell completion already calls ResumeExternal() immediately before AdvanceItinerary(),
+            // so this changes nothing for later legs.
+            moveToTarget.ResumeExternal();
+
             // ROUTE-PRESERVING STOP OVERRIDE.
             // 'target' remains the itinerary waypoint (the Attractor Plane Transform) and is still the
             // value used by OnReachedWaypoint() / FindAttractorInfo() / the exit test / AdvanceItinerary().
@@ -732,6 +778,7 @@ public class PedestrianAgent : MonoBehaviour
 
                 // Existing public overload - MoveToTarget's movement implementation is NOT modified.
                 moveToTarget.MoveTo(attractorStop);
+                moveToTarget.SetLegArriveRadius(arriveTolerance); // after MoveTo(), which resets it
             }
             else
             {
@@ -743,6 +790,7 @@ public class PedestrianAgent : MonoBehaviour
 
                 // MoveToTarget will handle movement and arrival
                 moveToTarget.MoveTo(target);
+                moveToTarget.SetLegArriveRadius(arriveTolerance); // after MoveTo(), which resets it
             }
         }
         else
@@ -784,10 +832,25 @@ public class PedestrianAgent : MonoBehaviour
     /// </summary>
     void OnMoveToArrived()
     {
+        // MoveTo(Vector3) is also used by an UncertainBehavior Detour, and MoveToTarget fires OnArrived for ANY
+        // target it reaches. Arrival at the temporary detour point is not arrival at the itinerary waypoint:
+        // ignore it (stay subscribed for the real arrival; UncertainBehavior handles its own detour arrival).
+        if (uncertainBehavior != null && uncertainBehavior.IsDetouring)
+            return;
+
+        // Process each leg's arrival once: only while still travelling (not already dwelling / finished).
+        if (state != State.Moving)
+            return;
+
         // Unsubscribe immediately — the next leg will re-subscribe in MoveToCurrent().
         UnsubscribeFromMoveToArrived();
 
-        // Safety: only call the same logic as the polling path.
+        // Make the order explicit: suspend UncertainBehavior BEFORE the dwell pauses the mover, instead of
+        // relying on which OnArrived subscriber happens to run first. Idempotent if its own handler already ran.
+        if (uncertainBehavior != null)
+            uncertainBehavior.NotifyMainTargetArrived();
+
+        // The same dwell / attractor / finish logic as before, now reached through a single arrival path.
         OnReachedWaypoint();
     }
 

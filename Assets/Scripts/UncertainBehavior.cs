@@ -128,6 +128,31 @@ public class UncertainBehavior : MonoBehaviour
     // Flag: when true, uncertain behavior is suspended because we've arrived at the main target
     bool suspendedBecauseArrived = false;
 
+    // Optional hook supplied by the component that owns the NPC's authoritative main target (currently
+    // PedestrianAgent in undirected/Part 2 mode). When a Detour ends, ExitCurrentState() asks it to re-issue the
+    // CURRENT main target instead of restoring the position snapshot taken at Detour entry, which can be stale
+    // if the owner picked a new target in the meantime. Returns true if it handled the restore. Null (the
+    // default, and always the case in directed/Part 3 mode) keeps the original snapshot-restore behaviour.
+    // Held as a delegate so this script does not depend on PedestrianAgent.
+    Func<bool> mainTargetRestorer = null;
+
+    /// <summary>
+    /// True only while a Detour is actually in progress: the component is active and enabled, not suspended by
+    /// an arrival, and the current state is Detour. Used by PedestrianAgent so undirected wandering does not
+    /// reassign MoveToTarget's destination while the temporary detour destination is in control. A stale
+    /// state value left behind by a disabled component (see OnDisable) does not count as detouring.
+    /// </summary>
+    public bool IsDetouring => isActiveAndEnabled && !suspendedBecauseArrived && state == State.Detour;
+
+    /// <summary>
+    /// Registers (or clears, with null) the owner-supplied main-target restorer used when a Detour ends.
+    /// See 'mainTargetRestorer'. Called by PedestrianAgent.Initialize() once per life.
+    /// </summary>
+    public void SetMainTargetRestorer(Func<bool> restorer)
+    {
+        mainTargetRestorer = restorer;
+    }
+
     // ---- Look-around (Hesitate) runtime state ----
     // The look-around only offsets the yaw of the head/neck bone in LateUpdate (on top of the animated pose).
     // The root Transform is never rotated here, so MoveToTarget stays the sole writer of root rotation.
@@ -521,6 +546,7 @@ public class UncertainBehavior : MonoBehaviour
         Vector3 mainTarget = GetCurrentMainTarget();
 
         // If we saved a main target at detour start, prefer that (ensures we resume original goal).
+        bool endingDetour = haveSavedMainTarget;
         if (haveSavedMainTarget)
         {
             mainTarget = mainTargetOnDetourStart;
@@ -536,12 +562,21 @@ public class UncertainBehavior : MonoBehaviour
             // resume external control
             moveController.ResumeExternal();
 
-            // re-assert main target to ensure MoveToTarget will set destination/path again
-            // Avoid re-issuing MoveTo if already heading to roughly the same target (distance threshold).
-            Vector3 currentTarget = moveController.targetTransform != null ? moveController.targetTransform.position : moveController.targetPosition;
-            if (Vector3.Distance(currentTarget, mainTarget) > k_DestCompareThreshold)
+            // When a Detour is ending and the owner of the main target registered a restorer (undirected/Part 2
+            // wandering), let it re-issue its CURRENT target. The snapshot in 'mainTarget' may be stale if the
+            // owner chose a new target after the Detour began. Without a restorer (directed mode) the original
+            // snapshot restore below is unchanged.
+            bool restoredByOwner = endingDetour && mainTargetRestorer != null && mainTargetRestorer();
+
+            if (!restoredByOwner)
             {
-                moveController.MoveTo(mainTarget);
+                // re-assert main target to ensure MoveToTarget will set destination/path again
+                // Avoid re-issuing MoveTo if already heading to roughly the same target (distance threshold).
+                Vector3 currentTarget = moveController.targetTransform != null ? moveController.targetTransform.position : moveController.targetPosition;
+                if (Vector3.Distance(currentTarget, mainTarget) > k_DestCompareThreshold)
+                {
+                    moveController.MoveTo(mainTarget);
+                }
             }
         }
         else if (enableLogging)
@@ -757,6 +792,19 @@ public class UncertainBehavior : MonoBehaviour
             moveController.OnArrived -= onMainArrivalHandler;
             onMainArrivalHandler = null;
         }
+    }
+
+    /// <summary>
+    /// Called by PedestrianAgent when MoveToTarget reports arrival at the MAIN itinerary waypoint, BEFORE it begins
+    /// a dwell (PauseExternal). Guarantees this component is suspended - and any active Pause/Hesitate/Slow is
+    /// cleanly exited - before the dwell pauses the mover, independent of the order in which the OnArrived
+    /// subscribers happen to run (ExitCurrentState() calls ResumeExternal(), which would otherwise undo a dwell
+    /// pause if it ran second). Idempotent: if our own OnArrived handler already ran, this is a no-op. Ignored
+    /// during a Detour, exactly like the OnArrived handler (a Detour arrival is not a main-target arrival).
+    /// </summary>
+    public void NotifyMainTargetArrived()
+    {
+        OnMainArrivedFromMoveController();
     }
 
     // Public API to resume uncertain behavior if you want to re-enable it after arrival (not automatic).

@@ -202146,8 +202146,8 @@ MonoBehaviour:
   agentPrefab: {fileID: 3132995531446026970, guid: c34a3349d586043c09271e3b19db0437, type: 3}
   agentFactory: {fileID: 2139592827}
   defaultProfile: {fileID: 11400000, guid: 8ec1ac8d266554c54874ed3d7f9ce83e, type: 2}
-  spawnInterval: 0.5
-  maxAgents: 50
+  spawnInterval: 0.1
+  maxAgents: 500
   minAttractorsPerAgent: 1
   maxAttractorsPerAgent: 4
   dwellTimeSec: {x: 5, y: 15}
@@ -202165,7 +202165,7 @@ MonoBehaviour:
   - 0
   - -1
   usePooling: 1
-  poolPrewarm: 50
+  poolPrewarm: 500
   navmeshWaitTimeout: 5
   experimentManager: {fileID: 0}
   gateSpawningByTrialState: 1
@@ -223990,7 +223990,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   participantId: 0
-  selectedPart: 2
+  selectedPart: 3
   part2GroupIndex: 0
   part3GroupIndex: 0
   autoStart: 1

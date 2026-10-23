@@ -33,7 +33,8 @@
 // INTERACTIONS
 //   ExperimentManager  -> BeginNpcWarmup / EndNpcWarmup / ResetForNewPart (public), OnTrialStart/End, OnEndPanelShown
 //   AgentFactory       <- ApplyProfileToInstance (speed, appearance, NavMeshAgent shape, UncertainBehavior roll)
-//   PedestrianAgent    <- Initialize; -> OnAgentFinished, TryEnterAttractor / ReleaseAttractor / FindAttractorInfo
+//   PedestrianAgent    <- Initialize; -> OnAgentFinished, TryEnterAttractor / ReleaseAttractor / FindAttractorInfo,
+//                         IsEntrance / TryFindEntranceSpawnPosition (distributed placement around an Entrance)
 //   MoveToTarget       <- PauseExternal / ResumeExternal (trial pause, End-Panel hard stop)
 //   DataCaptureManager <- AgentSpawned / AgentDespawned / ActiveAgents (observer only)
 //
@@ -69,8 +70,8 @@ public class SpawnerManager : MonoBehaviour
 
     // Inspector order = declaration order. Sections, top to bottom:
     //   References | Part 3 Itinerary Stops | Part 2 Itinerary Stops | Spawn Configuration & Population Limit |
-    //   Spawn Interval & Position Sampling | Object Pooling & Prewarm | Agent Profile & NPC Configuration |
-    //   Experiment / Trial Spawn Gates | Debug & Diagnostics
+    //   Spawn Interval & Position Sampling | Entrance Spawn Distribution | Object Pooling & Prewarm |
+    //   Agent Profile & NPC Configuration | Experiment / Trial Spawn Gates | Debug & Diagnostics
     // The movement mode (Part 2 vs Part 3 itinerary) is NOT a field here: it is pulled per Part from
     // ExperimentManager.CurrentPartConfig.npcDirectedMovement (see ActiveMovementMode()). Attractor capacity is a
     // per-element field of 'attractors' (AttractorInfo.capacity). Part 1 spawns no NPCs by default, so no setting here
@@ -146,6 +147,21 @@ public class SpawnerManager : MonoBehaviour
     [Tooltip("Vertical offsets (relative to entrance Y) to try when NavMesh.SamplePosition fails to find a NavMesh from the projected ground point.")]
     public float[] verticalOffsets = new float[] { 2.0f, 1.0f, 0.5f, 0.0f, -1.0f };
 
+    [Header("Entrance Spawn Distribution")]
+    [Tooltip("Horizontal (XZ) radius in metres around the NPC's assigned Entrance within which it is placed at the " +
+             "start of its itinerary, instead of on the exact Entrance coordinate. Candidates are valid NavMesh points " +
+             "inside this disc that are locally connected to the Entrance and, where possible, clear of other NPCs " +
+             "(centre-to-centre distance of at least two runtime agent radii plus a small margin). The sampled NavMesh " +
+             "height is kept. The Entrance itself, the route and the exit are never changed. 0 = disabled: NPCs are " +
+             "placed exactly as before (useful as the control condition in A/B tests).")]
+    [Min(0f)]
+    public float entranceSpawnRadius = 2.5f;
+    [Tooltip("Maximum number of candidate positions evaluated per placement (bounded - never loops indefinitely). " +
+             "The first candidate with enough clearance is used; otherwise the least-crowded valid candidate; if no " +
+             "candidate is a valid NavMesh point the placement fails and PedestrianAgent retries a few times.")]
+    [Min(1)]
+    public int entranceSpawnMaxAttempts = 12;
+
     [Header("Object Pooling & Prewarm")]
     [Tooltip("Reuse NPC instances instead of destroying them when they finish.")]
     public bool usePooling = true;
@@ -216,6 +232,20 @@ public class SpawnerManager : MonoBehaviour
     // Reused buffer for BuildWanderingItinerary()'s leg reachability checks (created lazily on first use).
     private NavMeshPath routeCheckPath;
     private float nextRouteWarnTime = 0f;
+
+    // Entrance spawn distribution (see TryFindEntranceSpawnPosition). A private System.Random is used so the
+    // UnityEngine.Random sequence that drives route generation is never perturbed (same approach as AttractorDwell).
+    private System.Random entranceRng;
+    private readonly List<Vector3> entranceNeighbourBuffer = new List<Vector3>(64);
+    private Vector3[] entranceCornerBuffer;
+    private const float k_EntranceClearanceMargin = 0.1f;     // added to 2 x runtime agent radius
+    private const float k_EntranceBaseSampleDistance = 2f;     // snaps the Entrance itself onto the NavMesh
+    private const float k_EntranceCandidateSampleDistance = 1f; // per-candidate NavMesh snap distance
+    // lightweight diagnostics (aggregate counters; a summary is logged every 100 placements when enableDebugLogs)
+    private int entrancePlacements, entranceCrowdedPlacements, entranceFailedPlacements;
+    private long entranceAttemptsTotal;
+    private float entranceOffsetTotal;
+    private float nextEntranceWarnTime = 0f;
 
     /// <summary>Read-only view of the currently-alive (spawned, not finished) agent GameObjects.</summary>
     public IReadOnlyList<GameObject> ActiveAgents => activeAgents;
@@ -801,6 +831,187 @@ public class SpawnerManager : MonoBehaviour
             if (enableDebugLogs) Debug.LogWarning("SpawnerManager: failed to sample NavMesh near spawn origin. Using sampling origin position as fallback for spawn position.");
         }
         return spawnPos;
+    }
+
+    /// <summary>True when NPCs are placed at distributed positions around their Entrance (entranceSpawnRadius &gt; 0).</summary>
+    public bool EntranceSpawnDistributionEnabled => entranceSpawnRadius > 0f;
+
+    /// <summary>True if 't' is one of the configured entrances (used by PedestrianAgent to decide whether itinerary[0]
+    /// is an Entrance that should be distributed, as opposed to the StartPoint fallback or an attractor).</summary>
+    public bool IsEntrance(Transform t)
+    {
+        if (t == null || entrances == null) return false;
+        for (int i = 0; i < entrances.Length; i++)
+            if (entrances[i] == t) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Finds a position for 'self' near 'entrance' instead of on the exact Entrance coordinate. Called by
+    /// PedestrianAgent at the moment it relocates the NPC (so the chosen position is applied immediately and is
+    /// visible to the clearance check of the very next placement). Does not move anything itself.
+    ///
+    /// Algorithm (bounded by entranceSpawnMaxAttempts):
+    ///   1. Gather the live NPCs (activeAgents, excluding 'self') within radius + minSeparation of the Entrance.
+    ///   2. Draw a random point in the horizontal disc of entranceSpawnRadius around the Entrance (area-uniform) and
+    ///      snap it with NavMesh.SamplePosition (keeping the sampled NavMesh height).
+    ///   3. Reject it unless it is still inside the disc (horizontal XZ distance) and is locally connected to the
+    ///      Entrance by a short NavMesh path (so it cannot land on the far side of a wall or on a disconnected
+    ///      surface).
+    ///   4. Accept the first candidate whose nearest live NPC is at least minSeparation away, where minSeparation =
+    ///      2 x the runtime NavMeshAgent.radius (the AgentProfile overrides the prefab value) + a small margin.
+    ///      Otherwise remember the least-crowded valid candidate.
+    ///   5. After the last attempt use that least-crowded candidate (counted as a 'crowded' placement). If no
+    ///      candidate was a valid NavMesh point, return false: the caller retries later and never falls back to
+    ///      stacking everyone on the exact Entrance coordinate.
+    /// </summary>
+    public bool TryFindEntranceSpawnPosition(Transform entrance, GameObject self, out Vector3 position)
+    {
+        position = entrance != null ? entrance.position : Vector3.zero;
+        if (entrance == null || entranceSpawnRadius <= 0f)
+            return false;
+
+        Vector3 origin = entrance.position;
+        float radius = entranceSpawnRadius;
+        float radiusSqr = radius * radius;
+
+        // Runtime agent radius (AgentFactory/ApplyAgentProfile overwrite the prefab's 0.2), not the prefab value.
+        float agentRadius = 0.3f;
+        NavMeshAgent selfAgent = self != null ? self.GetComponent<NavMeshAgent>() : null;
+        if (selfAgent != null) agentRadius = selfAgent.radius;
+        else if (defaultProfile != null) agentRadius = defaultProfile.agentRadius;
+        float minSeparation = 2f * agentRadius + k_EntranceClearanceMargin;
+        float minSeparationSqr = minSeparation * minSeparation;
+
+        // 1. Live neighbours near this Entrance (one pass over the existing live-agent list).
+        entranceNeighbourBuffer.Clear();
+        float gather = radius + minSeparation;
+        float gatherSqr = gather * gather;
+        for (int i = 0; i < activeAgents.Count; i++)
+        {
+            GameObject go = activeAgents[i];
+            if (go == null || go == self) continue;
+            Vector3 p = go.transform.position;
+            float dx = p.x - origin.x, dz = p.z - origin.z;
+            if (dx * dx + dz * dz <= gatherSqr) entranceNeighbourBuffer.Add(p);
+        }
+
+        // The Entrance itself, snapped onto the NavMesh, is the reference for height and local connectivity.
+        NavMeshHit baseHit;
+        bool hasBase = NavMesh.SamplePosition(origin, out baseHit, k_EntranceBaseSampleDistance, NavMesh.AllAreas);
+        float sampleY = hasBase ? baseHit.position.y : origin.y;
+
+        if (entranceRng == null)
+            entranceRng = new System.Random(unchecked(System.Environment.TickCount * 397) ^ GetInstanceID());
+
+        int attempts = Mathf.Max(1, entranceSpawnMaxAttempts);
+        bool found = false, clear = false;
+        Vector3 best = origin;
+        float bestNearestSqr = -1f;
+        int used = 0;
+
+        for (int a = 0; a < attempts; a++)
+        {
+            used++;
+
+            // 2. Area-uniform random point in the horizontal disc, snapped to the NavMesh.
+            float angle = (float)(entranceRng.NextDouble() * 6.283185307179586);
+            float r = radius * Mathf.Sqrt((float)entranceRng.NextDouble());
+            Vector3 probe = new Vector3(origin.x + Mathf.Cos(angle) * r, sampleY, origin.z + Mathf.Sin(angle) * r);
+
+            NavMeshHit hit;
+            if (!NavMesh.SamplePosition(probe, out hit, k_EntranceCandidateSampleDistance, NavMesh.AllAreas))
+                continue;
+
+            // 3. Must stay inside the intended horizontal area and be locally connected to the Entrance.
+            float hx = hit.position.x - origin.x, hz = hit.position.z - origin.z;
+            if (hx * hx + hz * hz > radiusSqr)
+                continue;
+            if (hasBase && !IsLocallyReachable(baseHit.position, hit.position, 2f * radius + 1f))
+                continue;
+
+            // 4. Clearance: squared horizontal distance to the nearest live neighbour.
+            float nearestSqr = float.MaxValue;
+            for (int n = 0; n < entranceNeighbourBuffer.Count; n++)
+            {
+                float ex = entranceNeighbourBuffer[n].x - hit.position.x;
+                float ez = entranceNeighbourBuffer[n].z - hit.position.z;
+                float d = ex * ex + ez * ez;
+                if (d < nearestSqr) nearestSqr = d;
+            }
+
+            if (nearestSqr > bestNearestSqr)
+            {
+                bestNearestSqr = nearestSqr;
+                best = hit.position;
+                found = true;
+            }
+
+            if (nearestSqr >= minSeparationSqr)
+            {
+                clear = true;
+                break;
+            }
+        }
+
+        if (!found)
+        {
+            entranceFailedPlacements++;
+            if (enableDebugLogs && Time.time >= nextEntranceWarnTime)
+            {
+                nextEntranceWarnTime = Time.time + 2f;
+                Debug.LogWarning($"[SpawnerManager][EntrancePlacement] No valid NavMesh position within {radius:F1} m of " +
+                    $"Entrance '{entrance.name}' for {(self != null ? self.name : "NPC")} after {used} attempts; the NPC will retry. " +
+                    "Check the Entrance is on/near the NavMesh or increase entranceSpawnRadius.");
+            }
+            return false;
+        }
+
+        position = best;
+
+        // Diagnostics: aggregate counters, a crowded-placement warning (throttled) and a summary every 100 placements.
+        entrancePlacements++;
+        entranceAttemptsTotal += used;
+        float offX = best.x - origin.x, offZ = best.z - origin.z;
+        float offset = Mathf.Sqrt(offX * offX + offZ * offZ);
+        entranceOffsetTotal += offset;
+        if (!clear)
+        {
+            entranceCrowdedPlacements++;
+            if (enableDebugLogs && Time.time >= nextEntranceWarnTime)
+            {
+                nextEntranceWarnTime = Time.time + 2f;
+                Debug.LogWarning($"[SpawnerManager][EntrancePlacement] {(self != null ? self.name : "NPC")} at Entrance '{entrance.name}': " +
+                    $"no candidate had {minSeparation:F2} m clearance in {used} attempts; used the least-crowded one " +
+                    $"(offset {offset:F2} m, nearest NPC {(bestNearestSqr >= float.MaxValue ? -1f : Mathf.Sqrt(bestNearestSqr)):F2} m).");
+            }
+        }
+        if (enableDebugLogs && entrancePlacements % 100 == 0)
+        {
+            Debug.Log($"[SpawnerManager][EntrancePlacement] placements={entrancePlacements} crowded={entranceCrowdedPlacements} " +
+                $"failed={entranceFailedPlacements} avgAttempts={(float)entranceAttemptsTotal / entrancePlacements:F1} " +
+                $"avgOffset={entranceOffsetTotal / entrancePlacements:F2} m (radius {radius:F1} m, minSeparation {minSeparation:F2} m)");
+        }
+
+        return true;
+    }
+
+    // True if a complete NavMesh path joins the two points and is no longer than 'maxLength' (bounded, allocation-free).
+    private bool IsLocallyReachable(Vector3 from, Vector3 to, float maxLength)
+    {
+        if (routeCheckPath == null) routeCheckPath = new NavMeshPath();
+        if (!NavMesh.CalculatePath(from, to, NavMesh.AllAreas, routeCheckPath) ||
+            routeCheckPath.status != NavMeshPathStatus.PathComplete)
+            return false;
+
+        if (entranceCornerBuffer == null) entranceCornerBuffer = new Vector3[16];
+        int count = routeCheckPath.GetCornersNonAlloc(entranceCornerBuffer);
+        if (count >= entranceCornerBuffer.Length) return false; // implausibly winding for a short local hop
+
+        float length = 0f;
+        for (int i = 1; i < count; i++)
+            length += Vector3.Distance(entranceCornerBuffer[i - 1], entranceCornerBuffer[i]);
+        return length <= maxLength;
     }
 
     /// <summary>

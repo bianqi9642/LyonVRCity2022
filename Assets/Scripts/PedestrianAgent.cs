@@ -15,11 +15,23 @@
 //   NpcMovementMode.Part2WanderingItinerary   Entrance -> wandering points -> Exit
 //     - Index 0 (the entrance) is only the placement point: the NPC is relocated there instantly
 //       (MoveToTarget.TeleportTo) - not walked - and immediately continues to the first wandering point.
+//       (See 'Entrance placement' below for WHERE near the entrance.)
 //     - Intermediate wandering points are NOT completed by an arrival event and have no dwell: as soon as the NPC
 //       is within 'wanderLookAheadDistance' of the current stop, the next list entry is issued (before the
 //       mover's own tighter arrival threshold would bring the NPC to a stop), so movement reads as continuous.
 //     - Only the last entry (the exit) is completed through MoveToTarget.OnArrived, exactly like Part 3, and
 //       finishes the NPC. No AttractorDwell / capacity logic is ever applied to wandering points.
+//
+// Entrance placement (both modes): when SpawnerManager.entranceSpawnRadius > 0 and itinerary[0] is a configured
+// Entrance, the NPC is relocated to a NavMesh position chosen by SpawnerManager.TryFindEntranceSpawnPosition inside
+// that radius (preferring clearance from live NPCs) instead of onto the exact Entrance coordinate. The placement
+// stands in for 'reaching' the Entrance: the itinerary continues with the entry after it, and the Entrance itself
+// (a route waypoint, never moved) is not walked to. This is done explicitly here in BOTH modes because the Part 3
+// first life used to be snapped onto the exact Entrance by MoveToTarget.Start() as a side effect of
+// MoveTo(Transform) recording the target as 'startTransform'; SyncMoverStartToCurrentPosition() now keeps that
+// snap from happening. If no valid position is found the placement is retried a few times (bounded), then the NPC
+// is finished (returned to the pool) - it is never stacked on the exact Entrance coordinate. With
+// entranceSpawnRadius <= 0 (or when itinerary[0] is not an Entrance) the original behaviour is unchanged.
 //
 // Shared rules (both modes):
 //   - Arrival is decided in ONE place per waypoint type: the mover's OnArrived event (Part 3 waypoints, Part 2
@@ -133,6 +145,18 @@ public class PedestrianAgent : MonoBehaviour
     /// internal pacing safeguard, not a behavioural tuning parameter.</summary>
     const float k_WanderRetryBackoffSeconds = 0.5f;
 
+    // -----------------------------------------------------------------------------------------------
+    // Entrance placement retry state (both modes; see 'Entrance placement' in the file header)
+    // -----------------------------------------------------------------------------------------------
+
+    /// <summary>True while the NPC is waiting to retry a failed entrance placement (no valid NavMesh position was
+    /// found around the Entrance). Update() drives the retries; no leg has been issued yet.</summary>
+    bool awaitingEntrancePlacement = false;
+    int entrancePlacementRetries = 0;
+    float nextEntrancePlacementTime = 0f;
+    const int k_MaxEntrancePlacementRetries = 8;
+    const float k_EntrancePlacementRetrySeconds = 0.25f;
+
     // -----------------------------
     // Unique ID implementation
     // -----------------------------
@@ -245,6 +269,8 @@ public class PedestrianAgent : MonoBehaviour
         this.currentLegStopOverride = null;
         this.wanderingStarted = false;
         this.nextWanderRetryTime = -1f;
+        this.awaitingEntrancePlacement = false;
+        this.entrancePlacementRetries = 0;
         if (IsWanderingItinerary)
             this.wanderLookAheadDistance = Mathf.Max(0.01f, lookAheadDistance);
 
@@ -285,6 +311,13 @@ public class PedestrianAgent : MonoBehaviour
         // Only perform leg progression while moving
         if (state != State.Moving)
             return;
+
+        // Waiting to retry a failed entrance placement: nothing else happens until the NPC has been placed.
+        if (awaitingEntrancePlacement)
+        {
+            RetryEntrancePlacement();
+            return;
+        }
 
         if (itineraryTransforms == null || currentIndex >= itineraryTransforms.Count) return;
 
@@ -374,12 +407,22 @@ public class PedestrianAgent : MonoBehaviour
         }
 
         Transform entrance = itineraryTransforms[0];
-        if (moveToTarget != null && entrance != null)
+        if (UsesDistributedEntrancePlacement(entrance))
         {
+            if (!PlaceNearEntrance(entrance))
+            {
+                ScheduleEntrancePlacementRetry();
+                return;
+            }
+        }
+        else if (moveToTarget != null && entrance != null)
+        {
+            // Original exact placement: distribution disabled (entranceSpawnRadius <= 0) or itinerary[0] is not an Entrance.
             moveToTarget.TeleportTo(entrance.position);
             SyncMoverStartToCurrentPosition();
         }
 
+        awaitingEntrancePlacement = false;
         wanderingStarted = true;
         AdvanceWanderingItinerary(); // currentIndex 0 (entrance) -> first reachable stop
     }
@@ -472,6 +515,90 @@ public class PedestrianAgent : MonoBehaviour
         if (moveToTarget == null) return;
         moveToTarget.startTransform = null;
         moveToTarget.startPosition = transform.position;
+    }
+
+    // -----------------------------------------------------------------------------------------------
+    // Entrance placement (both modes)
+    // -----------------------------------------------------------------------------------------------
+
+    /// <summary>True if itinerary[0] ('first') should be replaced by a distributed position around it: distribution is
+    /// enabled in SpawnerManager and 'first' really is one of its configured Entrances (not the StartPoint fallback
+    /// or an attractor).</summary>
+    bool UsesDistributedEntrancePlacement(Transform first)
+    {
+        return moveToTarget != null && first != null && manager != null
+            && manager.EntranceSpawnDistributionEnabled && manager.IsEntrance(first);
+    }
+
+    /// <summary>
+    /// Relocates the NPC to a distributed NavMesh position near 'entrance' (TeleportTo = transform + NavMeshAgent.Warp
+    /// in one call, so no stale path or velocity survives) and keeps the mover's start fields equal to that position.
+    /// Returns false if SpawnerManager found no valid position; nothing has been moved in that case.
+    /// </summary>
+    bool PlaceNearEntrance(Transform entrance)
+    {
+        Vector3 position;
+        if (!manager.TryFindEntranceSpawnPosition(entrance, gameObject, out position))
+            return false;
+
+        moveToTarget.TeleportTo(position);
+        SyncMoverStartToCurrentPosition();
+        return true;
+    }
+
+    void ScheduleEntrancePlacementRetry()
+    {
+        awaitingEntrancePlacement = true;
+        nextEntrancePlacementTime = Time.time + k_EntrancePlacementRetrySeconds;
+    }
+
+    // Driven from Update() while awaitingEntrancePlacement. Bounded: after k_MaxEntrancePlacementRetries failed
+    // retries the NPC is finished (returned to the pool) rather than stacked on the exact Entrance coordinate. This runs
+    // from Update(), i.e. after SpawnerManager has registered the NPC, so the pool return is always seen.
+    void RetryEntrancePlacement()
+    {
+        if (Time.time < nextEntrancePlacementTime)
+            return;
+
+        if (++entrancePlacementRetries > k_MaxEntrancePlacementRetries)
+        {
+            awaitingEntrancePlacement = false;
+            Debug.LogWarning($"[PedestrianAgent][{agentID}] No valid spawn position around its Entrance after " +
+                $"{k_MaxEntrancePlacementRetries} retries; skipping this NPC (returned to the pool).");
+            Finish();
+            return;
+        }
+
+        awaitingEntrancePlacement = false; // the Begin* method re-arms it if placement fails again
+        StartItinerary();
+    }
+
+    /// <summary>
+    /// Part 3: first movement command of a life. With distributed entrance placement the NPC is placed near its
+    /// Entrance and the placement stands in for reaching it, so the itinerary continues with the entry after the
+    /// Entrance (no leg back to the exact Entrance coordinate). Otherwise (distribution disabled, or itinerary[0] is
+    /// not an Entrance) the original behaviour is kept: MoveToCurrent() towards itinerary[0].
+    /// </summary>
+    void BeginAttractorItinerary()
+    {
+        Transform first = (itineraryTransforms != null && itineraryTransforms.Count >= 2) ? itineraryTransforms[0] : null;
+
+        if (UsesDistributedEntrancePlacement(first))
+        {
+            if (!PlaceNearEntrance(first))
+            {
+                ScheduleEntrancePlacementRetry();
+                return;
+            }
+
+            awaitingEntrancePlacement = false;
+            AdvanceItinerary();                 // currentIndex 0 (Entrance) -> 1, then MoveToCurrent()
+            SyncMoverStartToCurrentPosition();  // MoveTo(Transform) records the new target as startTransform: stop
+                                                // a first-life MoveToTarget.Start() from snapping onto it
+            return;
+        }
+
+        MoveToCurrent();
     }
 
     /// <summary>
@@ -589,7 +716,7 @@ public class PedestrianAgent : MonoBehaviour
         if (IsWanderingItinerary)
             BeginWanderingItinerary();
         else
-            MoveToCurrent();
+            BeginAttractorItinerary();
     }
 
     /// <summary>
@@ -1065,6 +1192,8 @@ public class PedestrianAgent : MonoBehaviour
         // next Initialize() call always resets this explicitly anyway; this is a defensive tidy-up).
         wanderingStarted = false;
         nextWanderRetryTime = -1f;
+        awaitingEntrancePlacement = false;
+        entrancePlacementRetries = 0;
     }
 
     void OnDestroy()

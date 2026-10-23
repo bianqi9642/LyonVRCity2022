@@ -17088,6 +17088,10 @@ PrefabInstance:
       propertyPath: m_Name
       value: XR Interaction Setup
       objectReference: {fileID: 0}
+    - target: {fileID: 7690080512698956842, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
+      propertyPath: m_LocomotionVignetteProviders.Array.data[3].m_LocomotionProvider
+      value: 
+      objectReference: {fileID: 560509426}
     - target: {fileID: 9014170783809206330, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
       propertyPath: m_BackGroundColor.a
       value: 1
@@ -17120,19 +17124,15 @@ PrefabInstance:
       propertyPath: m_MaxRaycastDistance
       value: 100
       objectReference: {fileID: 0}
+    - target: {fileID: 9032954039820430273, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
+      propertyPath: m_RaycastMask.m_Bits
+      value: 2147483745
+      objectReference: {fileID: 0}
     - target: {fileID: 9146015503685400394, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
       propertyPath: m_MaxRaycastDistance
       value: 100
       objectReference: {fileID: 0}
     - target: {fileID: 9146015503685400394, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
-      propertyPath: m_RaycastMask.m_Bits
-      value: 2147483745
-      objectReference: {fileID: 0}
-    - target: {fileID: 7690080512698956842, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
-      propertyPath: m_LocomotionVignetteProviders.Array.data[3].m_LocomotionProvider
-      value:
-      objectReference: {fileID: 560509426}
-    - target: {fileID: 9032954039820430273, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
       propertyPath: m_RaycastMask.m_Bits
       value: 2147483745
       objectReference: {fileID: 0}
@@ -61094,19 +61094,8 @@ MonoBehaviour:
   m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 6df61a9a13528fd4f9365c233cb23bfb, type: 3}
-  m_Name:
-  m_EditorClassIdentifier:
-  m_RaycastTriggerInteraction: 1
-  m_EventMask:
-    serializedVersion: 2
-    m_Bits: 4294967295
-  m_MaxRayIntersections: 10
-  m_EventCamera: {fileID: 560509422}
---- !u!1 &560509427 stripped
-GameObject:
-  m_CorrespondingSourceObject: {fileID: 7169631891049266947, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
-  m_PrefabInstance: {fileID: 156316457}
-  m_PrefabAsset: {fileID: 0}
+  m_Name: 
+  m_EditorClassIdentifier: 
 --- !u!114 &560509426
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -61117,8 +61106,8 @@ MonoBehaviour:
   m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 5db58e38ae044397bf752151289755ba, type: 3}
-  m_Name:
-  m_EditorClassIdentifier:
+  m_Name: 
+  m_EditorClassIdentifier: 
   m_System: {fileID: 0}
   m_DelayTime: 0
   experimentManager: {fileID: 1652900175}
@@ -61130,9 +61119,16 @@ MonoBehaviour:
   requireActiveTrial: 1
   denyWhileFullPanelOpen: 1
   riverPointExclusionRadius: 1
+  routeRiverAnchorRequests: 1
   logRejections: 1
   rejectionLogCooldown: 0.5
+  logRequests: 1
   enableDebugLogs: 0
+--- !u!1 &560509427 stripped
+GameObject:
+  m_CorrespondingSourceObject: {fileID: 7169631891049266947, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
+  m_PrefabInstance: {fileID: 156316457}
+  m_PrefabAsset: {fileID: 0}
 --- !u!1001 &562456426
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -171927,6 +171923,7 @@ MonoBehaviour:
   part3StartGU: {fileID: 1286414815}
   part3StartOE: {fileID: 1870100303}
   part3StartOU: {fileID: 394228928}
+  allowWrongCandidateSelection: 0
   part3ZoneGE:
     buildingA: {fileID: 607749484}
     buildingB: {fileID: 26100205}
@@ -202476,10 +202473,10 @@ MonoBehaviour:
   - {fileID: 1025276686}
   minWanderingPointsPerAgent: 1
   maxWanderingPointsPerAgent: 8
-  wanderLookAheadDistance: 1.5
+  wanderLookAheadDistance: 15
   agentPrefab: {fileID: 3132995531446026970, guid: c34a3349d586043c09271e3b19db0437, type: 3}
-  maxAgents: 500
-  spawnInterval: 0.1
+  maxAgents: 5000
+  spawnInterval: 0.5
   spawnSampleRadius: 1
   spawnSampleMaxAttempts: 8
   groundLayers:
@@ -202493,8 +202490,10 @@ MonoBehaviour:
   - 0.5
   - 0
   - -1
+  entranceSpawnRadius: 5
+  entranceSpawnMaxAttempts: 12
   usePooling: 1
-  poolPrewarm: 500
+  poolPrewarm: 5000
   navmeshWaitTimeout: 5
   agentFactory: {fileID: 2139592827}
   defaultProfile: {fileID: 11400000, guid: 8ec1ac8d266554c54874ed3d7f9ce83e, type: 2}
@@ -224464,7 +224463,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   participantId: 0
-  selectedPart: 3
+  selectedPart: 2
   part2GroupIndex: 0
   part3GroupIndex: 0
   autoStart: 1

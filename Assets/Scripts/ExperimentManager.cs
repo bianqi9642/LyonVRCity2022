@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using UnityEngine;
 
 /// <summary>
@@ -246,6 +247,14 @@ public class ExperimentManager : MonoBehaviour
     public Transform part3StartOE;
     public Transform part3StartOU;
 
+    [Header("Part3 - selection protocol")]
+    [Tooltip("Existing protocol (default, false): while a destination is being searched ONLY its assigned building is " +
+             "selectable, so a wrong-building selection cannot occur. If true, the other candidate of the SAME zone " +
+             "also becomes selectable for the duration of that destination's search window, a selection of it is " +
+             "scored 'wrong_building' (does not resolve the destination; the search continues), and it is disabled " +
+             "again when the window closes. Part 1 targets and all other buildings stay unselectable either way.")]
+    public bool allowWrongCandidateSelection = false;
+
     [Header("Part3 - candidate destination buildings (exactly 2 per zone)")]
     public Part3ZoneTargets part3ZoneGE = new Part3ZoneTargets();
     public Part3ZoneTargets part3ZoneGU = new Part3ZoneTargets();
@@ -296,6 +305,12 @@ public class ExperimentManager : MonoBehaviour
     private bool targetWasSelected;
     private object lastSelectedTargetData;
 
+    // Part 3 selection window: every accepted building selection is queued (in click order) while a destination's
+    // search window is open and scored once per entry by the Part 3 loops. Outside a window nothing is queued, so
+    // stale or unrelated clicks can never be scored later.
+    private readonly Queue<string> pendingSelections = new Queue<string>();
+    private bool selectionWindowOpen;
+
     private enum RunningPart { None, Part1, Part2, Part3 }
     private RunningPart currentRunningPart = RunningPart.None;
     private bool part1ContinuePanelOpen = false;
@@ -311,6 +326,8 @@ public class ExperimentManager : MonoBehaviour
         // Baseline: every Phase 3 candidate building must behave as an ordinary (non-interactable) building
         // until Phase 3 assigns it as a destination. Visibility is NOT touched here.
         SetAllPart3CandidatesInteractable(false);
+
+        ValidateTargetIds();
 
         if (sessionController != null && sessionController.autoStart)
         {
@@ -340,6 +357,9 @@ public class ExperimentManager : MonoBehaviour
         lastSelectedTargetData = targetData;
         Debug.Log("Target selected: " + (targetData ?? "unknown"));
 
+        if (selectionWindowOpen)
+            pendingSelections.Enqueue(targetData != null ? targetData.ToString() : "");
+
         if (currentRunningPart == RunningPart.Part1 && !part1ContinuePanelOpen && uiManager != null)
         {
             part1ContinuePanelOpen = true;
@@ -349,6 +369,35 @@ public class ExperimentManager : MonoBehaviour
             });
         }
     }
+
+    #region Participant teleport observer API (additive; used by GuardedTeleportationProvider)
+
+    /// <summary>
+    /// "Part1" / "Part2" / "Part3" while a Part is running (from part_start until its End Panel is confirmed), else "".
+    /// Read-only view of the existing private state; does not change the state machine.
+    /// </summary>
+    public string RunningPartName => CurrentRunningPartString();
+
+    /// <summary>
+    /// A participant-initiated XRI teleport was EXECUTED. Raised through the existing "teleport" event so the
+    /// data-capture layer treats it like the scripted teleports (same event type and from/to fields); the label
+    /// distinguishes the source. Observation only.
+    /// </summary>
+    public void ReportParticipantTeleport(string sourceLabel, Vector3 fromPos, Vector3 toPos)
+    {
+        RaiseEvt("teleport", label: sourceLabel, stringValue: "XRI", fromPos: fromPos, toPos: toPos);
+    }
+
+    /// <summary>
+    /// A participant-initiated XRI teleport request was REJECTED before the rig moved. Raised as a distinct
+    /// "teleport_rejected" event (never as "teleport"), so rejected attempts cannot be mistaken for displacement.
+    /// </summary>
+    public void ReportParticipantTeleportRejected(string sourceLabel, string reason, Vector3 rigPos, Vector3 attemptedPos)
+    {
+        RaiseEvt("teleport_rejected", label: sourceLabel, stringValue: reason, fromPos: rigPos, toPos: attemptedPos);
+    }
+
+    #endregion
 
     #region Public API to start each part
 
@@ -562,6 +611,8 @@ public class ExperimentManager : MonoBehaviour
 
         // Clean slate: no candidate is interactable (covers a re-run after an interrupted previous Phase 3).
         SetAllPart3CandidatesInteractable(false);
+        selectionWindowOpen = false;
+        pendingSelections.Clear();
 
         // --- 1. Resolve the participant's group (index 0..11 -> Group 1..12). ---
         int groupNumber = 1;
@@ -597,12 +648,15 @@ public class ExperimentManager : MonoBehaviour
 
         string d1AssignedId = GetAssignedTargetId(destination1Building);
         string d2AssignedId = GetAssignedTargetId(destination2Building);
-        bool d1RequireCorrect = !string.IsNullOrEmpty(d1AssignedId);
-        bool d2RequireCorrect = !string.IsNullOrEmpty(d2AssignedId);
-        if (!d1RequireCorrect)
-            Debug.LogError("[ExperimentManager] Part3 Destination 1 building has no TargetSelectable.targetId; any building click will end Destination 1.");
-        if (!d2RequireCorrect)
-            Debug.LogError("[ExperimentManager] Part3 Destination 2 building has no TargetSelectable.targetId; any building click will end Destination 2.");
+        // The expected answer is the assigned building's own identity (TargetSelectable.ResolvedTargetId == the
+        // building's GameObject name). A selection is correct only when its id EQUALS the stage's expected id; if a
+        // destination has no resolvable id nothing can be correct (it is never "any click counts").
+        if (string.IsNullOrEmpty(d1AssignedId))
+            Debug.LogError("[ExperimentManager] Part3 Destination 1 building has no TargetSelectable id; no selection can be scored correct for Destination 1.");
+        if (string.IsNullOrEmpty(d2AssignedId))
+            Debug.LogError("[ExperimentManager] Part3 Destination 2 building has no TargetSelectable id; no selection can be scored correct for Destination 2.");
+        if (!string.IsNullOrEmpty(d1AssignedId) && d1AssignedId == d2AssignedId)
+            Debug.LogError("[ExperimentManager] Part3 Destination 1 and Destination 2 resolve to the same building id '" + d1AssignedId + "'; the stages cannot be scored independently.");
 
         // --- 3b. Generate the target-building preview images for BOTH destinations. ---
         if (uiManager != null)
@@ -656,6 +710,12 @@ public class ExperimentManager : MonoBehaviour
         SetAllPart3CandidatesInteractable(false);
         SetCandidateInteractable(destination1Building, true);
         RaiseEvt("candidate_interactable_on", "Part3", label: "D1", building: destination1Building);
+        GameObject d1Alternate = allowWrongCandidateSelection ? GetAlternateCandidate(d1ZoneTargets, destination1Building) : null;
+        if (d1Alternate != null)
+        {
+            SetCandidateInteractable(d1Alternate, true);
+            RaiseEvt("candidate_interactable_on", "Part3", label: "D1", building: d1Alternate);
+        }
 
         GameObject dest1ShrunkInstance = null;
         if (uiManager != null && uiManagerHasShrunkTemplate())
@@ -663,6 +723,8 @@ public class ExperimentManager : MonoBehaviour
 
         targetWasSelected = false;
         lastSelectedTargetData = null;
+        pendingSelections.Clear();
+        selectionWindowOpen = true;
         bool d1Found = false;
         double d1StartRealtime = Time.realtimeSinceStartupAsDouble;
 
@@ -670,10 +732,13 @@ public class ExperimentManager : MonoBehaviour
                && (Time.realtimeSinceStartupAsDouble - d1StartRealtime) < part3Destination1MaxSeconds
                && (Time.realtimeSinceStartupAsDouble - phaseStartRealtime) < part3TotalMaxSeconds)
         {
-            if (targetWasSelected)
+            // Score every queued selection in click order. correct <=> selected id == this stage's expected id.
+            // Once Destination 1 is found, the remaining queued selections of that frame are discarded, so a
+            // destination can be resolved (and its success event emitted) at most once.
+            while (!d1Found && pendingSelections.Count > 0)
             {
-                string clickedId = lastSelectedTargetData != null ? lastSelectedTargetData.ToString() : "";
-                bool correct = d1RequireCorrect ? (clickedId == d1AssignedId) : true;
+                string clickedId = pendingSelections.Dequeue();
+                bool correct = !string.IsNullOrEmpty(d1AssignedId) && clickedId == d1AssignedId;
 
                 AppendPart3Log("d1_click", groupNumber, def, startPoint, destination1Building, destination2Building,
                     selectedId: clickedId, found: correct,
@@ -681,13 +746,15 @@ public class ExperimentManager : MonoBehaviour
                     notes: correct ? "correct" : "wrong_building");
 
                 if (correct) d1Found = true;
-
-                // Consume the click. A wrong-building click does NOT end the sub-phase and shows no feedback.
-                targetWasSelected = false;
-                lastSelectedTargetData = null;
+                // A wrong-building selection does NOT end the sub-phase and shows no feedback.
             }
             yield return null;
         }
+
+        selectionWindowOpen = false;
+        pendingSelections.Clear();
+        targetWasSelected = false;
+        lastSelectedTargetData = null;
 
         string d1SelectedId = d1Found ? d1AssignedId : "";
         double d1Elapsed = Time.realtimeSinceStartupAsDouble - d1StartRealtime;
@@ -698,6 +765,11 @@ public class ExperimentManager : MonoBehaviour
         // Destination 1 finished: the D1 target is a plain non-interactable building again.
         SetCandidateInteractable(destination1Building, false);
         RaiseEvt("candidate_interactable_off", "Part3", label: "D1", building: destination1Building);
+        if (d1Alternate != null)
+        {
+            SetCandidateInteractable(d1Alternate, false);
+            RaiseEvt("candidate_interactable_off", "Part3", label: "D1", building: d1Alternate);
+        }
 
         AppendPart3Log("d1_result", groupNumber, def, startPoint, destination1Building, destination2Building,
             selectedId: d1SelectedId, found: d1Found, elapsedSeconds: d1Elapsed,
@@ -730,6 +802,12 @@ public class ExperimentManager : MonoBehaviour
             SetAllPart3CandidatesInteractable(false);
             SetCandidateInteractable(destination2Building, true);
             RaiseEvt("candidate_interactable_on", "Part3", label: "D2", building: destination2Building);
+            GameObject d2Alternate = allowWrongCandidateSelection ? GetAlternateCandidate(d2ZoneTargets, destination2Building) : null;
+            if (d2Alternate != null)
+            {
+                SetCandidateInteractable(d2Alternate, true);
+                RaiseEvt("candidate_interactable_on", "Part3", label: "D2", building: d2Alternate);
+            }
 
             GameObject dest2ShrunkInstance = null;
             if (uiManager != null && uiManagerHasShrunkTemplatePart2())
@@ -737,15 +815,19 @@ public class ExperimentManager : MonoBehaviour
 
             targetWasSelected = false;
             lastSelectedTargetData = null;
+            pendingSelections.Clear();
+            selectionWindowOpen = true;
             double d2StartRealtime = Time.realtimeSinceStartupAsDouble;
 
             while (!d2Found
                    && (Time.realtimeSinceStartupAsDouble - phaseStartRealtime) < part3TotalMaxSeconds)
             {
-                if (targetWasSelected)
+                // Same rule as Destination 1, against Destination 2's OWN expected id: a building that was correct
+                // for Destination 1 is not correct here, and a destination resolves at most once.
+                while (!d2Found && pendingSelections.Count > 0)
                 {
-                    string clickedId = lastSelectedTargetData != null ? lastSelectedTargetData.ToString() : "";
-                    bool correct = d2RequireCorrect ? (clickedId == d2AssignedId) : true;
+                    string clickedId = pendingSelections.Dequeue();
+                    bool correct = !string.IsNullOrEmpty(d2AssignedId) && clickedId == d2AssignedId;
 
                     AppendPart3Log("d2_click", groupNumber, def, startPoint, destination1Building, destination2Building,
                         selectedId: clickedId, found: correct,
@@ -753,12 +835,14 @@ public class ExperimentManager : MonoBehaviour
                         notes: correct ? "correct" : "wrong_building");
 
                     if (correct) d2Found = true;
-
-                    targetWasSelected = false;
-                    lastSelectedTargetData = null;
                 }
                 yield return null;
             }
+
+            selectionWindowOpen = false;
+            pendingSelections.Clear();
+            targetWasSelected = false;
+            lastSelectedTargetData = null;
 
             d2SelectedId = d2Found ? d2AssignedId : "";
             d2Elapsed = Time.realtimeSinceStartupAsDouble - d2StartRealtime;
@@ -768,6 +852,11 @@ public class ExperimentManager : MonoBehaviour
             // Destination 2 finished: the D2 target is a plain non-interactable building again.
             SetCandidateInteractable(destination2Building, false);
             RaiseEvt("candidate_interactable_off", "Part3", label: "D2", building: destination2Building);
+            if (d2Alternate != null)
+            {
+                SetCandidateInteractable(d2Alternate, false);
+                RaiseEvt("candidate_interactable_off", "Part3", label: "D2", building: d2Alternate);
+            }
         }
         else
         {
@@ -893,7 +982,43 @@ public class ExperimentManager : MonoBehaviour
         TargetSelectable ts = building.GetComponent<TargetSelectable>();
         if (ts == null) ts = building.GetComponentInChildren<TargetSelectable>(true);
 
-        return (ts != null) ? ts.targetId : null;
+        // ResolvedTargetId is exactly what TargetSelectable.Select() reports on a click, so expected and selected
+        // ids are produced by the same rule.
+        return (ts != null) ? ts.ResolvedTargetId : null;
+    }
+
+    /// <summary>The other candidate of the same zone (the legitimate choice set), or null if there is none.</summary>
+    private GameObject GetAlternateCandidate(Part3ZoneTargets zone, GameObject assigned)
+    {
+        if (zone == null || assigned == null) return null;
+        if (zone.buildingA == assigned) return zone.buildingB;
+        if (zone.buildingB == assigned) return zone.buildingA;
+        return null;
+    }
+
+    /// <summary>
+    /// One-time sanity check of building identities: every TargetSelectable must resolve to a unique, non-empty id
+    /// (the id equals the building's GameObject name). Diagnostic only; never changes state.
+    /// </summary>
+    private void ValidateTargetIds()
+    {
+        TargetSelectable[] all = FindObjectsOfType<TargetSelectable>(true);
+        var seen = new Dictionary<string, TargetSelectable>();
+        for (int i = 0; i < all.Length; i++)
+        {
+            string id = all[i].ResolvedTargetId;
+            if (string.IsNullOrEmpty(id))
+            {
+                Debug.LogError("[ExperimentManager] TargetSelectable on '" + all[i].name + "' has an empty id.", all[i]);
+                continue;
+            }
+            if (!string.IsNullOrEmpty(all[i].targetId) && all[i].targetId != all[i].name)
+                Debug.LogWarning("[ExperimentManager] TargetSelectable id '" + all[i].targetId + "' differs from its GameObject name '" + all[i].name + "'.", all[i]);
+            if (seen.TryGetValue(id, out TargetSelectable other))
+                Debug.LogError("[ExperimentManager] Duplicate TargetSelectable id '" + id + "' on '" + other.name + "' and '" + all[i].name + "': building identity is ambiguous.", all[i]);
+            else
+                seen[id] = all[i];
+        }
     }
 
     /// <summary>

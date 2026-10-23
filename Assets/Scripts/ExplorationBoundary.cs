@@ -331,13 +331,42 @@ public class ExplorationBoundary : MonoBehaviour
         if (!ProtectionActive) return true;
         if (areaVolumes == null || areaVolumes.Length == 0) return true;   // fail-open (warned at Start)
 
-        if (!IsInsideArea(destination)) return false;
+        return IsInsideAreaWithInsetMargin(destination);
+    }
+
+    /// <summary>
+    /// Authoritative "may a participant LAND here" test for teleports that are not routed through
+    /// RiverTeleportPoint (used by GuardedTeleportationProvider for XRI anchors/areas). Same geometry and inset
+    /// margin as IsTeleportDestinationAllowed, but it does NOT depend on the part-window state (the caller decides
+    /// when the restriction applies, from the running Part) and it FAILS CLOSED when no Area Volume is assigned.
+    /// Respects the 'useTeleportRestriction' master switch (false = no area restriction, as for river teleports).
+    /// </summary>
+    public bool IsLandingPositionAllowed(Vector3 landing, out string reason)
+    {
+        reason = "";
+        if (!useTeleportRestriction) return true;
+        if (areaVolumes == null || areaVolumes.Length == 0)
+        {
+            reason = "no_area_volumes";
+            return false;
+        }
+        if (!IsInsideAreaWithInsetMargin(landing))
+        {
+            reason = "outside_exploration_area";
+            return false;
+        }
+        return true;
+    }
+
+    private bool IsInsideAreaWithInsetMargin(Vector3 p)
+    {
+        if (!IsInsideArea(p)) return false;
         if (teleportInsetMargin > 0f)
         {
-            if (!IsInsideArea(destination + new Vector3(teleportInsetMargin, 0, 0))) return false;
-            if (!IsInsideArea(destination + new Vector3(-teleportInsetMargin, 0, 0))) return false;
-            if (!IsInsideArea(destination + new Vector3(0, 0, teleportInsetMargin))) return false;
-            if (!IsInsideArea(destination + new Vector3(0, 0, -teleportInsetMargin))) return false;
+            if (!IsInsideArea(p + new Vector3(teleportInsetMargin, 0, 0))) return false;
+            if (!IsInsideArea(p + new Vector3(-teleportInsetMargin, 0, 0))) return false;
+            if (!IsInsideArea(p + new Vector3(0, 0, teleportInsetMargin))) return false;
+            if (!IsInsideArea(p + new Vector3(0, 0, -teleportInsetMargin))) return false;
         }
         return true;
     }

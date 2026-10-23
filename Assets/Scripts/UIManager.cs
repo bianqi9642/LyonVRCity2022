@@ -136,6 +136,26 @@ public class UIManager : MonoBehaviour
         return null;
     }
 
+    /// <summary>
+    /// True while a full instruction panel (Start / Continue / End / Destination) instantiated by this manager is
+    /// open. Full panels are active children of this transform that carry a PanelController; the inactive scene
+    /// templates and the head-anchored shrunk HUD copies (re-parented to the head) are not counted.
+    /// Read-only; used by GuardedTeleportationProvider to refuse teleports while the participant must respond.
+    /// </summary>
+    public bool HasOpenFullPanel
+    {
+        get
+        {
+            for (int i = 0; i < transform.childCount; i++)
+            {
+                Transform child = transform.GetChild(i);
+                if (child.gameObject.activeSelf && child.GetComponentInChildren<PanelController>() != null)
+                    return true;
+            }
+            return false;
+        }
+    }
+
     #region Phase 3 target-image API
 
     /// <summary>

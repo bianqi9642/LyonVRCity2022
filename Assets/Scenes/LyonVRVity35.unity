@@ -1788,7 +1788,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 8df59e022c2de42629ba43fe6c59669d, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  targetId: targetA
+  targetId: 69385AE63
   experimentManager: {fileID: 1652900175}
 --- !u!1001 &17000739
 PrefabInstance:
@@ -3200,7 +3200,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 8df59e022c2de42629ba43fe6c59669d, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  targetId: targetA
+  targetId: 69383AC88
   experimentManager: {fileID: 1652900175}
 --- !u!1 &27988738
 GameObject:
@@ -6164,7 +6164,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 8df59e022c2de42629ba43fe6c59669d, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  targetId: targetA
+  targetId: 69383AH88
   experimentManager: {fileID: 1652900175}
 --- !u!1001 &61296775
 PrefabInstance:
@@ -11299,7 +11299,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!4 &101799188
 Transform:
   m_ObjectHideFlags: 0
@@ -17124,11 +17124,24 @@ PrefabInstance:
       propertyPath: m_MaxRaycastDistance
       value: 100
       objectReference: {fileID: 0}
+    - target: {fileID: 9146015503685400394, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
+      propertyPath: m_RaycastMask.m_Bits
+      value: 2147483745
+      objectReference: {fileID: 0}
+    - target: {fileID: 7690080512698956842, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
+      propertyPath: m_LocomotionVignetteProviders.Array.data[3].m_LocomotionProvider
+      value:
+      objectReference: {fileID: 560509426}
+    - target: {fileID: 9032954039820430273, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
+      propertyPath: m_RaycastMask.m_Bits
+      value: 2147483745
+      objectReference: {fileID: 0}
     - target: {fileID: 9168142743249570444, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
       propertyPath: m_MoveSpeed
       value: 1.4
       objectReference: {fileID: 0}
-    m_RemovedComponents: []
+    m_RemovedComponents:
+    - {fileID: 7303196168416792226, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
     m_RemovedGameObjects: []
     m_AddedGameObjects:
     - targetCorrespondingSourceObject: {fileID: 4134505312059479865, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
@@ -17153,6 +17166,12 @@ PrefabInstance:
     - targetCorrespondingSourceObject: {fileID: 9014170783809206332, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
       insertIndex: -1
       addedObject: {fileID: 560509424}
+    - targetCorrespondingSourceObject: {fileID: 9014170783809206332, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
+      insertIndex: -1
+      addedObject: {fileID: 560509425}
+    - targetCorrespondingSourceObject: {fileID: 7169631891049266947, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
+      insertIndex: -1
+      addedObject: {fileID: 560509426}
   m_SourcePrefab: {fileID: 100100000, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
 --- !u!1001 &156635750
 PrefabInstance:
@@ -18902,6 +18921,10 @@ PrefabInstance:
     serializedVersion: 3
     m_TransformParent: {fileID: 518841039}
     m_Modifications:
+    - target: {fileID: 7991192106561393046, guid: b4ffde217659b4d31a081ba62d8edda5, type: 3}
+      propertyPath: m_Enabled
+      value: 0
+      objectReference: {fileID: 0}
     - target: {fileID: 4086534348240863044, guid: b4ffde217659b4d31a081ba62d8edda5, type: 3}
       propertyPath: m_LocalPosition.x
       value: 264.4
@@ -32985,7 +33008,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 8df59e022c2de42629ba43fe6c59669d, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  targetId: targetA
+  targetId: 69385AI6
   experimentManager: {fileID: 1652900175}
 --- !u!1001 &295604937
 PrefabInstance:
@@ -43474,9 +43497,21 @@ PrefabInstance:
       propertyPath: m_LocalEulerAnglesHint.z
       value: 0
       objectReference: {fileID: 0}
+    - target: {fileID: 2213631984131348457, guid: 4e70e30c4b6444b0eab53ab168fc2087, type: 3}
+      propertyPath: m_Layer
+      value: 6
+      objectReference: {fileID: 0}
+    - target: {fileID: 2276133901449172221, guid: 4e70e30c4b6444b0eab53ab168fc2087, type: 3}
+      propertyPath: m_Layer
+      value: 6
+      objectReference: {fileID: 0}
     - target: {fileID: 2378932404282862094, guid: 4e70e30c4b6444b0eab53ab168fc2087, type: 3}
       propertyPath: m_Name
       value: 69385AE77
+      objectReference: {fileID: 0}
+    - target: {fileID: 2378932404282862094, guid: 4e70e30c4b6444b0eab53ab168fc2087, type: 3}
+      propertyPath: m_Layer
+      value: 6
       objectReference: {fileID: 0}
     - target: {fileID: 2378932404282862094, guid: 4e70e30c4b6444b0eab53ab168fc2087, type: 3}
       propertyPath: m_IsActive
@@ -43580,7 +43615,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 8df59e022c2de42629ba43fe6c59669d, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  targetId: targetA
+  targetId: 69385AE77
   experimentManager: {fileID: 1652900175}
 --- !u!1001 &393755241
 PrefabInstance:
@@ -50080,6 +50115,10 @@ PrefabInstance:
     serializedVersion: 3
     m_TransformParent: {fileID: 2059230410}
     m_Modifications:
+    - target: {fileID: 7991192106561393046, guid: b4ffde217659b4d31a081ba62d8edda5, type: 3}
+      propertyPath: m_Enabled
+      value: 0
+      objectReference: {fileID: 0}
     - target: {fileID: 4086534348240863044, guid: b4ffde217659b4d31a081ba62d8edda5, type: 3}
       propertyPath: m_LocalPosition.x
       value: -115.58
@@ -61053,6 +61092,55 @@ MonoBehaviour:
     serializedVersion: 2
     m_Bits: 4294967295
   m_MaxRayIntersections: 0
+--- !u!114 &560509425
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 560509418}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 6df61a9a13528fd4f9365c233cb23bfb, type: 3}
+  m_Name:
+  m_EditorClassIdentifier:
+  m_RaycastTriggerInteraction: 1
+  m_EventMask:
+    serializedVersion: 2
+    m_Bits: 4294967295
+  m_MaxRayIntersections: 10
+  m_EventCamera: {fileID: 560509422}
+--- !u!1 &560509427 stripped
+GameObject:
+  m_CorrespondingSourceObject: {fileID: 7169631891049266947, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
+  m_PrefabInstance: {fileID: 156316457}
+  m_PrefabAsset: {fileID: 0}
+--- !u!114 &560509426
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 560509427}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 5db58e38ae044397bf752151289755ba, type: 3}
+  m_Name:
+  m_EditorClassIdentifier:
+  m_System: {fileID: 0}
+  m_DelayTime: 0
+  experimentManager: {fileID: 1652900175}
+  uiManager: {fileID: 224290818}
+  part1Policy: 0
+  part2Policy: 1
+  part3Policy: 0
+  noPartPolicy: 0
+  requireActiveTrial: 1
+  denyWhileFullPanelOpen: 1
+  riverPointExclusionRadius: 1
+  logRejections: 1
+  rejectionLogCooldown: 0.5
+  enableDebugLogs: 0
 --- !u!1001 &562456426
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -66370,7 +66458,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 8df59e022c2de42629ba43fe6c59669d, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  targetId: targetA
+  targetId: 69383AB59
   experimentManager: {fileID: 1652900175}
 --- !u!1001 &607795842
 PrefabInstance:
@@ -74661,7 +74749,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 8df59e022c2de42629ba43fe6c59669d, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  targetId: targetA
+  targetId: 69382AD14
   experimentManager: {fileID: 1652900175}
 --- !u!1001 &684584791
 PrefabInstance:
@@ -83996,7 +84084,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 8df59e022c2de42629ba43fe6c59669d, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  targetId: targetA
+  targetId: 69382AH38
   experimentManager: {fileID: 1652900175}
 --- !u!1001 &779057578
 PrefabInstance:
@@ -88292,7 +88380,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 8df59e022c2de42629ba43fe6c59669d, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  targetId: targetA
+  targetId: 69382AD61
   experimentManager: {fileID: 1652900175}
 --- !u!1 &807831533
 GameObject:
@@ -108835,7 +108923,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 8df59e022c2de42629ba43fe6c59669d, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  targetId: targetA
+  targetId: 69385AH82
   experimentManager: {fileID: 1652900175}
 --- !u!1001 &1022435589
 PrefabInstance:
@@ -143591,7 +143679,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 8df59e022c2de42629ba43fe6c59669d, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  targetId: targetA
+  targetId: 69382AD82
   experimentManager: {fileID: 1652900175}
 --- !u!1001 &1368753708
 PrefabInstance:
@@ -147473,6 +147561,10 @@ PrefabInstance:
     serializedVersion: 3
     m_TransformParent: {fileID: 2059230410}
     m_Modifications:
+    - target: {fileID: 7991192106561393046, guid: b4ffde217659b4d31a081ba62d8edda5, type: 3}
+      propertyPath: m_Enabled
+      value: 0
+      objectReference: {fileID: 0}
     - target: {fileID: 4086534348240863044, guid: b4ffde217659b4d31a081ba62d8edda5, type: 3}
       propertyPath: m_LocalPosition.x
       value: 0
@@ -154663,6 +154755,10 @@ PrefabInstance:
     serializedVersion: 3
     m_TransformParent: {fileID: 518841039}
     m_Modifications:
+    - target: {fileID: 7991192106561393046, guid: b4ffde217659b4d31a081ba62d8edda5, type: 3}
+      propertyPath: m_Enabled
+      value: 0
+      objectReference: {fileID: 0}
     - target: {fileID: 4086534348240863044, guid: b4ffde217659b4d31a081ba62d8edda5, type: 3}
       propertyPath: m_LocalPosition.x
       value: 318.9
@@ -177566,7 +177662,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 8df59e022c2de42629ba43fe6c59669d, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  targetId: targetA
+  targetId: 69382AE83
   experimentManager: {fileID: 1652900175}
 --- !u!1001 &1709383422
 PrefabInstance:
@@ -193816,7 +193912,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 8df59e022c2de42629ba43fe6c59669d, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  targetId: targetA
+  targetId: 69383AI2
   experimentManager: {fileID: 1652900175}
 --- !u!1 &1870100302
 GameObject:

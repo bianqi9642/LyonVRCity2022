@@ -93,11 +93,19 @@ public class GuardedTeleportationProvider : TeleportationProvider
              "rejected: river points teleport only through RiverTeleportPoint.Select() (pairing, cooldown, boundary, event).")]
     [SerializeField] private float riverPointExclusionRadius = 1f;
 
+    [Tooltip("A request whose destination is on an ENABLED RiverTeleportPoint is not executed as a generic XRI " +
+             "teleport (which would land on the selected point itself). It is handed to RiverTeleportPoint.Select() - " +
+             "pairing, cooldown, boundary check, OnPlayerTeleported - and the XRI request is declined, so one participant " +
+             "action causes exactly one operation. Requests near a river point that is not enabled stay rejected.")]
+    [SerializeField] private bool routeRiverAnchorRequests = true;
+
     [Header("Diagnostics")]
     [Tooltip("Log one concise line per rejected request (rate-limited).")]
     [SerializeField] private bool logRejections = true;
     [SerializeField] private float rejectionLogCooldown = 0.5f;
-    [Tooltip("Log accepted requests too (never per-frame).")]
+    [Tooltip("Log one line per request outcome (accepted / executed / routed to a river point). One line per " +
+             "participant action, never per frame.")]
+    [SerializeField] private bool logRequests = true;
     [SerializeField] private bool enableDebugLogs = false;
 
     private bool trialActive;
@@ -159,13 +167,18 @@ public class GuardedTeleportationProvider : TeleportationProvider
     /// </summary>
     public override bool QueueTeleportRequest(TeleportRequest teleportRequest)
     {
+        // River points are paired-teleport-only: hand the action to RiverTeleportPoint.Select() and decline the
+        // generic request, so the rig is never moved to the selected river point's own anchor position.
+        if (routeRiverAnchorRequests && TryRouteToRiverPoint(teleportRequest))
+            return false;
+
         if (!Evaluate(teleportRequest, out string reason, out Vector3 camLanding, out Vector3 rootLanding))
         {
             OnRequestRejected(teleportRequest, reason, camLanding, rootLanding);
             return false;
         }
 
-        if (enableDebugLogs)
+        if (logRequests || enableDebugLogs)
         {
             Debug.Log($"[GuardedTeleportationProvider] Accepted XRI teleport request to {Fmt(teleportRequest.destinationPosition)} " +
                       $"(head {Fmt(camLanding)}, rig root {Fmt(rootLanding)}, part '{PartName()}').", this);
@@ -277,6 +290,38 @@ public class GuardedTeleportationProvider : TeleportationProvider
         return experimentManager != null ? experimentManager.RunningPartName : "";
     }
 
+    /// <summary>
+    /// If the request's destination coincides (within riverPointExclusionRadius, horizontally) with an enabled
+    /// RiverTeleportPoint, performs that point's own paired teleport and returns true (caller declines the request).
+    /// </summary>
+    private bool TryRouteToRiverPoint(TeleportRequest request)
+    {
+        if (riverPointExclusionRadius <= 0f) return false;
+
+        if (riverPoints == null)
+            riverPoints = FindObjectsOfType<RiverTeleportPoint>(true);
+
+        RiverTeleportPoint best = null;
+        float bestSqr = riverPointExclusionRadius * riverPointExclusionRadius;
+        for (int i = 0; i < riverPoints.Length; i++)
+        {
+            RiverTeleportPoint rp = riverPoints[i];
+            if (rp == null || !rp.isActiveAndEnabled) continue;
+            Vector3 d = rp.transform.position - request.destinationPosition;
+            d.y = 0f;
+            float sqr = d.sqrMagnitude;
+            if (sqr <= bestSqr) { bestSqr = sqr; best = rp; }
+        }
+
+        if (best == null) return false;
+
+        if (logRequests || enableDebugLogs)
+            Debug.Log($"[GuardedTeleportationProvider] XRI request at {Fmt(request.destinationPosition)} routed to RiverTeleportPoint '{best.name}'.Select() (generic teleport declined).", this);
+
+        best.Select();
+        return true;
+    }
+
     private bool IsNearRiverPoint(Vector3 destination)
     {
         if (riverPointExclusionRadius <= 0f) return false;
@@ -382,8 +427,11 @@ public class GuardedTeleportationProvider : TeleportationProvider
         if (logRejections && Time.unscaledTime - lastRejectionLogTime >= rejectionLogCooldown)
         {
             lastRejectionLogTime = Time.unscaledTime;
+            ExplorationBoundary eb = ExplorationBoundary.Instance;
+            string area = eb != null ? $" areaVolumes(active/total)={eb.ActiveAreaVolumeCount}/{eb.AreaVolumeCount}" : " areaVolumes=none";
+            bool panel = uiManager != null && uiManager.HasOpenFullPanel;
             Debug.Log($"[GuardedTeleportationProvider] REJECTED XRI teleport: {reason}. dest={Fmt(request.destinationPosition)} " +
-                      $"head={Fmt(camLanding)} rigRoot={Fmt(rootLanding)} part='{PartName()}' trialActive={trialActive}.", this);
+                      $"head={Fmt(camLanding)} rigRoot={Fmt(rootLanding)} part='{PartName()}' trialActive={trialActive} panelOpen={panel}{area}.", this);
         }
 
         if (experimentManager != null)
@@ -395,7 +443,7 @@ public class GuardedTeleportationProvider : TeleportationProvider
 
     private void ReportExecuted(Vector3 from, Vector3 to)
     {
-        if (enableDebugLogs)
+        if (logRequests || enableDebugLogs)
             Debug.Log($"[GuardedTeleportationProvider] Executed XRI teleport: rig {Fmt(from)} -> {Fmt(to)}.", this);
 
         if (experimentManager == null) return;

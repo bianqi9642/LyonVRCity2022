@@ -318,7 +318,7 @@ public class ExplorationBoundary : MonoBehaviour
                         ? new Vector3(p.x, c.bounds.center.y, p.z) : p)) return true;
                 continue;
             }
-            Vector3 cp = c.ClosestPoint(p);        // respects the collider's rotation
+            Vector3 cp = ClosestPointOnCollider(c, p);   // respects the collider's rotation and scale
             if (ignoreYInContainmentTest) cp.y = p.y;
             if ((cp - p).sqrMagnitude <= containmentEpsilon * containmentEpsilon) return true;
         }
@@ -371,6 +371,46 @@ public class ExplorationBoundary : MonoBehaviour
         return true;
     }
 
+    /// <summary>
+    /// Closest point on a collider. For a BoxCollider this is computed analytically in the collider's local space
+    /// (identical result to Collider.ClosestPoint for an active collider), so the inside/outside test does not depend
+    /// on the physics engine having created the shape. That matters here: the Area Volumes sit under the
+    /// 'Participant'/'EnvironmentConfig' organisation objects, which are inactive in the saved scene, and
+    /// Collider.ClosestPoint is not defined for a collider that is inactive in the hierarchy. Other collider types
+    /// still use Collider.ClosestPoint.
+    /// </summary>
+    private static Vector3 ClosestPointOnCollider(Collider c, Vector3 p)
+    {
+        BoxCollider box = c as BoxCollider;
+        if (box == null) return c.ClosestPoint(p);
+
+        Transform t = box.transform;
+        Vector3 local = t.InverseTransformPoint(p);
+        Vector3 half = box.size * 0.5f;
+        Vector3 ctr = box.center;
+        Vector3 clamped = new Vector3(
+            Mathf.Clamp(local.x, ctr.x - Mathf.Abs(half.x), ctr.x + Mathf.Abs(half.x)),
+            Mathf.Clamp(local.y, ctr.y - Mathf.Abs(half.y), ctr.y + Mathf.Abs(half.y)),
+            Mathf.Clamp(local.z, ctr.z - Mathf.Abs(half.z), ctr.z + Mathf.Abs(half.z)));
+        return t.TransformPoint(clamped);
+    }
+
+    /// <summary>Diagnostics: number of assigned Area Volumes.</summary>
+    public int AreaVolumeCount => areaVolumes != null ? areaVolumes.Length : 0;
+
+    /// <summary>Diagnostics: Area Volumes whose collider is enabled AND active in the hierarchy.</summary>
+    public int ActiveAreaVolumeCount
+    {
+        get
+        {
+            int n = 0;
+            if (areaVolumes == null) return 0;
+            for (int i = 0; i < areaVolumes.Length; i++)
+                if (areaVolumes[i] != null && areaVolumes[i].enabled && areaVolumes[i].gameObject.activeInHierarchy) n++;
+            return n;
+        }
+    }
+
     public Vector3 ClosestPointOnArea(Vector3 p)
     {
         Vector3 best = p; float bestSqr = float.PositiveInfinity;
@@ -379,7 +419,7 @@ public class ExplorationBoundary : MonoBehaviour
         {
             Collider c = areaVolumes[i];
             if (c == null || (c is MeshCollider mc && !mc.convex)) continue;
-            Vector3 cp = c.ClosestPoint(p);
+            Vector3 cp = ClosestPointOnCollider(c, p);
             float d = ignoreYInContainmentTest
                 ? (new Vector2(cp.x, cp.z) - new Vector2(p.x, p.z)).sqrMagnitude
                 : (cp - p).sqrMagnitude;

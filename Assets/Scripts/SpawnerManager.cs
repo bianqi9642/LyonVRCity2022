@@ -200,6 +200,15 @@ public class SpawnerManager : MonoBehaviour
              "simply wait, frozen, until the next trial resumes them.")]
     public bool despawnLiveAgentsOnTrialEnd = false;
 
+    [Header("NavMesh Pathfinding Budget (global)")]
+    [Min(1)]
+    [Tooltip("NavMesh Pathfinding Iterations Per Frame. Written once to the global UnityEngine.AI.NavMesh." +
+             "pathfindingIterationsPerFrame in Awake(), before any NPC can issue a path request. Higher values can shorten " +
+             "the asynchronous pathfinding delay (NPCs waiting on a pending path) but may increase per-frame CPU cost. " +
+             "Unity's default is 100. Values below 1 are ignored (the default of 100 is applied instead). " +
+             "This is the only place in the project that sets this global; it applies to all NavMeshAgents.")]
+    public int navMeshPathfindingIterationsPerFrame = 100;
+
     [Header("Debug & Diagnostics")]
     [Tooltip("Mirrors MoveToTarget.enableDebugLogs. When true (default), SpawnerManager logs " +
              "per-spawn/per-despawn itinerary details and warnings/errors via Debug.Log(...). Disable this " +
@@ -281,6 +290,33 @@ public class SpawnerManager : MonoBehaviour
     // =================================================================================================================
     #region 3. Unity lifecycle and event subscriptions
     // =================================================================================================================
+
+    // Fallback applied when the serialized pathfinding budget is invalid (< 1). Matches Unity's default.
+    const int k_DefaultPathfindingIterationsPerFrame = 100;
+
+    void Awake()
+    {
+        // Awake runs before any Start(), and every NPC is created later from this component's pooling coroutine
+        // (the scene holds no pre-placed MoveToTarget), so the budget is in place before the first path request.
+        ApplyPathfindingBudget();
+    }
+
+    // Single authoritative writer of the global NavMesh.pathfindingIterationsPerFrame. Applied once, never per frame.
+    void ApplyPathfindingBudget()
+    {
+        int value = navMeshPathfindingIterationsPerFrame;
+        if (value < 1)
+        {
+            Debug.LogWarning($"[SpawnerManager] navMeshPathfindingIterationsPerFrame = {value} is invalid (must be >= 1); " +
+                             $"using {k_DefaultPathfindingIterationsPerFrame} instead.");
+            value = k_DefaultPathfindingIterationsPerFrame;
+        }
+
+        NavMesh.pathfindingIterationsPerFrame = value;
+
+        if (enableDebugLogs)
+            Debug.Log($"[SpawnerManager] NavMesh.pathfindingIterationsPerFrame = {NavMesh.pathfindingIterationsPerFrame}");
+    }
 
     void Start()
     {

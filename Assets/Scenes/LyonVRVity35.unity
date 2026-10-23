@@ -202476,7 +202476,7 @@ MonoBehaviour:
   wanderLookAheadDistance: 15
   agentPrefab: {fileID: 3132995531446026970, guid: c34a3349d586043c09271e3b19db0437, type: 3}
   maxAgents: 5000
-  spawnInterval: 0.5
+  spawnInterval: 0.1
   spawnSampleRadius: 1
   spawnSampleMaxAttempts: 8
   groundLayers:
@@ -202501,6 +202501,7 @@ MonoBehaviour:
   gateSpawningByTrialState: 1
   pauseLiveAgentsOutsideTrial: 1
   despawnLiveAgentsOnTrialEnd: 0
+  navMeshPathfindingIterationsPerFrame: 1000
   enableDebugLogs: 1
 --- !u!4 &1947343306
 Transform:

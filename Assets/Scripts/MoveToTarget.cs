@@ -151,6 +151,36 @@ public class MoveToTarget : MonoBehaviour
     Vector3 lastPosition;
     float smoothedSpeed = 0f;
 
+    // Current Walk/Idle state of the hysteresis in Update(). Reset whenever the animator is forced to Idle.
+    bool walkAnimActive = false;
+    // Walk returns to Idle below walkSpeedThreshold * this factor (it starts above walkSpeedThreshold).
+    const float k_WalkStopThresholdFactor = 0.5f;
+
+    // ---- Stalled-movement detector (ANIMATION ONLY) ----
+    // Catches an NPC that is not making real progress although its instantaneous speed is not exactly zero: pinned by
+    // neighbours, sliding or jittering under local avoidance, repeated contacts. It watches the horizontal Transform
+    // position over a sliding window of k_StallBins bins of k_StallBinSeconds (1.0 s). The window is "stalled" when both
+    // the net displacement and the distance actually walked are tiny (average speed well below even the slowest
+    // legitimate walk: UncertainBehavior Slow on a 0.6 m/s walker is 0.3 m/s). Net displacement alone is not used,
+    // because a Detour turning back on itself has ~0 net displacement while walking at full speed.
+    // Effect: only forces Idle through the existing Walk/Idle decision. It never touches the NavMeshAgent (path,
+    // destination, isStopped), the itinerary or the Transform, so the NPC keeps trying to move and Walk resumes by itself.
+    const int k_StallBins = 4;
+    const float k_StallBinSeconds = 0.25f;
+    const float k_StallMaxNetSpeed = 0.10f;    // m/s average net displacement below which the window has no progress
+    const float k_StallMaxTravelSpeed = 0.20f; // m/s average distance walked below which the window has no progress
+    readonly Vector2[] stallBinStart = new Vector2[k_StallBins];
+    readonly float[] stallBinTravel = new float[k_StallBins];
+    readonly float[] stallBinTime = new float[k_StallBins];
+    int stallHead, stallFilled;
+    float stallCurTravel, stallCurTime;
+    Vector2 stallCurStart, stallLastPos;
+    bool stallTracking = false;
+    bool animStalled = false;
+
+    /// <summary>True while the stalled-movement detector forces Idle (animation only; navigation is untouched).</summary>
+    public bool IsAnimationStalled => animStalled;
+
     // Optional AgentID for better logs and traceability.
     [Tooltip("Optional unique identifier for this mover instance (set by factory or PedestrianAgent).")]
     public string AgentID = null;
@@ -344,6 +374,8 @@ public class MoveToTarget : MonoBehaviour
         // refresh last position / speed
         lastPosition = transform.position;
         smoothedSpeed = 0f;
+        walkAnimActive = false;
+        ResetStallDetector();
         arrived = false;
 
         if (agent == null)
@@ -401,7 +433,10 @@ public class MoveToTarget : MonoBehaviour
 
         // If agent cannot control, nothing to do (component should normally be disabled in that case).
         if (!AgentCanControl())
+        {
+            ResetStallDetector();
             return;
+        }
 
         // Velocity / speed measurement:
         // - Use the NavMeshAgent velocity as the authoritative instantaneous velocity.
@@ -411,34 +446,42 @@ public class MoveToTarget : MonoBehaviour
         float alpha = Mathf.Clamp01(dt * speedSmoothing);
         smoothedSpeed = Mathf.Lerp(smoothedSpeed, instantSpeed, alpha);
 
-        // Animator decision:
-        bool shouldWalk = false;
+        // Animator decision. Walk follows ACTUAL movement, never movement intent: 'moving && !arrived' (a destination
+        // has been issued) and desiredVelocity are deliberately NOT used. While the NavMeshAgent waits for a path
+        // (pathPending, hasPath == false - which can take seconds when many NPCs request paths) its velocity is ~0, so
+        // the NPC shows Idle instead of walking on the spot, and returns to Walk as soon as it really moves.
+        // Hysteresis on the smoothed actual speed (start at walkSpeedThreshold, stop at half of it) avoids flicker
+        // around the threshold, e.g. when crowd avoidance nudges a standing NPC. An explicit animator freeze
+        // (PauseExternal(.., freezeAnimator: true): Pause, Attractor dwell, End-Panel hard stop) always wins.
+        bool shouldWalk;
 
         if (externallyFreezeAnimator)
         {
-            shouldWalk = false;
+            walkAnimActive = false;
+            ResetStallDetector();
         }
         else
         {
-            shouldWalk = (smoothedSpeed > walkSpeedThreshold) || (moving && !arrived);
+            UpdateStallDetector(dt);
+
+            walkAnimActive = walkAnimActive
+                ? smoothedSpeed > walkSpeedThreshold * k_WalkStopThresholdFactor
+                : smoothedSpeed > walkSpeedThreshold;
+
+            // No real progress (pinned / jittering under avoidance, or waiting): Idle even if the speed is non-zero.
+            if (animStalled)
+                walkAnimActive = false;
         }
+        shouldWalk = walkAnimActive;
 
         if (animator != null)
         {
             animator.SetBool(animatorIsWalkingParam, shouldWalk);
 
-            float moveSpeedValue = smoothedSpeed;
-
-            if (shouldWalk && moveSpeedValue < 0.01f)
-            {
-                // fall back to agent.speed if measured speed is tiny but we consider walking
-                moveSpeedValue = agent.speed;
-            }
-
-            if (!shouldWalk)
-                moveSpeedValue = 0f;
-
-            animator.SetFloat(animatorMoveSpeedParam, moveSpeedValue);
+            // Walk cadence follows the measured speed (so UncertainBehavior's Slow state and 0.6 m/s walkers play
+            // proportionally slower); no fallback to the nominal agent.speed, which would play a stationary NPC at
+            // full cadence. Idle always reports 0.
+            animator.SetFloat(animatorMoveSpeedParam, shouldWalk ? smoothedSpeed : 0f);
         }
 
         // Early out if not actively moving or already arrived
@@ -618,6 +661,8 @@ public class MoveToTarget : MonoBehaviour
 
         if (animator != null && freezeAnimator)
         {
+            walkAnimActive = false;
+            ResetStallDetector();
             animator.SetBool(animatorIsWalkingParam, false);
             animator.SetFloat(animatorMoveSpeedParam, 0f);
         }
@@ -649,6 +694,75 @@ public class MoveToTarget : MonoBehaviour
             resampleAttempts = 0;
             loggedNoPathOnce = false;
             lastResampleTime = -10f;
+        }
+    }
+
+    void ResetStallDetector()
+    {
+        stallTracking = false;
+        animStalled = false;
+        stallFilled = 0;
+        stallHead = 0;
+    }
+
+    // Called once per frame while the animator is not frozen. Updates 'animStalled'.
+    void UpdateStallDetector(float dt)
+    {
+        Vector3 wp = transform.position;
+        Vector2 pos = new Vector2(wp.x, wp.z);
+
+        if (!stallTracking)
+        {
+            stallTracking = true;
+            stallLastPos = pos;
+            stallCurStart = pos;
+            stallCurTravel = 0f;
+            stallCurTime = 0f;
+            stallFilled = 0;
+            stallHead = 0;
+            return;
+        }
+
+        stallCurTravel += (pos - stallLastPos).magnitude;
+        stallLastPos = pos;
+        stallCurTime += dt;
+        if (stallCurTime < k_StallBinSeconds)
+            return;
+
+        // Close the current bin.
+        stallBinStart[stallHead] = stallCurStart;
+        stallBinTravel[stallHead] = stallCurTravel;
+        stallBinTime[stallHead] = stallCurTime;
+        stallHead = (stallHead + 1) % k_StallBins;
+        if (stallFilled < k_StallBins) stallFilled++;
+        stallCurStart = pos;
+        stallCurTravel = 0f;
+        stallCurTime = 0f;
+
+        if (stallFilled < k_StallBins)
+            return; // not a full observation window yet
+
+        // Full window (stallHead now indexes the oldest bin).
+        float time = 0f, travel = 0f;
+        for (int i = 0; i < k_StallBins; i++) { time += stallBinTime[i]; travel += stallBinTravel[i]; }
+        float net = (pos - stallBinStart[stallHead]).magnitude;
+        bool windowStalled = net < k_StallMaxNetSpeed * time && travel < k_StallMaxTravelSpeed * time;
+
+        if (windowStalled)
+        {
+            animStalled = true;
+        }
+        else if (animStalled)
+        {
+            // Release only on movement sustained over the two most recent bins (0.5 s) at a real walking pace, so a
+            // brief shove does not flip the NPC back to Walk, yet a genuinely free NPC resumes within ~0.5 s.
+            int newest = (stallHead + k_StallBins - 1) % k_StallBins;
+            int prev = (stallHead + k_StallBins - 2) % k_StallBins;
+            float rt = stallBinTime[newest] + stallBinTime[prev];
+            float rtravel = stallBinTravel[newest] + stallBinTravel[prev];
+            float rnet = (pos - stallBinStart[prev]).magnitude;
+            if (rnet >= k_StallMaxNetSpeed * rt && rtravel >= k_StallMaxTravelSpeed * rt)
+                animStalled = false;
         }
     }
 
@@ -900,6 +1014,9 @@ public class MoveToTarget : MonoBehaviour
         moving = false;
         SafeSetIsStopped(true);
 
+        walkAnimActive = false;
+
+        ResetStallDetector();
         if (animator != null)
         {
             animator.SetBool(animatorIsWalkingParam, false);
@@ -910,6 +1027,7 @@ public class MoveToTarget : MonoBehaviour
     public void TeleportTo(Vector3 pos)
     {
         // Teleport both transform and agent
+        ResetStallDetector();
         transform.position = pos;
         if (agent != null && agent.enabled)
         {
@@ -954,6 +1072,9 @@ public class MoveToTarget : MonoBehaviour
         moving = false;
         SafeSetIsStopped(true);
 
+        walkAnimActive = false;
+
+        ResetStallDetector();
         if (animator != null)
         {
             animator.SetBool(animatorIsWalkingParam, false);
@@ -966,6 +1087,9 @@ public class MoveToTarget : MonoBehaviour
         moving = false;
         SafeSetIsStopped(true);
 
+        walkAnimActive = false;
+
+        ResetStallDetector();
         if (animator != null)
         {
             animator.SetBool(animatorIsWalkingParam, false);

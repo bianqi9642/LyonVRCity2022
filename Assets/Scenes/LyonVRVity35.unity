@@ -11299,7 +11299,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!4 &101799188
 Transform:
   m_ObjectHideFlags: 0
@@ -202501,7 +202501,7 @@ MonoBehaviour:
   gateSpawningByTrialState: 1
   pauseLiveAgentsOutsideTrial: 1
   despawnLiveAgentsOnTrialEnd: 0
-  navMeshPathfindingIterationsPerFrame: 1000
+  navMeshPathfindingIterationsPerFrame: 1500
   enableDebugLogs: 1
 --- !u!4 &1947343306
 Transform:

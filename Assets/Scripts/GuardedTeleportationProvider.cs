@@ -38,6 +38,11 @@
 //     while a trial is running, no instruction panel is open, and the landing position lies inside the
 //     Exploration Area (ExplorationBoundary.IsLandingPositionAllowed - the same geometry RiverTeleportPoint
 //     uses via IsTeleportDestinationAllowed).
+//   * Anchor-category allowance (added): the scene has three anchor groups whose positions match the Parts they serve -
+//     Practice anchors surround the Part 1 start, Grid/Organic anchors surround the Part 3 start points. For a Part whose
+//     policy is Deny, requests attributed to an allowed group (part1AllowedAnchors = Practice, part3AllowedAnchors =
+//     Grid|Organic) are judged as AllowDuringTrial: trial running, no full panel open, not a river point. Other anchors,
+//     TeleportationAreas and every other Part are unchanged (Part 2 keeps the Exploration Area test).
 //   * Requests landing near a RiverTeleportPoint are rejected: river points are paired-teleport-only.
 //   * Fails closed: missing ExperimentManager / ExplorationBoundary / XR Origin => request rejected.
 //
@@ -59,10 +64,24 @@ public class GuardedTeleportationProvider : TeleportationProvider
     // Deny: every generic XRI teleport request is rejected.
     // AllowInsideExplorationArea: allowed only while a trial is running, no instruction panel is open, and both
     // the head and rig-root landing positions are inside the Exploration Area.
+    // AllowDuringTrial: allowed while a trial is running and no instruction panel is open; no Exploration Area test
+    // (that restriction belongs to Part 2 only). Appended last so serialized values 0 / 1 keep their meaning.
     public enum GenericTeleportPolicy
     {
         Deny = 0,
-        AllowInsideExplorationArea = 1
+        AllowInsideExplorationArea = 1,
+        AllowDuringTrial = 2
+    }
+
+    // Experiment-specific teleport-anchor groups (the three anchor sets in the scene). None = not a member of any
+    // group (TeleportationArea requests, river-bank anchors, anchors outside the groups).
+    [System.Flags]
+    public enum AnchorCategory
+    {
+        None = 0,
+        Practice = 1,
+        Grid = 2,
+        Organic = 4
     }
 
     public const string EventSourceLabel = "xri_participant";
@@ -88,6 +107,22 @@ public class GuardedTeleportationProvider : TeleportationProvider
     [Tooltip("Reject requests while any full instruction panel (Start / Continue / End / Destination) is open.")]
     [SerializeField] private bool denyWhileFullPanelOpen = true;
 
+    [Header("Anchor categories (Practice / Grid / Organic)")]
+    [Tooltip("Name of the scene object that is the ancestor of every Practice anchor. An anchor belongs to a category " +
+             "when one of its ancestors has exactly this name. Leave empty to disable the category.")]
+    [SerializeField] private string practiceRootName = "PracticeTeleportPoint";
+    [SerializeField] private string gridRootName = "GridTeleportPoint";
+    [SerializeField] private string organicRootName = "OrganicTeleportPoint";
+
+    [Tooltip("Part 1 (Practice): anchor categories that may be used when part1Policy is Deny. A matching request is judged " +
+             "like AllowDuringTrial (trial running, no full panel open, not a river point); every other anchor stays denied.")]
+    [SerializeField] private AnchorCategory part1AllowedAnchors = AnchorCategory.Practice;
+    [Tooltip("Part 3 (Experiment): anchor categories that may be used when part3Policy is Deny. Same rule as Part 1.")]
+    [SerializeField] private AnchorCategory part3AllowedAnchors = AnchorCategory.Grid | AnchorCategory.Organic;
+    [Tooltip("Max distance (m) between a request's destination and an anchor's teleport transform for the request to be " +
+             "attributed to that anchor. Anchors are >2.5 m apart in the scene.")]
+    [SerializeField] private float anchorMatchRadius = 0.25f;
+
     [Header("River points")]
     [Tooltip("Generic requests whose destination is within this horizontal distance (m) of a RiverTeleportPoint are " +
              "rejected: river points teleport only through RiverTeleportPoint.Select() (pairing, cooldown, boundary, event).")]
@@ -112,6 +147,9 @@ public class GuardedTeleportationProvider : TeleportationProvider
     private bool subscribed;
     private float lastRejectionLogTime = -999f;
     private RiverTeleportPoint[] riverPoints;
+    private TeleportationAnchor[] anchorCache;
+    private AnchorCategory[] anchorCacheCategories;
+    private string lastAnchorLabel = "";
 
     /// <summary>True from OnTrialStart to OnTrialEnd of the running Part.</summary>
     public bool TrialActive => trialActive;
@@ -181,7 +219,7 @@ public class GuardedTeleportationProvider : TeleportationProvider
         if (logRequests || enableDebugLogs)
         {
             Debug.Log($"[GuardedTeleportationProvider] Accepted XRI teleport request to {Fmt(teleportRequest.destinationPosition)} " +
-                      $"(head {Fmt(camLanding)}, rig root {Fmt(rootLanding)}, part '{PartName()}').", this);
+                      $"(head {Fmt(camLanding)}, rig root {Fmt(rootLanding)}, part '{PartName()}', anchor '{lastAnchorLabel}').", this);
         }
 
         return base.QueueTeleportRequest(teleportRequest);
@@ -219,6 +257,17 @@ public class GuardedTeleportationProvider : TeleportationProvider
 
         string part = PartName();
         GenericTeleportPolicy policy = PolicyFor(part);
+
+        // Anchor-category allowance: a Part whose generic policy is Deny may still permit specific anchor groups
+        // (Practice in Part 1, Grid/Organic in Part 3). Such a request is judged under AllowDuringTrial, so the trial,
+        // panel and river-point gates below still apply. Any other anchor stays denied.
+        AnchorCategory category = ResolveAnchorCategory(request.destinationPosition, out lastAnchorLabel);
+        if (policy == GenericTeleportPolicy.Deny && category != AnchorCategory.None &&
+            (AllowedAnchorsFor(part) & category) != 0)
+        {
+            policy = GenericTeleportPolicy.AllowDuringTrial;
+        }
+
         if (policy == GenericTeleportPolicy.Deny)
         {
             reason = string.IsNullOrEmpty(part) ? "policy_deny_no_part_running" : "policy_deny_" + part;
@@ -283,6 +332,68 @@ public class GuardedTeleportationProvider : TeleportationProvider
             case "Part3": return part3Policy;
             default: return noPartPolicy;
         }
+    }
+
+    private AnchorCategory AllowedAnchorsFor(string part)
+    {
+        switch (part)
+        {
+            case "Part1": return part1AllowedAnchors;
+            case "Part3": return part3AllowedAnchors;
+            default: return AnchorCategory.None;
+        }
+    }
+
+    /// <summary>
+    /// Attributes a request to a Practice / Grid / Organic anchor: the nearest TeleportationAnchor whose teleport
+    /// transform lies within anchorMatchRadius of the request destination (XRI sets the destination to exactly that
+    /// transform). The anchor list is cached and rebuilt once when no anchor matches (anchors may be activated later).
+    /// Returns None for TeleportationArea requests and for anchors outside the three groups.
+    /// </summary>
+    private AnchorCategory ResolveAnchorCategory(Vector3 destination, out string label)
+    {
+        label = "";
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            if (anchorCache == null || attempt == 1) BuildAnchorCache();
+
+            int best = -1;
+            float bestSqr = anchorMatchRadius * anchorMatchRadius;
+            for (int i = 0; i < anchorCache.Length; i++)
+            {
+                TeleportationAnchor a = anchorCache[i];
+                if (a == null) continue;
+                Transform t = a.teleportAnchorTransform != null ? a.teleportAnchorTransform : a.transform;
+                float sqr = (t.position - destination).sqrMagnitude;
+                if (sqr <= bestSqr) { bestSqr = sqr; best = i; }
+            }
+
+            if (best >= 0)
+            {
+                label = anchorCache[best].name + "/" + anchorCacheCategories[best];
+                return anchorCacheCategories[best];
+            }
+        }
+        return AnchorCategory.None;
+    }
+
+    private void BuildAnchorCache()
+    {
+        anchorCache = FindObjectsOfType<TeleportationAnchor>(true);
+        anchorCacheCategories = new AnchorCategory[anchorCache.Length];
+        for (int i = 0; i < anchorCache.Length; i++)
+            anchorCacheCategories[i] = CategoryOf(anchorCache[i]);
+    }
+
+    private AnchorCategory CategoryOf(TeleportationAnchor anchor)
+    {
+        for (Transform t = anchor.transform; t != null; t = t.parent)
+        {
+            if (!string.IsNullOrEmpty(practiceRootName) && t.name == practiceRootName) return AnchorCategory.Practice;
+            if (!string.IsNullOrEmpty(gridRootName) && t.name == gridRootName) return AnchorCategory.Grid;
+            if (!string.IsNullOrEmpty(organicRootName) && t.name == organicRootName) return AnchorCategory.Organic;
+        }
+        return AnchorCategory.None;
     }
 
     private string PartName()
@@ -431,7 +542,7 @@ public class GuardedTeleportationProvider : TeleportationProvider
             string area = eb != null ? $" areaVolumes(active/total)={eb.ActiveAreaVolumeCount}/{eb.AreaVolumeCount}" : " areaVolumes=none";
             bool panel = uiManager != null && uiManager.HasOpenFullPanel;
             Debug.Log($"[GuardedTeleportationProvider] REJECTED XRI teleport: {reason}. dest={Fmt(request.destinationPosition)} " +
-                      $"head={Fmt(camLanding)} rigRoot={Fmt(rootLanding)} part='{PartName()}' trialActive={trialActive} panelOpen={panel}{area}.", this);
+                      $"head={Fmt(camLanding)} rigRoot={Fmt(rootLanding)} part='{PartName()}' anchor='{lastAnchorLabel}' trialActive={trialActive} panelOpen={panel}{area}.", this);
         }
 
         if (experimentManager != null)

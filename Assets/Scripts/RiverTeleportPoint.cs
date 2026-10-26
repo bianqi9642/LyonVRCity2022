@@ -73,6 +73,7 @@ public class RiverTeleportPoint : MonoBehaviour, IPointerClickHandler
     public event Action<RiverTeleportPoint, RiverTeleportPoint, Vector3, Vector3> OnPlayerTeleported;
 
     private float lastTeleportTime = -999f;
+    private float lastBlockedLogTime = -999f;
 
     private void Start()
     {
@@ -116,6 +117,23 @@ public class RiverTeleportPoint : MonoBehaviour, IPointerClickHandler
     /// </summary>
     public void Select()
     {
+        // Part 2: participant-initiated river teleports are disabled (protocol). Every participant entry point - the
+        // pointer click, OnMouseDown and the Guard's XRI routing - ends here, so this single check covers them all.
+        // The scheduled cross-bank teleport does not use this method. Decided from the experiment state only.
+        if (experimentManager == null) experimentManager = FindObjectOfType<ExperimentManager>();
+        if (experimentManager != null && experimentManager.IsParticipantRiverTeleportBlocked)
+        {
+            if (Time.unscaledTime - lastBlockedLogTime > 0.5f)
+            {
+                lastBlockedLogTime = Time.unscaledTime;
+                Debug.Log($"RiverTeleportPoint ({gameObject.name}): participant river teleport rejected - {ExperimentManager.RiverTeleportDisabledReason}.");
+                Vector3 rigPos = playerRig != null ? playerRig.position : Vector3.zero;
+                try { experimentManager.ReportParticipantTeleportRejected("river_point", ExperimentManager.RiverTeleportDisabledReason, rigPos, transform.position); }
+                catch (Exception e) { Debug.LogWarning("RiverTeleportPoint: rejection report failed: " + e.Message); }
+            }
+            return;
+        }
+
         if (pairedPoint == null)
         {
             Debug.LogWarning($"RiverTeleportPoint ({gameObject.name}): cannot teleport, pairedPoint is null.");

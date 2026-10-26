@@ -150,6 +150,11 @@ public class ExperimentManager : MonoBehaviour
              "permanently placed under an active parent in the scene.")]
     public bool ensureExplorationBoundaryActive = true;
 
+    [Header("Part 2 participant teleport restrictions")]
+    [Tooltip("Participants cannot use the paired river teleport points (controller or UI click) while Part 2 runs. " +
+             "The scheduled cross-bank teleport at the Part 2 phase transition is unaffected.")]
+    public bool disableParticipantRiverTeleportInPart2 = true;
+
     [Header("Part durations (seconds)")]
     public float part1Duration = 60f;
     public float part2FirstDuration = 60f;
@@ -415,6 +420,18 @@ public class ExperimentManager : MonoBehaviour
     /// Read-only view of the existing private state; does not change the state machine.
     /// </summary>
     public string RunningPartName => CurrentRunningPartString();
+
+    /// <summary>Rejection reason reported when a participant tries to use a river point while it is disabled.</summary>
+    public const string RiverTeleportDisabledReason = "river_teleport_disabled_in_part2";
+
+    /// <summary>
+    /// True while a participant-initiated river teleport must be refused: Part 2 is running (from part_start until its End
+    /// Panel is confirmed) and the protocol switch is on. Single source of truth for GuardedTeleportationProvider and
+    /// RiverTeleportPoint, so the XRI and UI-click paths cannot diverge. The scheduled cross-bank transition is NOT a
+    /// river-point interaction: it is TeleportPlayerTo() and is unaffected.
+    /// </summary>
+    public bool IsParticipantRiverTeleportBlocked =>
+        disableParticipantRiverTeleportInPart2 && currentRunningPart == RunningPart.Part2;
 
     /// <summary>
     /// A participant-initiated XRI teleport was EXECUTED. Raised through the existing "teleport" event so the
@@ -951,6 +968,25 @@ public class ExperimentManager : MonoBehaviour
     private void TeleportPlayerTo(Transform dest)
     {
         if (dest == null || playerRig == null) return;
+
+        // Part 2 invariant: no movement may leave the Exploration Area. The scheduled/scripted teleports are the
+        // experiment's own moves (start position, cross-bank transition), so they are validated against the SAME
+        // boundary query as participant teleports instead of bypassing it. Fail closed when the destination is invalid.
+        if (currentRunningPart == RunningPart.Part2)
+        {
+            ExplorationBoundary eb = ExplorationBoundary.Instance;
+            if (eb == null)
+            {
+                Debug.LogWarning($"[ExperimentManager] Scripted Part 2 teleport to '{dest.name}' could not be validated: no ExplorationBoundary instance.", this);
+            }
+            else if (!eb.IsLandingPositionAllowed(dest.position, out string why))
+            {
+                Debug.LogError($"[ExperimentManager] Scripted Part 2 teleport to '{dest.name}' at {dest.position} REJECTED ({why}): " +
+                               "the destination is outside the Exploration Area. Fix the Part 2 group start/teleport positions.", this);
+                RaiseEvt("teleport_rejected", label: "scripted", stringValue: "scripted_" + why, fromPos: playerRig.position, toPos: dest.position);
+                return;
+            }
+        }
 
         // Data-capture observer hook (Revision 2): announce the teleport with the raw pre/post positions
         // BEFORE the assignment, so trajectory analysis can preserve the discontinuity. Mechanics unchanged.

@@ -453,6 +453,24 @@ public class UIManager : MonoBehaviour
         instance.transform.localRotation = Quaternion.identity;
         instance.transform.localScale = shrunkLocalScale;
 
+        // Lock the pose in the participant's VIEW: a constant camera-local pose, re-applied every frame and right before
+        // rendering, so looking up/down/sideways cannot move the panel within the field of view. Only these two shrunk
+        // Destination panels are created here; the full-size panels never get this component.
+        HeadLockedPanel lockPanel = instance.GetComponent<HeadLockedPanel>();
+        if (lockPanel == null) lockPanel = instance.AddComponent<HeadLockedPanel>();
+        lockPanel.headCamera = head.GetComponent<Camera>();
+        lockPanel.localPosition = instance.transform.localPosition;
+        lockPanel.localRotation = instance.transform.localRotation;
+        lockPanel.localScale = instance.transform.localScale;
+        lockPanel.enableDebugLogs = enableDebugLogs;
+
+        if (enableDebugLogs)
+        {
+            float elevation = Mathf.Atan2(instance.transform.localPosition.y, instance.transform.localPosition.z) * Mathf.Rad2Deg;
+            Debug.Log($"[UIManager] Shrunk panel '{shrunkTemplate.name}' head-locked at camera-local {instance.transform.localPosition} " +
+                      $"({elevation:F1} deg above the line of sight).", this);
+        }
+
         // Show the matching destination image on the shrunk HUD (same texture as the full panel).
         if (shrunkTemplate == part3Dest1ShrunkTemplate) ApplyDestinationImage(instance, destination1Image);
         else if (shrunkTemplate == part3Dest2ShrunkTemplate) ApplyDestinationImage(instance, destination2Image);

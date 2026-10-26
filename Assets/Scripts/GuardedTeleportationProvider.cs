@@ -207,6 +207,18 @@ public class GuardedTeleportationProvider : TeleportationProvider
     {
         // River points are paired-teleport-only: hand the action to RiverTeleportPoint.Select() and decline the
         // generic request, so the rig is never moved to the selected river point's own anchor position.
+        // Part 2: participant-initiated river teleports are disabled. Decided from the experiment state alone (never from the
+        // boundary) and BEFORE the river-routing branch, which would otherwise reach RiverTeleportPoint.Select() ahead of
+        // the ordinary checks. Applies to every river point, active or not.
+        if (experimentManager != null && experimentManager.IsParticipantRiverTeleportBlocked &&
+            IsNearRiverPoint(teleportRequest.destinationPosition))
+        {
+            lastAnchorLabel = "river_point";
+            OnRequestRejected(teleportRequest, ExperimentManager.RiverTeleportDisabledReason,
+                              teleportRequest.destinationPosition, teleportRequest.destinationPosition);
+            return false;
+        }
+
         if (routeRiverAnchorRequests && TryRouteToRiverPoint(teleportRequest))
             return false;
 
@@ -304,6 +316,11 @@ public class GuardedTeleportationProvider : TeleportationProvider
             if (boundary == null)
             {
                 reason = "no_exploration_boundary";
+                return false;
+            }
+            if (!boundary.isActiveAndEnabled || boundary.AreaVolumeCount == 0)
+            {
+                reason = "exploration_boundary_not_ready";   // fail closed: cannot be validated reliably
                 return false;
             }
 

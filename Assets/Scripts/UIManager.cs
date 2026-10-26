@@ -1,6 +1,8 @@
 using System;
+using System.Collections;
 using UnityEngine;
 using UnityEngine.UI;
+using UnityEngine.XR;
 
 /// <summary>
 /// UIManager specialized for the experiment with explicit slots per panel type.
@@ -82,9 +84,26 @@ public class UIManager : MonoBehaviour
              "If left empty it is located with FindObjectOfType at Awake.")]
     public TargetBuildingPreviewGenerator targetPreviewGenerator;
 
+    [Header("Head pose readiness (full-size panels)")]
+    [Tooltip("A full panel is positioned only once the HMD pose is valid and its height has been steady for this many " +
+             "consecutive frames. Without this the first Start panel (shown in the first frames of a run) used a temporary " +
+             "pre-tracking / still-settling pose and could end up too low.")]
+    public int settledFramesRequired = 8;
+    [Tooltip("Largest frame-to-frame change in head height (m) still counted as steady (tracking noise is ~1 mm).")]
+    public float settledMaxHeightDelta = 0.003f;
+    [Tooltip("Longest time (s, real time) a panel waits for a steady valid pose before being placed with the current pose.")]
+    public float settleTimeout = 3f;
+
     [Header("Debug")]
     [Tooltip("Log one line per full-panel placement (never per frame).")]
     public bool enableDebugLogs = false;
+
+    // Head pose sampling (updated once per frame, see SampleHead).
+    private Transform sampledHead;
+    private float sampledHeadY;
+    private int stableFrames;
+    private bool headTracked;
+    private int lastSampleFrame = -1;
 
     // Runtime images for the current Phase 3 session. Owned by this component; destroyed on regeneration and OnDestroy.
     private Texture2D destination1Image;
@@ -113,6 +132,75 @@ public class UIManager : MonoBehaviour
         DestroyDestinationImages();
     }
 
+    private void Update()
+    {
+        SampleHead();
+    }
+
+    #region Head pose readiness
+
+    /// <summary>True when the HMD pose is valid and its height has been steady for 'settledFramesRequired' frames.</summary>
+    public bool IsHeadPoseSettled
+    {
+        get
+        {
+            SampleHead();
+            return headTracked && stableFrames >= settledFramesRequired;
+        }
+    }
+
+    // Once per frame: is the head tracked, and has its world height stopped changing? "Steady" also covers a rig that is
+    // still being grounded/teleported (AutoGroundAlign lerp, gravity), not only XR tracking start-up.
+    private void SampleHead()
+    {
+        if (lastSampleFrame == Time.frameCount) return;
+        lastSampleFrame = Time.frameCount;
+
+        Transform head = ResolveHeadTransform(false);
+        if (head == null) { stableFrames = 0; headTracked = false; return; }
+
+        headTracked = ReadHeadTracked(false, out _);
+        float y = head.position.y;
+        if (head != sampledHead) { sampledHead = head; stableFrames = 0; }
+        else if (headTracked && Mathf.Abs(y - sampledHeadY) <= settledMaxHeightDelta) stableFrames++;
+        else stableFrames = 0;
+        sampledHeadY = y;
+    }
+
+    // Tracking validity from the XR input subsystem. No active XR device (Editor/desktop) counts as valid. If a device is
+    // active but does not report the head node, validity cannot be determined and the steady-height test alone decides.
+    private static bool ReadHeadTracked(bool describe, out string state)
+    {
+        state = null;
+        if (!XRSettings.isDeviceActive)
+        {
+            if (describe) state = "no active XR device (desktop/Editor)";
+            return true;
+        }
+
+        InputDevice device = InputDevices.GetDeviceAtXRNode(XRNode.Head);
+        if (!device.isValid)
+        {
+            if (describe) state = "XR device active, head node not reported (validity unknown)";
+            return true;
+        }
+
+        if (device.TryGetFeatureValue(CommonUsages.trackingState, out InputTrackingState ts))
+        {
+            if (describe) state = "trackingState=" + ts;
+            return (ts & InputTrackingState.Position) != 0;
+        }
+        if (device.TryGetFeatureValue(CommonUsages.isTracked, out bool tracked))
+        {
+            if (describe) state = "isTracked=" + tracked;
+            return tracked;
+        }
+        if (describe) state = "head device valid, tracking feature unavailable";
+        return true;
+    }
+
+    #endregion
+
     /// <summary>
     /// Resolve the participant's CURRENT tracked head transform at the moment a panel is shown.
     /// Priority: explicit headTransformOverride -> hmdCamera -> Camera.main -> first active Camera in the scene.
@@ -120,7 +208,7 @@ public class UIManager : MonoBehaviour
     /// show/hide/show cycle re-anchors to wherever the participant is actually looking.
     /// Returns null if nothing usable exists (callers must handle this without breaking the experiment).
     /// </summary>
-    private Transform ResolveHeadTransform()
+    private Transform ResolveHeadTransform(bool warn = true)
     {
         if (headTransformOverride != null) return headTransformOverride;
         if (hmdCamera != null && hmdCamera.isActiveAndEnabled) return hmdCamera.transform;
@@ -145,8 +233,9 @@ public class UIManager : MonoBehaviour
             return cam.transform;
         }
 
-        Debug.LogWarning("UIManager.ResolveHeadTransform: no head/camera transform available. " +
-                         "Panel will be left at its instantiated pose.");
+        if (warn)
+            Debug.LogWarning("UIManager.ResolveHeadTransform: no head/camera transform available. " +
+                             "Panel will be left at its instantiated pose.");
         return null;
     }
 
@@ -329,7 +418,7 @@ public class UIManager : MonoBehaviour
         if (pc == null)
         {
             Debug.LogWarning("UIManager.ShowFullPanel: instantiated panel has no PanelController component (search included children).");
-            PositionPanelInFront(instance.transform, panelLocalOffset);
+            PlaceFullPanel(instance.transform);
             return;
         }
 
@@ -344,7 +433,7 @@ public class UIManager : MonoBehaviour
         pc.Setup(textToPass, onConfirm, showCancel: false);
 
         // position the panel in front of the HMD
-        PositionPanelInFront(instance.transform, panelLocalOffset);
+        PlaceFullPanel(instance.transform);
     }
 
     /// <summary>
@@ -370,8 +459,8 @@ public class UIManager : MonoBehaviour
         if (pc == null)
         {
             Debug.LogWarning("UIManager.ShowFullPanelAndReturnController: no PanelController found.");
-            PositionPanelInFront(instance.transform, panelLocalOffset);
             ApplyDestinationImage(instance, destinationImage);
+            PlaceFullPanel(instance.transform);
             onConfirm?.Invoke();
             return null;
         }
@@ -383,8 +472,8 @@ public class UIManager : MonoBehaviour
         string textToPass = templateHasText ? null : fallbackMessage;
 
         pc.Setup(textToPass, onConfirm, showCancel: false);
-        PositionPanelInFront(instance.transform, panelLocalOffset);
-        ApplyDestinationImage(instance, destinationImage);
+        ApplyDestinationImage(instance, destinationImage);   // before placement: it can change what is active in the layout
+        PlaceFullPanel(instance.transform);
         return pc;
     }
 
@@ -430,45 +519,31 @@ public class UIManager : MonoBehaviour
         GameObject instance = Instantiate(shrunkTemplate, this.transform);
         instance.SetActive(true);
 
-        // Parent to the head but set worldPositionStays = false so local transform can be set deterministically.
-        instance.transform.SetParent(head, worldPositionStays: false);
-
-        // Set local position/rotation/scale according to chosen corner
+        // Camera-local pose for the chosen corner, computed BEFORE any component can touch the transform.
+        Vector3 localPos;
         switch (corner)
         {
-            case Corner.TopRight:
-                instance.transform.localPosition = topRightLocalPos;
-                break;
-            case Corner.TopLeft:
-                instance.transform.localPosition = new Vector3(-topRightLocalPos.x, topRightLocalPos.y, topRightLocalPos.z);
-                break;
-            case Corner.BottomRight:
-                instance.transform.localPosition = new Vector3(topRightLocalPos.x, -topRightLocalPos.y, topRightLocalPos.z);
-                break;
-            case Corner.BottomLeft:
-                instance.transform.localPosition = new Vector3(-topRightLocalPos.x, -topRightLocalPos.y, topRightLocalPos.z);
-                break;
+            case Corner.TopLeft:    localPos = new Vector3(-topRightLocalPos.x, topRightLocalPos.y, topRightLocalPos.z); break;
+            case Corner.BottomRight: localPos = new Vector3(topRightLocalPos.x, -topRightLocalPos.y, topRightLocalPos.z); break;
+            case Corner.BottomLeft: localPos = new Vector3(-topRightLocalPos.x, -topRightLocalPos.y, topRightLocalPos.z); break;
+            default:                localPos = topRightLocalPos; break;   // TopRight
         }
 
-        instance.transform.localRotation = Quaternion.identity;
-        instance.transform.localScale = shrunkLocalScale;
-
-        // Lock the pose in the participant's VIEW: a constant camera-local pose, re-applied every frame and right before
-        // rendering, so looking up/down/sideways cannot move the panel within the field of view. Only these two shrunk
-        // Destination panels are created here; the full-size panels never get this component.
+        // HeadLockedPanel is the single owner of this panel's pose: Configure() parents it to the active HMD camera and
+        // applies the constant camera-local pose, so its position in the view cannot depend on head pitch/yaw/roll. The
+        // component does nothing until configured (see HeadLockedPanel). Only the two shrunk Destination panels are created
+        // here; the full-size panels never get this component.
         HeadLockedPanel lockPanel = instance.GetComponent<HeadLockedPanel>();
         if (lockPanel == null) lockPanel = instance.AddComponent<HeadLockedPanel>();
-        lockPanel.headCamera = head.GetComponent<Camera>();
-        lockPanel.localPosition = instance.transform.localPosition;
-        lockPanel.localRotation = instance.transform.localRotation;
-        lockPanel.localScale = instance.transform.localScale;
         lockPanel.enableDebugLogs = enableDebugLogs;
+        lockPanel.Configure(head.GetComponent<Camera>(), localPos, Quaternion.identity, shrunkLocalScale);
 
         if (enableDebugLogs)
         {
-            float elevation = Mathf.Atan2(instance.transform.localPosition.y, instance.transform.localPosition.z) * Mathf.Rad2Deg;
-            Debug.Log($"[UIManager] Shrunk panel '{shrunkTemplate.name}' head-locked at camera-local {instance.transform.localPosition} " +
-                      $"({elevation:F1} deg above the line of sight).", this);
+            float elevation = Mathf.Atan2(localPos.y, localPos.z) * Mathf.Rad2Deg;
+            Debug.Log($"[UIManager] Shrunk panel '{shrunkTemplate.name}' head-locked to camera '{head.name}' at camera-local {localPos}, " +
+                      $"scale {shrunkLocalScale} ({elevation:F1} deg above the line of sight); active={instance.activeInHierarchy}, " +
+                      $"lossyScale={instance.transform.lossyScale}.", this);
         }
 
         // Show the matching destination image on the shrunk HUD (same texture as the full panel).
@@ -479,14 +554,56 @@ public class UIManager : MonoBehaviour
     }
 
     /// <summary>
-    /// Position a full instruction panel ONCE, in world space, in front of the participant's CURRENT head pose.
-    /// The panel is NOT parented to the head, so it stays fixed in the world for as long as it is visible.
-    /// Every call recomputes from the live head transform, so each show/hide/show cycle re-anchors to the
-    /// participant's new viewpoint. Distance is configurable via 'panelDistance'; 'localOffset' (panelLocalOffset)
-    /// is applied in the facing frame. When 'placeUsingHeadYawOnly' is true the panel is kept level (pitch/roll
-    /// ignored); otherwise the full head forward direction is used, matching the previous behaviour.
+    /// Places a full instruction panel. If the HMD pose is already valid and steady (every panel after the first frames of
+    /// a run) it is positioned immediately. Otherwise - typically the first Start panel, shown in the first frames while XR
+    /// tracking starts and the rig is still being grounded - the panel's Canvas is hidden, the placement waits for a valid
+    /// steady pose (bounded by 'settleTimeout'), and only then is the panel positioned and shown. It is positioned exactly
+    /// once and never moves afterwards.
     /// </summary>
-    private void PositionPanelInFront(Transform panelTransform, Vector3 localOffset)
+    private void PlaceFullPanel(Transform panel)
+    {
+        if (panel == null) return;
+
+        if (IsHeadPoseSettled)
+        {
+            PositionPanelInFront(panel, panelLocalOffset, "immediate");
+            return;
+        }
+
+        StartCoroutine(PlaceWhenSettled(panel));
+    }
+
+    private IEnumerator PlaceWhenSettled(Transform panel)
+    {
+        // Hide (not deactivate) the root canvases: the panel stays "open" for HasOpenFullPanel but cannot be seen or hit.
+        Canvas[] canvases = panel.GetComponentsInChildren<Canvas>(true);
+        bool[] wasEnabled = new bool[canvases.Length];
+        for (int i = 0; i < canvases.Length; i++)
+        {
+            wasEnabled[i] = canvases[i].enabled;
+            if (canvases[i].isRootCanvas) canvases[i].enabled = false;
+        }
+
+        float start = Time.unscaledTime;
+        while (panel != null && !IsHeadPoseSettled && Time.unscaledTime - start < settleTimeout)
+            yield return null;
+
+        if (panel == null) yield break;   // destroyed while waiting
+
+        bool timedOut = !IsHeadPoseSettled;
+        PositionPanelInFront(panel, panelLocalOffset, timedOut ? "after settle TIMEOUT" : $"after settle ({Time.unscaledTime - start:F2} s)");
+
+        for (int i = 0; i < canvases.Length; i++)
+            if (canvases[i] != null) canvases[i].enabled = wasEnabled[i];
+    }
+
+    /// <summary>
+    /// Position a full instruction panel ONCE, in world space, in front of the participant's CURRENT head pose, using the
+    /// horizontal heading only (pitch/roll never move it) and the centre of its enabled Buttons as the height reference.
+    /// The panel is NOT parented to the head, so it stays fixed in the world for as long as it is visible. 'localOffset'
+    /// (panelLocalOffset) is applied in the facing frame (horizontal components only).
+    /// </summary>
+    private void PositionPanelInFront(Transform panelTransform, Vector3 localOffset, string phase)
     {
         if (panelTransform == null)
         {
@@ -515,28 +632,32 @@ public class UIManager : MonoBehaviour
 
         Quaternion facing = Quaternion.LookRotation(forward, Vector3.up);
 
-        // Provisional placement at eye height; the vertical position is then corrected from the real button rectangles.
+        // Orientation first, then a provisional position at eye height. The layout is rebuilt AFTER the panel is active and
+        // oriented, so button rectangles are measured in their final layout, then the height is corrected from them.
         Vector3 horizontalOffset = facing * new Vector3(localOffset.x, 0f, localOffset.z);
         Vector3 worldPos = head.position + forward * panelDistance + horizontalOffset;
-        panelTransform.position = worldPos;
+        panelTransform.SetPositionAndRotation(worldPos, facing);
 
-        // Face the participant, kept perfectly level (project convention: canvas +Z points away from the viewer
-        // along the view direction, which makes the UI readable).
-        panelTransform.rotation = facing;
-
-        // Vertical placement: put the centre of the panel's interactive area (enabled Buttons) at eye level plus
-        // 'interactiveAreaEyeOffset'. Panel size, pivot and layout are measured, not assumed.
-        float targetY = head.position.y + interactiveAreaEyeOffset;
-        float currentY = worldPos.y;
-        bool measured = TryGetInteractiveAreaCentre(panelTransform, out Vector3 areaCentre);
-        if (measured) currentY = areaCentre.y;
-        worldPos.y += targetY - currentY;
+        float eyeY = head.position.y;
+        float targetY = eyeY + interactiveAreaEyeOffset;
+        bool measured = TryGetInteractiveAreaCentre(panelTransform, out Vector3 areaCentre, out _);
+        float before = measured ? areaCentre.y : worldPos.y;
+        worldPos.y += targetY - before;
         panelTransform.position = worldPos;
 
         if (enableDebugLogs)
         {
-            Debug.Log($"[UIManager] Panel '{panelTransform.name}' placed {panelDistance:F1} m ahead; headY={head.position.y:F2}, " +
-                      $"interactiveCentreY={targetY:F2} (buttons measured: {measured}), panelY={worldPos.y:F2}.", this);
+            bool afterMeasured = TryGetInteractiveAreaCentre(panelTransform, out Vector3 afterCentre, out float afterBottom);
+            ReadHeadTracked(true, out string trackingDesc);
+            float floorY = head.root.position.y;   // rig origin (floor) height
+            bool usable = afterMeasured && afterBottom - floorY >= 0.3f && Mathf.Abs(afterCentre.y - eyeY) <= 0.6f;
+            string msg = $"[UIManager] Panel '{panelTransform.name}' placed ({phase}): camera='{head.name}' pose[{trackingDesc}, steadyFrames={stableFrames}] " +
+                         $"headPos={head.position} heading={Mathf.Atan2(forward.x, forward.z) * Mathf.Rad2Deg:F0} deg; " +
+                         $"buttonCentreY before={before:F2} after={(afterMeasured ? afterCentre.y : float.NaN):F2} (target {targetY:F2}); " +
+                         $"buttonBottom above floor={(afterMeasured ? afterBottom - floorY : float.NaN):F2} m; canvasPos={panelTransform.position}; " +
+                         $"parent={(panelTransform.parent != null ? panelTransform.parent.name : "none")} lossyScale={panelTransform.lossyScale}.";
+            if (usable) Debug.Log(msg, this);
+            else Debug.LogWarning(msg + " Interactive area is NOT within the expected usable height range.", this);
         }
     }
 
@@ -545,9 +666,10 @@ public class UIManager : MonoBehaviour
     /// Forces a layout rebuild first so Layout Groups have already positioned the children. Returns false if the panel
     /// has no such Button (callers then fall back to the panel origin).
     /// </summary>
-    private bool TryGetInteractiveAreaCentre(Transform panelTransform, out Vector3 centre)
+    private bool TryGetInteractiveAreaCentre(Transform panelTransform, out Vector3 centre, out float bottomY)
     {
         centre = panelTransform.position;
+        bottomY = centre.y;
 
         RectTransform panelRect = panelTransform as RectTransform;
         if (panelRect != null) LayoutRebuilder.ForceRebuildLayoutImmediate(panelRect);
@@ -572,7 +694,7 @@ public class UIManager : MonoBehaviour
             }
         }
 
-        if (any) centre = bounds.center;
+        if (any) { centre = bounds.center; bottomY = bounds.min.y; }
         return any;
     }
 

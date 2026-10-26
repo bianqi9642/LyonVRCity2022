@@ -48,16 +48,26 @@ public class UIManager : MonoBehaviour
     public GameObject part3EndPanelTemplate;
 
     [Header("Placement settings")]
+    [Tooltip("Horizontal distance (m) from the HMD to the panel. The instruction canvases are 750x450 px at scale 0.01 " +
+             "(7.5 m x 4.5 m), so they are sized for roughly 5 m; a much smaller distance makes them fill the whole view.")]
     public float panelDistance = 1.2f;
+    [Tooltip("Horizontal offset applied in the facing frame. Its Y component is ignored for full panels: vertical " +
+             "placement comes from 'interactiveAreaEyeOffset' (the old -0.2 m Y offset put only the panel CENTRE near " +
+             "eye level, which left the buttons of a 4.5 m tall panel about 1.7 m below the eyes, i.e. below the floor).")]
     public Vector3 panelLocalOffset = new Vector3(0f, -0.2f, 0f);
+
+    [Tooltip("Vertical position of the panel's interactive area (the centre of its enabled Buttons) relative to the " +
+             "HMD eye height, in metres. 0 = eye level; negative = slightly below. Measured from the real button " +
+             "rectangles at show time, so panel size, pivot and layout are accounted for.")]
+    public float interactiveAreaEyeOffset = -0.1f;
 
     [Header("Head-anchored placement (all instruction canvases)")]
     [Tooltip("Explicit tracked-HMD transform used as the placement reference for every instruction panel. " +
              "Leave empty to fall back to 'hmdCamera', then Camera.main, then any active Camera.")]
     public Transform headTransformOverride;
 
-    [Tooltip("Place panels using only the participant's horizontal facing (head yaw). " +
-             "Pitch and roll are ignored so the panel remains level.")]
+    [Tooltip("Legacy flag, kept so existing scene references survive. Full panels are now ALWAYS placed on the " +
+             "participant's horizontal heading (head yaw); pitch and roll never affect where a panel appears.")]
     public bool placeUsingHeadYawOnly = true;
 
     [Header("Corner (shrunk) placement settings")]
@@ -71,6 +81,10 @@ public class UIManager : MonoBehaviour
     [Tooltip("Generator that renders an isolated image of the selected destination building. " +
              "If left empty it is located with FindObjectOfType at Awake.")]
     public TargetBuildingPreviewGenerator targetPreviewGenerator;
+
+    [Header("Debug")]
+    [Tooltip("Log one line per full-panel placement (never per frame).")]
+    public bool enableDebugLogs = false;
 
     // Runtime images for the current Phase 3 session. Owned by this component; destroyed on regeneration and OnDestroy.
     private Texture2D destination1Image;
@@ -109,7 +123,7 @@ public class UIManager : MonoBehaviour
     private Transform ResolveHeadTransform()
     {
         if (headTransformOverride != null) return headTransformOverride;
-        if (hmdCamera != null) return hmdCamera.transform;
+        if (hmdCamera != null && hmdCamera.isActiveAndEnabled) return hmdCamera.transform;
 
         Camera cam = Camera.main;
         if (cam == null)
@@ -470,37 +484,78 @@ public class UIManager : MonoBehaviour
             return;
         }
 
-        if (placeUsingHeadYawOnly)
+        // Horizontal heading only: pitch/roll of the head must never move a newly shown panel up or down.
+        Vector3 forward = head.forward;
+        forward.y = 0f;
+        if (forward.sqrMagnitude < 1e-6f)
         {
-            // Level placement: use only the horizontal component of the head forward.
-            Vector3 forward = head.forward;
-            forward.y = 0f;
-            if (forward.sqrMagnitude < 1e-6f)
+            // Participant looking straight up/down - fall back to head-space up projected to horizontal.
+            forward = Vector3.ProjectOnPlane(head.up, Vector3.up);
+            if (forward.sqrMagnitude < 1e-6f) forward = Vector3.forward;
+        }
+        forward.Normalize();
+
+        Quaternion facing = Quaternion.LookRotation(forward, Vector3.up);
+
+        // Provisional placement at eye height; the vertical position is then corrected from the real button rectangles.
+        Vector3 horizontalOffset = facing * new Vector3(localOffset.x, 0f, localOffset.z);
+        Vector3 worldPos = head.position + forward * panelDistance + horizontalOffset;
+        panelTransform.position = worldPos;
+
+        // Face the participant, kept perfectly level (project convention: canvas +Z points away from the viewer
+        // along the view direction, which makes the UI readable).
+        panelTransform.rotation = facing;
+
+        // Vertical placement: put the centre of the panel's interactive area (enabled Buttons) at eye level plus
+        // 'interactiveAreaEyeOffset'. Panel size, pivot and layout are measured, not assumed.
+        float targetY = head.position.y + interactiveAreaEyeOffset;
+        float currentY = worldPos.y;
+        bool measured = TryGetInteractiveAreaCentre(panelTransform, out Vector3 areaCentre);
+        if (measured) currentY = areaCentre.y;
+        worldPos.y += targetY - currentY;
+        panelTransform.position = worldPos;
+
+        if (enableDebugLogs)
+        {
+            Debug.Log($"[UIManager] Panel '{panelTransform.name}' placed {panelDistance:F1} m ahead; headY={head.position.y:F2}, " +
+                      $"interactiveCentreY={targetY:F2} (buttons measured: {measured}), panelY={worldPos.y:F2}.", this);
+        }
+    }
+
+    /// <summary>
+    /// World-space centre of the union of the rectangles of all enabled, interactable Buttons under the panel.
+    /// Forces a layout rebuild first so Layout Groups have already positioned the children. Returns false if the panel
+    /// has no such Button (callers then fall back to the panel origin).
+    /// </summary>
+    private bool TryGetInteractiveAreaCentre(Transform panelTransform, out Vector3 centre)
+    {
+        centre = panelTransform.position;
+
+        RectTransform panelRect = panelTransform as RectTransform;
+        if (panelRect != null) LayoutRebuilder.ForceRebuildLayoutImmediate(panelRect);
+
+        Button[] buttons = panelTransform.GetComponentsInChildren<Button>(false);
+        bool any = false;
+        Bounds bounds = new Bounds();
+        Vector3[] corners = new Vector3[4];
+
+        for (int i = 0; i < buttons.Length; i++)
+        {
+            Button b = buttons[i];
+            if (b == null || !b.isActiveAndEnabled || !b.interactable) continue;
+            RectTransform rt = b.transform as RectTransform;
+            if (rt == null) continue;
+
+            rt.GetWorldCorners(corners);
+            for (int c = 0; c < 4; c++)
             {
-                // Participant looking straight up/down - fall back to head-space forward projected to horizontal.
-                forward = Vector3.ProjectOnPlane(head.up, Vector3.up);
-                if (forward.sqrMagnitude < 1e-6f) forward = Vector3.forward;
+                if (!any) { bounds = new Bounds(corners[c], Vector3.zero); any = true; }
+                else bounds.Encapsulate(corners[c]);
             }
-            forward.Normalize();
-
-            Quaternion facing = Quaternion.LookRotation(forward, Vector3.up);
-
-            Vector3 worldPos = head.position + forward * panelDistance + facing * localOffset;
-            panelTransform.position = worldPos;
-
-            // Face the participant, kept perfectly level (project convention: canvas +Z points away from the viewer
-            // along the view direction, which makes the UI readable).
-            panelTransform.rotation = facing;
         }
-        else
-        {
-            // Full head-forward placement - preserves the original behaviour, now using the live head transform.
-            Vector3 worldPos = head.position + head.forward * panelDistance + head.TransformVector(localOffset);
-            panelTransform.position = worldPos;
 
-            // Rotate to face the camera so the front of the panel faces the user (existing project convention).
-            panelTransform.rotation = Quaternion.LookRotation(panelTransform.position - head.position);
-        }
+        if (any) centre = bounds.center;
+        return any;
     }
 
     #endregion

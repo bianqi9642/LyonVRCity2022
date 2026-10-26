@@ -429,7 +429,20 @@ public class GuardedTeleportationProvider : TeleportationProvider
         if (logRequests || enableDebugLogs)
             Debug.Log($"[GuardedTeleportationProvider] XRI request at {Fmt(request.destinationPosition)} routed to RiverTeleportPoint '{best.name}'.Select() (generic teleport declined).", this);
 
+        Transform rig = RigRoot();
+        Vector3 before = rig != null ? rig.position : Vector3.zero;
         best.Select();
+
+        // RiverTeleportPoint.Select() returns void and refuses silently (cooldown, boundary, missing refs), so the
+        // outcome is read from the rig: one line per participant action, never per frame.
+        if (logRequests || enableDebugLogs)
+        {
+            ExplorationBoundary eb = ExplorationBoundary.Instance;
+            Vector3 after = rig != null ? rig.position : Vector3.zero;
+            bool moved = rig != null && (after - before).sqrMagnitude > 0.0001f;
+            Debug.Log($"[GuardedTeleportationProvider] River route '{best.name}' result: {(moved ? "MOVED" : "NOT MOVED (cooldown, Exploration Area refusal or missing reference)")}. " +
+                      $"rig {Fmt(before)} -> {Fmt(after)} part='{PartName()}' boundary={(eb != null ? (eb.ProtectionActive ? "live+protecting" : "live,idle") : "null")}.", this);
+        }
         return true;
     }
 
@@ -539,10 +552,13 @@ public class GuardedTeleportationProvider : TeleportationProvider
         {
             lastRejectionLogTime = Time.unscaledTime;
             ExplorationBoundary eb = ExplorationBoundary.Instance;
-            string area = eb != null ? $" areaVolumes(active/total)={eb.ActiveAreaVolumeCount}/{eb.AreaVolumeCount}" : " areaVolumes=none";
+            string area = eb != null
+                ? $" boundary=live(protecting={eb.ProtectionActive}) areaVolumes(active/total)={eb.ActiveAreaVolumeCount}/{eb.AreaVolumeCount}"
+                : " boundary=null";
+            string rigNow = rig != null ? $" rigNow={Fmt(rig.position)}" : "";
             bool panel = uiManager != null && uiManager.HasOpenFullPanel;
             Debug.Log($"[GuardedTeleportationProvider] REJECTED XRI teleport: {reason}. dest={Fmt(request.destinationPosition)} " +
-                      $"head={Fmt(camLanding)} rigRoot={Fmt(rootLanding)} part='{PartName()}' anchor='{lastAnchorLabel}' trialActive={trialActive} panelOpen={panel}{area}.", this);
+                      $"head={Fmt(camLanding)} rigRoot={Fmt(rootLanding)} part='{PartName()}' anchor='{lastAnchorLabel}' trialActive={trialActive} panelOpen={panel}{rigNow}{area}.", this);
         }
 
         if (experimentManager != null)

@@ -144,6 +144,12 @@ public class ExperimentManager : MonoBehaviour
     public SpawnerManager spawner;
     public AgentProfile currentProfile;
 
+    [Header("Exploration boundary lifecycle")]
+    [Tooltip("If the ExplorationBoundary object is enabled but sits under an inactive parent (EnvironmentConfig/Participant), " +
+             "move only that object to the scene root at Awake so the boundary initialises. Turn off if the boundary is " +
+             "permanently placed under an active parent in the scene.")]
+    public bool ensureExplorationBoundaryActive = true;
+
     [Header("Part durations (seconds)")]
     public float part1Duration = 60f;
     public float part2FirstDuration = 60f;
@@ -319,6 +325,38 @@ public class ExperimentManager : MonoBehaviour
     {
         if (uiManager == null) Debug.LogWarning("ExperimentManager: UIManager not assigned in inspector.");
         if (sessionController == null) Debug.LogWarning("ExperimentManager: ExternalSessionController not assigned in inspector.");
+
+        EnsureExplorationBoundaryInitialised();
+    }
+
+    /// <summary>
+    /// The ExplorationBoundary component lives under EnvironmentConfig/Participant/..., organisation objects that are
+    /// saved inactive on purpose (they hold hidden marker meshes and NPC placeholders). A component inside an inactive
+    /// hierarchy never receives Awake/OnEnable/Start, so ExplorationBoundary.Instance stayed null: Part 2 walls were never
+    /// enabled, RiverTeleportPoint skipped its area test, and GuardedTeleportationProvider rejected every Part 2 XRI
+    /// teleport as "no_exploration_boundary". This runs before any Part starts and, only when the boundary object itself is
+    /// enabled but inactive in the hierarchy, re-parents JUST that object (with its wall colliders) to the scene root,
+    /// keeping its world pose. The organisation parents, the Area Volume colliders (hidden meshes) and every other
+    /// inactive object stay as authored. No-op when the boundary is already live (e.g. the hierarchy was activated in the
+    /// Editor) or when none exists.
+    /// </summary>
+    private void EnsureExplorationBoundaryInitialised()
+    {
+        if (!ensureExplorationBoundaryActive) return;
+
+        ExplorationBoundary[] found = FindObjectsOfType<ExplorationBoundary>(true);
+        for (int i = 0; i < found.Length; i++)
+        {
+            ExplorationBoundary eb = found[i];
+            if (eb == null) continue;
+            GameObject go = eb.gameObject;
+            if (go.activeInHierarchy || !go.activeSelf) continue; // already live, or deliberately disabled itself
+
+            string oldPath = go.transform.parent != null ? go.transform.parent.name + "/" + go.name : go.name;
+            go.transform.SetParent(null, worldPositionStays: true);
+            Debug.Log($"[ExperimentManager] ExplorationBoundary '{oldPath}' was inactive in the hierarchy; moved to the scene root " +
+                      $"(world pose kept) so it initialises before Part start. Instance available: {ExplorationBoundary.Instance != null}.", this);
+        }
     }
 
     private void Start()

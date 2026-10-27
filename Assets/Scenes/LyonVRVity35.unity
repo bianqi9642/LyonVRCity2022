@@ -5451,8 +5451,8 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 0.15, y: 3, z: 400.18994}
-  m_Center: {x: 0, y: 0, z: 0}
+  m_Size: {x: 0.15, y: 22.2, z: 400.18994}
+  m_Center: {x: 0, y: -2.6, z: 0}
 --- !u!1001 &54918697
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -22335,8 +22335,8 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 0.15, y: 3, z: 78.51283}
-  m_Center: {x: 0, y: 0, z: 0}
+  m_Size: {x: 0.15, y: 22.2, z: 78.51283}
+  m_Center: {x: 0, y: -2.6, z: 0}
 --- !u!1 &200584958
 GameObject:
   m_ObjectHideFlags: 0
@@ -25382,11 +25382,16 @@ MonoBehaviour:
   part3EndPanelTemplate: {fileID: 1220433592}
   panelDistance: 5
   panelLocalOffset: {x: 0, y: 1, z: 0}
+  interactiveAreaEyeOffset: -0.1
   headTransformOverride: {fileID: 0}
   placeUsingHeadYawOnly: 1
   topRightLocalPos: {x: 0, y: 2, z: 5}
   shrunkLocalScale: {x: 0.01, y: 0.01, z: 0.01}
   targetPreviewGenerator: {fileID: 744017214}
+  settledFramesRequired: 8
+  settledMaxHeightDelta: 0.003
+  settleTimeout: 3
+  enableDebugLogs: 0
 --- !u!1001 &224652559
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -33520,8 +33525,8 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 0.15, y: 3, z: 209.37692}
-  m_Center: {x: 0, y: 0, z: 0}
+  m_Size: {x: 0.15, y: 21.4812, z: 209.37692}
+  m_Center: {x: 0, y: 1.73625, z: 0}
 --- !u!1001 &301148227
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -41324,8 +41329,8 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 0.3, y: 3, z: 0.3}
-  m_Center: {x: 0, y: 0, z: 0}
+  m_Size: {x: 0.3, y: 64.6764, z: 0.3}
+  m_Center: {x: 0, y: 25.0428, z: 0}
 --- !u!1001 &368848002
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -48511,8 +48516,8 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 0.3, y: 3, z: 0.3}
-  m_Center: {x: 0, y: 0, z: 0}
+  m_Size: {x: 0.3, y: 22.2, z: 0.3}
+  m_Center: {x: 0, y: -2.6, z: 0}
 --- !u!1001 &444043312
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -60634,8 +60639,8 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 0.3, y: 3, z: 0.3}
-  m_Center: {x: 0, y: 0, z: 0}
+  m_Size: {x: 0.3, y: 21.4812, z: 0.3}
+  m_Center: {x: 0, y: 0.94423, z: 0}
 --- !u!1001 &556088111
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -60993,6 +60998,9 @@ MonoBehaviour:
   safetyRecoveryMode: 0
   safetyCheckSkin: 0.1
   lastValidSampleInterval: 0.25
+  enforceContainment: 1
+  containHeadPosition: 1
+  containmentRecoverInset: 0.1
   activePartName: Part2
   forceActiveForTesting: 0
   enableDebugLogs: 1
@@ -61082,7 +61090,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   m_EventMask:
     serializedVersion: 2
-    m_Bits: 4294967295
+    m_Bits: 4294967291
   m_MaxRayIntersections: 0
 --- !u!114 &560509425
 MonoBehaviour:
@@ -61118,6 +61126,12 @@ MonoBehaviour:
   noPartPolicy: 0
   requireActiveTrial: 1
   denyWhileFullPanelOpen: 1
+  practiceRootName: PracticeTeleportPoint
+  gridRootName: GridTeleportPoint
+  organicRootName: OrganicTeleportPoint
+  part1AllowedAnchors: 1
+  part3AllowedAnchors: 6
+  anchorMatchRadius: 0.25
   riverPointExclusionRadius: 1
   routeRiverAnchorRequests: 1
   logRejections: 1
@@ -70279,7 +70293,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!4 &647135922
 Transform:
   m_ObjectHideFlags: 0
@@ -77418,8 +77432,8 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 0.15, y: 3, z: 458.75256}
-  m_Center: {x: 0, y: 0, z: 0}
+  m_Size: {x: 0.15, y: 22.2, z: 458.75256}
+  m_Center: {x: 0, y: -2.6, z: 0}
 --- !u!1001 &710601986
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -83277,8 +83291,8 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 0.15, y: 3, z: 500.19003}
-  m_Center: {x: 0, y: 0, z: 0}
+  m_Size: {x: 0.15, y: 22.2, z: 500.19003}
+  m_Center: {x: 0, y: -0.808877, z: 0}
 --- !u!1 &773342941
 GameObject:
   m_ObjectHideFlags: 0
@@ -87343,8 +87357,8 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 0.3, y: 3, z: 0.3}
-  m_Center: {x: 0, y: 0, z: 0}
+  m_Size: {x: 0.3, y: 65.875, z: 0.3}
+  m_Center: {x: 0, y: 20.1297, z: 0}
 --- !u!1001 &802571084
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -117208,8 +117222,8 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 0.15, y: 3, z: 367.01392}
-  m_Center: {x: 0, y: 0, z: 0}
+  m_Size: {x: 0.15, y: 64.4554, z: 367.01392}
+  m_Center: {x: 0, y: 20.7199, z: 0}
 --- !u!1001 &1100452045
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -119570,7 +119584,7 @@ MonoBehaviour:
   enableROIRaycast: 1
   roiLayerMask:
     serializedVersion: 2
-    m_Bits: 4294967295
+    m_Bits: 4294967291
   roiMaxDistance: 50
   enableDebugLogs: 1
 --- !u!1001 &1121243365
@@ -129769,8 +129783,8 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 0.3, y: 3, z: 0.3}
-  m_Center: {x: 0, y: 0, z: 0}
+  m_Size: {x: 0.3, y: 22.2, z: 0.3}
+  m_Center: {x: 0, y: -0.301017, z: 0}
 --- !u!1001 &1229466438
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -137866,8 +137880,8 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 0.3, y: 3, z: 0.3}
-  m_Center: {x: 0, y: 0, z: 0}
+  m_Size: {x: 0.3, y: 22.2, z: 0.3}
+  m_Center: {x: 0, y: -2.6, z: 0}
 --- !u!1 &1311245224
 GameObject:
   m_ObjectHideFlags: 0
@@ -154380,8 +154394,8 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 0.3, y: 3, z: 0.3}
-  m_Center: {x: 0, y: 0, z: 0}
+  m_Size: {x: 0.3, y: 22.2, z: 0.3}
+  m_Center: {x: 0, y: -2.6, z: 0}
 --- !u!1001 &1479750631
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -167681,8 +167695,8 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 0.15, y: 3, z: 400.19006}
-  m_Center: {x: 0, y: 0, z: 0}
+  m_Size: {x: 0.15, y: 60.2403, z: 400.19006}
+  m_Center: {x: 0, y: -5.20756, z: 0}
 --- !u!1001 &1605861396
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -171448,8 +171462,8 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 0.3, y: 3, z: 0.3}
-  m_Center: {x: 0, y: 0, z: 0}
+  m_Size: {x: 0.3, y: 65.6352, z: 0.3}
+  m_Center: {x: 0, y: -24.6183, z: 0}
 --- !u!114 &1643646519 stripped
 MonoBehaviour:
   m_CorrespondingSourceObject: {fileID: 8503936499194532900, guid: c24a7635b5761984d81cf6c4aac26e0d, type: 3}
@@ -171879,6 +171893,8 @@ MonoBehaviour:
   playerRig: {fileID: 1625669939}
   spawner: {fileID: 1947343305}
   currentProfile: {fileID: 11400000, guid: 8ec1ac8d266554c54874ed3d7f9ce83e, type: 2}
+  ensureExplorationBoundaryActive: 1
+  disableParticipantRiverTeleportInPart2: 1
   part1Duration: 15
   part2FirstDuration: 15
   part2SecondDuration: 15
@@ -173795,8 +173811,8 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 0.15, y: 3, z: 600.19006}
-  m_Center: {x: 0, y: 0, z: 0}
+  m_Size: {x: 0.15, y: 17.8069, z: 600.19006}
+  m_Center: {x: 0, y: 0.536366, z: 0}
 --- !u!1001 &1669037740
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -178689,7 +178705,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!4 &1721331417
 Transform:
   m_ObjectHideFlags: 0
@@ -184805,7 +184821,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!4 &1786930768
 Transform:
   m_ObjectHideFlags: 0
@@ -211249,7 +211265,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!4 &2015723019
 Transform:
   m_ObjectHideFlags: 0

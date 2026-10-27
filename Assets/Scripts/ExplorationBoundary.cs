@@ -16,9 +16,11 @@
 //   irregular / L-shaped / multi-piece / ROTATED area works (ClosestPoint respects collider rotation).
 //
 //   The Editor generator (Assets/Editor/ExplorationBoundaryEditor.cs) traces the true world-space
-//   perimeter of the union of the Area Volumes (real rotated footprints, NOT their AABBs) and creates
-//   the Layer-1 wall colliders. It reuses AppendColliderFootprintXZ() below so the runtime gizmo and the
-//   generator always agree on the footprint geometry.
+//   perimeter of the union of the Area Volumes (real rotated footprints, NOT their AABBs) and creates the static
+//   wall sections (BoxColliders under 'GeneratedSegments') with a terrain-calibrated vertical extent. They are
+//   ordinary serialized Scene objects; nothing is generated at runtime.
+//   It reuses AppendColliderFootprintXZ() below so the runtime gizmo and the generator always agree on the
+//   footprint geometry.
 //
 // INTEGRATION (all additive; ExperimentManager is NOT modified)
 //   * Part window: subscribes to ExperimentManager.OnExperimentEvent and watches
@@ -27,8 +29,7 @@
 //     coroutine) is never missed. Always unsubscribed in OnDisable()/OnDestroy().
 //   * RiverTeleportPoint.Select() already calls ExplorationBoundary.Instance.IsTeleportDestinationAllowed(..).
 //   * Physical walls are discovered from 'boundarySegments' (explicit MANUAL list) PLUS every Collider
-//     under 'boundarySegmentsRoot' (recursive, incl. inactive). The Editor generator creates its walls
-//     under a child named "GeneratedSegments" and points 'boundarySegmentsRoot' at it.
+//     under 'boundarySegmentsRoot' (recursive, incl. inactive) - the authored "GeneratedSegments" child.
 //
 // PRIORITY RULE
 //   walls enabled  <=>  useBoundaryCollider (Inspector master switch)  AND  gated part running.
@@ -86,24 +87,6 @@ public class ExplorationBoundary : MonoBehaviour
     [SerializeField] private float safetyCheckSkin = 0.10f;
     [SerializeField] private float lastValidSampleInterval = 0.25f;
 
-    [Header("Layer 1b - Runtime 3D-robust walls (built from the Area Volumes)")]
-    [Tooltip("Build the physical walls at runtime from the Area Volumes (true union perimeter), following the terrain " +
-             "in short overlapping segments. Complements the Editor-generated 'GeneratedSegments', whose single flat " +
-             "height per long segment can leave the player a way under or over the wall on sloping ground.")]
-    [SerializeField] private bool buildRuntimeWalls = true;
-    [SerializeField] private float runtimeWallThickness = 0.4f;
-    [Tooltip("Longest runtime wall segment (m). Each segment gets its own vertical extent from the terrain under it.")]
-    [SerializeField] private float runtimeWallSegmentLength = 20f;
-    [Tooltip("Spacing (m) of the terrain probes along the perimeter.")]
-    [SerializeField] private float terrainSampleSpacing = 4f;
-    [Tooltip("The wall extends this far BELOW the lowest ground found under (and next to) a segment.")]
-    [SerializeField] private float runtimeWallBelowGround = 6f;
-    [Tooltip("The wall extends this far ABOVE the highest ground found under (and next to) a segment.")]
-    [SerializeField] private float runtimeWallAboveGround = 8f;
-    [Tooltip("Layers probed for the ground. Empty = the 'Ground' layer. Where no ground is found for a segment, the wall " +
-             "spans the full vertical range of the Area Volumes instead.")]
-    [SerializeField] private LayerMask terrainProbeMask = 0;
-
     [Header("Layer 3b - Containment (secondary enforcement while the gated part runs)")]
     [Tooltip("Keeps the participant inside the Exploration Area even if a wall is bypassed (teleport, room-scale lean, " +
              "unbaked terrain). Active only while protection is active. Works together with 'usePositionSafetyCheck' " +
@@ -132,43 +115,55 @@ public class ExplorationBoundary : MonoBehaviour
     [Serializable]
     public class GenerationSettings
     {
-        public enum VerticalMode { GroundRaycastPerSegment, FixedBaseY }
-
         [Header("Wall geometry")]
-        [Tooltip("Full wall height in metres (base at ground level, extends upward).")]
-        public float wallHeight = 3.0f;
         [Tooltip("Wall thickness in metres.")]
         public float wallThickness = 0.15f;
         [Tooltip("Gap (m) between the area perimeter and the wall's INNER face. 0 = inner face flush with " +
                  "the perimeter (recommended - does not shrink the usable area).")]
         public float wallOffset = 0.0f;
-        [Tooltip("Extra length added to EACH end of every wall run, on top of the automatic " +
-                 "(thickness/2 + max(0,offset)), so corners always overlap and never gap.")]
+        [Tooltip("Extra length (m) added to the two OUTER ends of every perimeter run, on top of thickness/2, so run ends " +
+                 "overlap their corner posts.")]
         public float extraCornerOverlap = 0.05f;
-        [Tooltip("Wall runs shorter than this (m) are treated as numerical slivers and skipped.")]
+        [Tooltip("Longest wall section (m). Every perimeter run is cut into sections of at most this length; each gets its own " +
+                 "terrain-calibrated height.")]
+        public float maxSectionLength = 20f;
+        [Tooltip("Overlap (m) between neighbouring sections of a run, so no gap remains at their junction.")]
+        public float sectionOverlap = 0.4f;
+        [Tooltip("Perimeter pieces shorter than this (m) are treated as numerical slivers and skipped.")]
         public float minEdgeLength = 0.05f;
 
         [Header("Corner closure")]
-        [Tooltip("Also drop a small square post collider at every perimeter corner so that corners at any " +
-                 "angle (not just 90 degrees) are guaranteed to be closed.")]
+        [Tooltip("Also create a small square post collider at every perimeter corner / run junction so that corners at any " +
+                 "angle are closed. Its height covers the union of the adjoining sections.")]
         public bool generateCornerPosts = true;
         [Tooltip("Corner post footprint size (m). 0 = auto (2 x wall thickness, min 0.2).")]
         public float cornerPostSize = 0f;
 
-        [Header("Wall vertical placement")]
-        public VerticalMode verticalMode = VerticalMode.GroundRaycastPerSegment;
-        [Tooltip("Layers treated as 'ground' for per-segment ground raycasts. Empty = auto ('Ground').")]
-        public LayerMask groundRaycastMask = 0;
-        [Tooltip("Wall base is placed this far BELOW detected ground (skirt against slope gaps).")]
-        public float wallSkirtBelowGround = 0.5f;
-        [Tooltip("Used when Vertical Mode = Fixed Base Y, and as the fallback when a ground raycast misses.")]
-        public float fixedBaseY = 0.0f;
+        [Header("Terrain-calibrated wall height")]
+        [Tooltip("Collider bottom = lowest relevant ground under the section minus this (m).")]
+        public float groundMarginBelow = 6f;
+        [Tooltip("Collider top = highest relevant ground under the section plus this (m).")]
+        public float groundMarginAbove = 8f;
+        [Tooltip("Spacing (m) of the ground samples along every perimeter run.")]
+        public float sampleSpacing = 2f;
+        [Tooltip("A section needs at least this fraction of valid ground samples to use only its own samples (Partial).")]
+        [Range(0.05f, 1f)] public float minValidFraction = 0.5f;
+        [Tooltip("A stretch of missing ground samples at least this long (m, measured along the whole perimeter) is flagged for review.")]
+        public float gapReviewLength = 20f;
+        [Tooltip("Missing samples may borrow the ground range of valid samples at most this far (m, along the perimeter) " +
+                 "(Inferred). Farther away the section falls back to the global ground envelope.")]
+        public float inferMaxDistance = 150f;
+        [Tooltip("Grid spacing (m) used to sample the interior of the exploration region for the global ground envelope.")]
+        public float interiorSampleSpacing = 20f;
 
-        [Header("Wall object")]
-        [Tooltip("Layer for generated walls. Empty = copy the first Area Volume's layer.")]
+        [Header("Wall objects")]
+        [Tooltip("Layer of the generated wall colliders. The XR Origin's CharacterController shares this layer, so they collide.")]
         public string wallLayerName = "Ignore Raycast";
-        [Tooltip("Name of the child container that holds generated segments. Clear only ever touches this.")]
+        [Tooltip("Name of the child container the generated walls live under (the component's 'boundarySegmentsRoot').")]
         public string containerName = "GeneratedSegments";
+        [Tooltip("Generate also removes walls left by the previous generator generation: direct children of the container named " +
+                 "Segment_NN / Corner_NN that consist of just a BoxCollider on the wall layer. Nothing else is ever deleted.")]
+        public bool removeLegacyWalls = true;
 
         [Header("Scene View visualization (editor only)")]
         public bool showAreaPerimeter = true;
@@ -189,8 +184,6 @@ public class ExplorationBoundary : MonoBehaviour
     private bool haveLastValid;
     private float lastValidTimer;
     private bool wasOutside;
-    private readonly List<Collider> runtimeWallColliders = new List<Collider>();
-    private Transform runtimeWallRoot;
     private Transform headRef;
 
     public bool ProtectionActive => isActiveAndEnabled && (partActive || forceActiveForTesting);
@@ -218,7 +211,6 @@ public class ExplorationBoundary : MonoBehaviour
     private void Start()
     {
         ResolveRefs();
-        BuildRuntimeWalls();
         RebuildSegmentCache();
         Subscribe();
         WarnIfMisconfigured();
@@ -278,13 +270,10 @@ public class ExplorationBoundary : MonoBehaviour
         {
             partActive = true;
             haveLastValid = false; lastValidTimer = 0f; wasOutside = false;
-            // Rebuild now: the terrain colliders may have been activated after Start, and the walls must follow them.
-            BuildRuntimeWalls();
-            RebuildSegmentCache();
             if (enableDebugLogs)
                 Debug.Log($"[ExplorationBoundary] {activePartName} start - protection ON " +
                           $"(walls {(useBoundaryCollider ? "enabled" : "SUPPRESSED by master switch")}, " +
-                          $"{resolvedSegments.Count} wall colliders, {runtimeWallColliders.Count} runtime).");
+                          $"{resolvedSegments.Count} wall colliders).");
             ApplyWallState(true);
         }
         else if (info.type == "part_end")
@@ -607,254 +596,6 @@ public class ExplorationBoundary : MonoBehaviour
         if (boundarySegmentsRoot != null)
             foreach (var c in boundarySegmentsRoot.GetComponentsInChildren<Collider>(true))
                 if (c != null && !resolvedSegments.Contains(c)) resolvedSegments.Add(c);
-        foreach (var c in runtimeWallColliders)
-            if (c != null && !resolvedSegments.Contains(c)) resolvedSegments.Add(c);
-    }
-
-    // ---------------------------------------------------------------- runtime walls (3D-robust)
-    private struct WallRun { public Vector2 a, b, outward; }
-
-    private void ClearRuntimeWalls()
-    {
-        for (int i = 0; i < runtimeWallColliders.Count; i++)
-        {
-            Collider c = runtimeWallColliders[i];
-            if (c == null) continue;
-            c.enabled = false;
-            Destroy(c.gameObject);
-        }
-        runtimeWallColliders.Clear();
-        if (runtimeWallRoot != null) { Destroy(runtimeWallRoot.gameObject); runtimeWallRoot = null; }
-    }
-
-    /// <summary>
-    /// Builds the physical walls from the Area Volumes: (1) the true XZ footprint polygon of every volume, (2) every polygon
-    /// edge minus the parts lying inside another volume = the perimeter of the UNION, (3) each run cut into short
-    /// segments of at most 'runtimeWallSegmentLength', (4) every segment gets its own vertical extent from the ground
-    /// probed under it (lowest and highest hit, so bridges/overpasses are covered) minus/plus margins, and from the Area
-    /// Volumes' own vertical range wherever no ground is found, (5) segments overlap along the run and a square post closes
-    /// every run end. Walls sit OUTSIDE the perimeter, so the permitted area is not reduced. Uses only transform math for the
-    /// volumes, so it is valid while they are inactive in the hierarchy. Colliders start disabled; ApplyWallState owns them.
-    /// </summary>
-    private void BuildRuntimeWalls()
-    {
-        ClearRuntimeWalls();
-        if (!buildRuntimeWalls || areaVolumes == null || areaVolumes.Length == 0) return;
-
-        // 1. footprints (CCW) and vertical range of the volumes
-        var polys = new List<Vector2[]>();
-        float volMinY = float.PositiveInfinity, volMaxY = float.NegativeInfinity;
-        var tmp = new List<Vector2>();
-        for (int i = 0; i < areaVolumes.Length; i++)
-        {
-            Collider c = areaVolumes[i];
-            if (c == null) continue;
-            tmp.Clear();
-            AppendColliderFootprintXZ(c, tmp);
-            if (tmp.Count < 3) continue;
-            Vector2[] poly = tmp.ToArray();
-            if (SignedArea(poly) < 0f) System.Array.Reverse(poly);
-            polys.Add(poly);
-
-            BoxCollider box = c as BoxCollider;
-            if (box != null)
-            {
-                for (int sx = -1; sx <= 1; sx += 2)
-                    for (int sy = -1; sy <= 1; sy += 2)
-                    {
-                        Vector3 w = box.transform.TransformPoint(box.center + new Vector3(0f, sy * box.size.y * 0.5f, 0f) +
-                                                                 new Vector3(sx * box.size.x * 0.5f, 0f, 0f));
-                        volMinY = Mathf.Min(volMinY, w.y); volMaxY = Mathf.Max(volMaxY, w.y);
-                    }
-            }
-            else if (c.bounds.size.y > 0f)
-            {
-                volMinY = Mathf.Min(volMinY, c.bounds.min.y); volMaxY = Mathf.Max(volMaxY, c.bounds.max.y);
-            }
-        }
-        if (polys.Count == 0) return;
-        if (float.IsInfinity(volMinY)) { volMinY = -1000f; volMaxY = 1000f; }
-
-        // 2. perimeter of the union = polygon edges minus the parts inside the other polygons
-        var runs = new List<WallRun>();
-        var inside = new List<Vector2>();
-        for (int pi = 0; pi < polys.Count; pi++)
-        {
-            Vector2[] poly = polys[pi];
-            for (int k = 0; k < poly.Length; k++)
-            {
-                Vector2 a = poly[k], b = poly[(k + 1) % poly.Length];
-                Vector2 d = b - a;
-                if (d.sqrMagnitude < 1e-4f) continue;
-
-                inside.Clear();
-                for (int pj = 0; pj < polys.Count; pj++)
-                {
-                    if (pj == pi) continue;
-                    if (ClipSegmentToConvex(a, b, polys[pj], out float t0, out float t1)) inside.Add(new Vector2(t0, t1));
-                }
-                inside.Sort((u, v) => u.x.CompareTo(v.x));
-
-                Vector2 dir = d.normalized;
-                Vector2 outward = new Vector2(dir.y, -dir.x);
-                if (PointInConvex(a + d * 0.5f + outward * 0.05f, poly)) outward = -outward;
-
-                float cursor = 0f;
-                for (int n = 0; n < inside.Count; n++)
-                {
-                    if (inside[n].x > cursor) AddRun(runs, a, d, cursor, inside[n].x, outward);
-                    cursor = Mathf.Max(cursor, inside[n].y);
-                }
-                if (cursor < 1f) AddRun(runs, a, d, cursor, 1f, outward);
-            }
-        }
-
-        // 3. ground probes + segments
-        int mask = terrainProbeMask.value != 0 ? terrainProbeMask.value : GroundMaskByName();
-        float probeTop = volMaxY + 50f;
-        float probeDist = (volMaxY - volMinY) + 150f;
-        var hits = new RaycastHit[16];
-
-        runtimeWallRoot = new GameObject("RuntimeWalls").transform;
-        runtimeWallRoot.SetParent(transform, false);
-        runtimeWallRoot.localPosition = Vector3.zero;
-        int layer = LayerMask.NameToLayer(generation != null ? generation.wallLayerName : "Ignore Raycast");
-        if (layer < 0) layer = 2;
-
-        float thick = Mathf.Max(0.1f, runtimeWallThickness);
-        float spacing = Mathf.Max(0.5f, terrainSampleSpacing);
-        int boxes = 0, groundHit = 0, groundMiss = 0, fallbackSegs = 0;
-        float gMin = float.PositiveInfinity, gMax = float.NegativeInfinity;
-
-        for (int r = 0; r < runs.Count; r++)
-        {
-            WallRun run = runs[r];
-            Vector2 ab = run.b - run.a;
-            float len = ab.magnitude;
-            Vector2 dir = ab / len;
-
-            int nSamples = Mathf.Max(2, Mathf.CeilToInt(len / spacing) + 1);
-            var sLow = new float[nSamples];
-            var sHigh = new float[nSamples];
-            var sOk = new bool[nSamples];
-            for (int s = 0; s < nSamples; s++)
-            {
-                Vector2 pt = run.a + ab * (s / (float)(nSamples - 1));
-                int n = Physics.RaycastNonAlloc(new Vector3(pt.x, probeTop, pt.y), Vector3.down, hits, probeDist, mask, QueryTriggerInteraction.Ignore);
-                if (n <= 0) { sOk[s] = false; groundMiss++; continue; }
-                float lo = float.PositiveInfinity, hi = float.NegativeInfinity;
-                for (int h = 0; h < n; h++) { lo = Mathf.Min(lo, hits[h].point.y); hi = Mathf.Max(hi, hits[h].point.y); }
-                sLow[s] = lo; sHigh[s] = hi; sOk[s] = true; groundHit++;
-                gMin = Mathf.Min(gMin, lo); gMax = Mathf.Max(gMax, hi);
-            }
-
-            int segCount = Mathf.Max(1, Mathf.CeilToInt(len / Mathf.Max(2f, runtimeWallSegmentLength)));
-            for (int sg = 0; sg < segCount; sg++)
-            {
-                float d0 = len * sg / segCount, d1 = len * (sg + 1) / segCount;
-                // sample window = this segment plus one probe spacing each side, so neighbouring segments overlap vertically
-                int i0 = Mathf.Clamp(Mathf.FloorToInt((d0 - spacing) / len * (nSamples - 1)), 0, nSamples - 1);
-                int i1 = Mathf.Clamp(Mathf.CeilToInt((d1 + spacing) / len * (nSamples - 1)), 0, nSamples - 1);
-                float lo = float.PositiveInfinity, hi = float.NegativeInfinity;
-                bool complete = true;
-                for (int s = i0; s <= i1; s++)
-                {
-                    if (!sOk[s]) { complete = false; break; }
-                    lo = Mathf.Min(lo, sLow[s]); hi = Mathf.Max(hi, sHigh[s]);
-                }
-                float bottom, top;
-                if (complete) { bottom = lo - runtimeWallBelowGround; top = hi + runtimeWallAboveGround; }
-                else { bottom = volMinY; top = volMaxY; fallbackSegs++; }
-
-                // overlap along the run: extend by a thickness at both ends
-                float segLen = (d1 - d0) + thick;
-                Vector2 mid2 = run.a + dir * ((d0 + d1) * 0.5f) + run.outward * (thick * 0.5f);
-                CreateWallBox(new Vector3(mid2.x, (bottom + top) * 0.5f, mid2.y),
-                              Quaternion.LookRotation(new Vector3(dir.x, 0f, dir.y), Vector3.up),
-                              new Vector3(thick, top - bottom, segLen), layer, ref boxes);
-
-                // square post at each run end closes corners of any angle
-                if (sg == 0 || sg == segCount - 1)
-                {
-                    Vector2 end = sg == 0 ? run.a : run.b;
-                    CreateWallBox(new Vector3(end.x, (bottom + top) * 0.5f, end.y), Quaternion.identity,
-                                  new Vector3(thick * 2f, top - bottom, thick * 2f), layer, ref boxes);
-                }
-            }
-        }
-
-        if (enableDebugLogs)
-        {
-            Debug.Log($"[ExplorationBoundary] runtime walls built: {runs.Count} perimeter runs, {boxes} colliders; ground probes hit/miss = " +
-                      $"{groundHit}/{groundMiss}; ground y {(groundHit > 0 ? gMin.ToString("F1") + ".." + gMax.ToString("F1") : "none found")}; " +
-                      $"{fallbackSegs} segments use the Area Volumes' vertical range ({volMinY:F1}..{volMaxY:F1}).");
-        }
-        if (groundHit == 0)
-            Debug.LogWarning("[ExplorationBoundary] No ground found under the perimeter (terrain colliders inactive or on another layer?). " +
-                             "Runtime walls use the full vertical range of the Area Volumes.");
-    }
-
-    private void CreateWallBox(Vector3 center, Quaternion rot, Vector3 size, int layer, ref int count)
-    {
-        var go = new GameObject("RW_" + count);
-        go.layer = layer;
-        go.transform.SetParent(runtimeWallRoot, false);
-        go.transform.SetPositionAndRotation(center, rot);
-        var bc = go.AddComponent<BoxCollider>();
-        bc.size = size;
-        bc.isTrigger = false;
-        bc.enabled = false;               // ApplyWallState enables it for the gated part
-        runtimeWallColliders.Add(bc);
-        count++;
-    }
-
-    private static void AddRun(List<WallRun> runs, Vector2 a, Vector2 d, float t0, float t1, Vector2 outward)
-    {
-        if ((t1 - t0) * d.magnitude < 0.05f) return;
-        runs.Add(new WallRun { a = a + d * t0, b = a + d * t1, outward = outward });
-    }
-
-    private static int GroundMaskByName()
-    {
-        int g = LayerMask.NameToLayer("Ground");
-        return g >= 0 ? (1 << g) : Physics.DefaultRaycastLayers;
-    }
-
-    private static float SignedArea(Vector2[] p)
-    {
-        float s = 0f;
-        for (int i = 0; i < p.Length; i++) { Vector2 u = p[i], v = p[(i + 1) % p.Length]; s += u.x * v.y - v.x * u.y; }
-        return s * 0.5f;
-    }
-
-    private static bool PointInConvex(Vector2 q, Vector2[] ccw)
-    {
-        for (int i = 0; i < ccw.Length; i++)
-        {
-            Vector2 e = ccw[(i + 1) % ccw.Length] - ccw[i];
-            if (e.x * (q.y - ccw[i].y) - e.y * (q.x - ccw[i].x) < 0f) return false;
-        }
-        return true;
-    }
-
-    // Cyrus-Beck: parameter interval [t0,t1] of segment a->b lying inside the CCW convex polygon.
-    private static bool ClipSegmentToConvex(Vector2 a, Vector2 b, Vector2[] ccw, out float t0, out float t1)
-    {
-        t0 = 0f; t1 = 1f;
-        Vector2 d = b - a;
-        for (int i = 0; i < ccw.Length; i++)
-        {
-            Vector2 p = ccw[i];
-            Vector2 e = ccw[(i + 1) % ccw.Length] - p;
-            Vector2 n = new Vector2(-e.y, e.x);                  // inward normal of a CCW polygon
-            float num = Vector2.Dot(n, a - p);
-            float den = Vector2.Dot(n, d);
-            if (Mathf.Abs(den) < 1e-9f) { if (num < 0f) return false; continue; }
-            float t = -num / den;
-            if (den > 0f) t0 = Mathf.Max(t0, t); else t1 = Mathf.Min(t1, t);
-            if (t0 >= t1) return false;
-        }
-        return t1 - t0 > 1e-5f;
     }
 
     private void ApplyWallState(bool force)
@@ -890,7 +631,12 @@ public class ExplorationBoundary : MonoBehaviour
         lastValidSampleInterval = Mathf.Max(0.02f, lastValidSampleInterval);
         if (generation != null)
         {
-            generation.wallHeight = Mathf.Max(0.05f, generation.wallHeight);
+            generation.sampleSpacing = Mathf.Max(0.25f, generation.sampleSpacing);
+            generation.maxSectionLength = Mathf.Max(2f, generation.maxSectionLength);
+            generation.sectionOverlap = Mathf.Max(0.05f, generation.sectionOverlap);
+            generation.interiorSampleSpacing = Mathf.Max(2f, generation.interiorSampleSpacing);
+            generation.groundMarginBelow = Mathf.Max(0f, generation.groundMarginBelow);
+            generation.groundMarginAbove = Mathf.Max(0f, generation.groundMarginAbove);
             generation.wallThickness = Mathf.Max(0.01f, generation.wallThickness);
             generation.minEdgeLength = Mathf.Max(0.001f, generation.minEdgeLength);
             generation.cornerPostSize = Mathf.Max(0f, generation.cornerPostSize);

@@ -242,7 +242,7 @@ public class DataCaptureManager : MonoBehaviour
         }
         else if (enableDebugLogs) Debug.LogWarning("[DataCapture] No SpawnerManager found; NPC capture disabled.");
 
-        _riverPoints = FindObjectsOfType<RiverTeleportPoint>();
+        _riverPoints = FindObjectsOfType<RiverTeleportPoint>(true);   // includeInactive: river points are inactive outside Part 3, their component events must still be subscribed
         for (int i = 0; i < _riverPoints.Length; i++)
             if (_riverPoints[i] != null) _riverPoints[i].OnPlayerTeleported += OnRiverCrossing;
 

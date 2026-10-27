@@ -515,11 +515,11 @@ public class UIManager : MonoBehaviour
             return null;
         }
 
-        // Instantiate under UIManager for organization, then parent to the head with worldPositionStays=false so we control local transform.
+        // Instantiate under UIManager first (HeadLockedPanel.Configure detaches it right away).
         GameObject instance = Instantiate(shrunkTemplate, this.transform);
         instance.SetActive(true);
 
-        // Camera-local pose for the chosen corner, computed BEFORE any component can touch the transform.
+        // Offset (lateral, height, horizontal distance) for the chosen corner, computed BEFORE any component can touch the transform.
         Vector3 localPos;
         switch (corner)
         {
@@ -529,21 +529,21 @@ public class UIManager : MonoBehaviour
             default:                localPos = topRightLocalPos; break;   // TopRight
         }
 
-        // HeadLockedPanel is the single owner of this panel's pose: Configure() parents it to the active HMD camera and
-        // applies the constant camera-local pose, so its position in the view cannot depend on head pitch/yaw/roll. The
-        // component does nothing until configured (see HeadLockedPanel). Only the two shrunk Destination panels are created
-        // here; the full-size panels never get this component.
+        // HeadLockedPanel is the single owner of this panel's pose. It follows the camera's position and horizontal heading
+        // (yaw) but ignores pitch and roll: x = lateral offset, y = height above the camera, z = horizontal distance. It
+        // does nothing until configured and detaches the panel from UIManager (so it never counts as an open full panel).
+        // Only the two shrunk Destination panels are created here; the full-size panels never get this component.
         HeadLockedPanel lockPanel = instance.GetComponent<HeadLockedPanel>();
         if (lockPanel == null) lockPanel = instance.AddComponent<HeadLockedPanel>();
         lockPanel.enableDebugLogs = enableDebugLogs;
-        lockPanel.Configure(head.GetComponent<Camera>(), localPos, Quaternion.identity, shrunkLocalScale);
+        lockPanel.Configure(head.GetComponent<Camera>(), localPos, shrunkLocalScale);
 
         if (enableDebugLogs)
         {
             float elevation = Mathf.Atan2(localPos.y, localPos.z) * Mathf.Rad2Deg;
-            Debug.Log($"[UIManager] Shrunk panel '{shrunkTemplate.name}' head-locked to camera '{head.name}' at camera-local {localPos}, " +
-                      $"scale {shrunkLocalScale} ({elevation:F1} deg above the line of sight); active={instance.activeInHierarchy}, " +
-                      $"lossyScale={instance.transform.lossyScale}.", this);
+            Debug.Log($"[UIManager] Shrunk panel '{shrunkTemplate.name}' follows camera '{head.name}' in yaw only at offset {localPos} " +
+                      $"(lateral, height, horizontal distance), scale {shrunkLocalScale} ({elevation:F1} deg above the level line of sight); " +
+                      $"active={instance.activeInHierarchy}.", this);
         }
 
         // Show the matching destination image on the shrunk HUD (same texture as the full panel).

@@ -1,22 +1,30 @@
 // HeadLockedPanel.cs
 //
-// Keeps a UI panel at a fixed pose in the participant's VIEW (camera-relative), so its position in the headset's field of
-// view does not change when the participant looks up, down or turns. Used only for the two small Experiment Phase
-// reminder panels (Destination 1 / Destination 2 "shrunk" panels) created by UIManager.CreateAndAnchorShrunkPanel.
-// Full-size interactive panels are NOT head-locked and never receive this component.
+// Hybrid "follow yaw, ignore pitch" placement for the two small Experiment Phase reminder panels (Destination 1 / 2 "shrunk"
+// panels created by UIManager.CreateAndAnchorShrunkPanel). Full-size interactive panels never get this component.
 //
-// Design
-// ------
-// - The panel is a child of the tracked HMD camera with a constant LOCAL pose. A camera child is exactly head-locked: its
-//   pose in camera space (hence its viewport position) cannot depend on head pitch/yaw/roll, and Unity moves it with the
-//   camera automatically, so no per-frame positioning and no render callbacks are needed.
-// - UIManager calls Configure() once with the final pose. That is the single source of truth for the pose; this component
-//   does nothing until it has been configured (an unconfigured component must never write a default pose - that was the
-//   cause of the panels disappearing: AddComponent applied a default zero pose/unit scale before UIManager could set the
-//   real values, and UIManager then read that default back as the "desired" pose).
-// - LateUpdate is only a cheap guard: if the camera became inactive/was replaced it re-resolves it and re-parents once, and
-//   if something else changed the local pose it restores it. In normal operation it writes nothing.
-// - The Canvas, its raycasters, scale and appearance are untouched, so controller UI interaction behaves as before.
+// Why not a child of the camera (the previous version)
+//   A child of the camera inherits its FULL rotation. The configured offset (0, 2, 5) is rotated with the head, so the panel
+//   sat at a constant place in the view at every pitch - it followed pitch and roll as well as yaw.
+//
+// What it does now (the panel is NOT parented to the camera)
+//   forward  = camera.forward projected onto the horizontal plane (yaw only); if the head looks (almost) straight up or down
+//              the projection is ~zero, and the last valid horizontal forward is used instead (never NaN, never a jump).
+//   position = camera.position + forward * distance + right * lateral + world-up * height
+//   rotation = LookRotation(forward, world-up)      -> upright, facing along the heading; the Canvas front is readable from
+//                                                      behind it, the same convention UIManager uses for full-size panels.
+//   * yaw   : forward turns with the head, so the panel keeps its horizontal place in the view.
+//   * pitch : ignored by construction; looking up/down moves the panel up/down in the view (intended).
+//   * roll  : ignored (rotation is built from a horizontal forward and world up).
+//   * head translation: the position follows camera.position, keeping the configured distance and height.
+//
+// Update stage: the pose is applied in Application.onBeforeRender. The XR pose driver moves the camera late in the frame
+// (Update and Before Render); this component subscribes after it (scene load) so it reads the final camera pose of the frame
+// that is about to be rendered. Applying in LateUpdate would use the previous frame's tracking pose. Work per frame: one
+// projection and one SetPositionAndRotation; no allocation, no logging.
+//
+// The panel is detached from UIManager's transform: UIManager.HasOpenFullPanel counts PanelController children of UIManager
+// as "open full panels" (which blocks generic teleports), and this HUD must not count.
 //
 // All comments in English per project convention.
 
@@ -25,79 +33,68 @@ using UnityEngine;
 [DisallowMultipleComponent]
 public class HeadLockedPanel : MonoBehaviour
 {
-    [Tooltip("Log a line when the camera/parent had to be re-resolved or the pose restored (never per frame).")]
+    [Tooltip("Log a line when the camera had to be re-resolved (never per frame).")]
     public bool enableDebugLogs = false;
 
     private Camera headCamera;
-    private Vector3 localPosition;
-    private Quaternion localRotation = Quaternion.identity;
-    private Vector3 localScale = Vector3.one;
+    private float lateral, height, distance;     // metres: along horizontal right / world up / horizontal forward
+    private Vector3 worldScale = Vector3.one;
+    private Vector3 lastForward = Vector3.forward;
     private bool configured;
 
     /// <summary>
-    /// Sets the camera and the constant camera-local pose and applies it immediately. Until this is called the component
-    /// leaves the transform alone.
+    /// Sets the reference camera and the offsets (x = lateral along the horizontal right, y = height above the camera along
+    /// world up, z = horizontal distance in the heading direction) and the panel scale, and applies them once. Until this is
+    /// called the component leaves the transform alone.
     /// </summary>
-    public void Configure(Camera camera, Vector3 position, Quaternion rotation, Vector3 scale)
+    public void Configure(Camera camera, Vector3 offset, Vector3 scale)
     {
         headCamera = camera;
-        localPosition = position;
-        localRotation = rotation;
-        localScale = scale;
+        lateral = offset.x; height = offset.y; distance = offset.z;
+        worldScale = scale;
+
+        if (transform.parent != null) transform.SetParent(null, worldPositionStays: true);
+        transform.localScale = worldScale;
         configured = true;
-        Apply(headCamera != null && headCamera.isActiveAndEnabled ? headCamera : ResolveCamera());
+
+        Camera cam = ActiveCamera();
+        if (cam != null)
+        {
+            Vector3 f = Vector3.ProjectOnPlane(cam.transform.forward, Vector3.up);
+            if (f.sqrMagnitude > 1e-4f) lastForward = f.normalized;
+        }
+        Apply();
     }
 
-    private void LateUpdate()
+    private void OnEnable() { Application.onBeforeRender += Apply; }
+    private void OnDisable() { Application.onBeforeRender -= Apply; }
+
+    private void Apply()
     {
         if (!configured) return;
-
-        Camera cam = headCamera;
-        if (cam == null || !cam.isActiveAndEnabled) cam = ResolveCamera();
+        Camera cam = ActiveCamera();
         if (cam == null) return;
 
-        if (transform.parent == cam.transform &&
-            transform.localPosition == localPosition &&
-            transform.localRotation == localRotation &&
-            transform.localScale == localScale)
-            return;   // nothing to do (the normal case)
+        Transform c = cam.transform;
+        Vector3 f = Vector3.ProjectOnPlane(c.forward, Vector3.up);
+        if (f.sqrMagnitude > 1e-4f) lastForward = f.normalized;     // otherwise keep the last valid heading
+        Vector3 fwd = lastForward;
+        Vector3 right = Vector3.Cross(Vector3.up, fwd);              // horizontal right of the heading
 
-        Apply(cam);
+        Vector3 pos = c.position + fwd * distance + right * lateral + Vector3.up * height;
+        transform.SetPositionAndRotation(pos, Quaternion.LookRotation(fwd, Vector3.up));
     }
 
-    private void Apply(Camera cam)
+    private Camera ActiveCamera()
     {
-        if (cam == null) return;
+        if (headCamera != null && headCamera.isActiveAndEnabled) return headCamera;
 
-        Transform camT = cam.transform;
-        if (transform.parent != camT)
-        {
-            if (enableDebugLogs)
-                Debug.Log($"[HeadLockedPanel] '{name}' re-parented to camera '{cam.name}'.", this);
-            transform.SetParent(camT, false);
-        }
-        else if (enableDebugLogs && configured && transform.localPosition != localPosition)
-        {
-            Debug.Log($"[HeadLockedPanel] '{name}' local pose was changed externally; restored.", this);
-        }
-
-        headCamera = cam;
-        transform.localPosition = localPosition;
-        transform.localRotation = localRotation;
-        transform.localScale = localScale;
-    }
-
-    private Camera ResolveCamera()
-    {
         Camera main = Camera.main;
-        if (main != null && main.isActiveAndEnabled) return main;
-
-        Camera[] all = Camera.allCameras;
-        for (int i = 0; i < all.Length; i++)
+        if (main != null && main.isActiveAndEnabled)
         {
-            Camera c = all[i];
-            if (c != null && c.isActiveAndEnabled && c.stereoTargetEye != StereoTargetEyeMask.None)
-                return c;
+            if (enableDebugLogs) Debug.Log($"[HeadLockedPanel] '{name}' switched to camera '{main.name}'.", this);
+            headCamera = main;
+            return main;
         }
         return null;
     }

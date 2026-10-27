@@ -99,29 +99,62 @@ public class RiverTeleportPoint : MonoBehaviour, IPointerClickHandler
         }
     }
 
-    // Called by UI/XR pointer click systems (mirrors TargetSelectable.OnPointerClick).
+    /// <summary>Outcome of a participant-initiated river teleport attempt.</summary>
+    public enum TeleportResult
+    {
+        Executed,
+        RejectedNotAvailable,       // not Part 3 (or its End Panel is showing) - the authoritative rule says no
+        RejectedNoExperimentManager,
+        RejectedNoPair,
+        RejectedNoRig,
+        RejectedCooldown,
+        RejectedBoundary
+    }
+
+    // Called by UI/XR pointer click systems (mirrors TargetSelectable.OnPointerClick). Pointer events reach only active,
+    // enabled components, and RiverPointAvailability keeps this object inactive outside Part 3.
     public void OnPointerClick(PointerEventData eventData)
     {
         Select();
     }
 
-    // For quick testing with a mouse in the Editor (requires a Collider, same as TargetSelectable).
+    // For quick testing with a mouse in the Editor (requires a Collider, same as TargetSelectable). Project convention
+    // (Select + OnPointerClick + OnMouseDown) is kept; with the Input System as the only input handler Unity may not send it.
     private void OnMouseDown()
     {
         Select();
     }
 
     /// <summary>
-    /// Public entry point. Can be called by XR Interactors, UI buttons, or other scripts,
-    /// in addition to the pointer-click handlers above.
+    /// Public entry point of the Select / OnPointerClick / OnMouseDown convention. It is only a name for
+    /// <see cref="TryTeleport"/>; there is no other river-teleport implementation.
     /// </summary>
     public void Select()
     {
-        // Part 2: participant-initiated river teleports are disabled (protocol). Every participant entry point - the
-        // pointer click, OnMouseDown and the Guard's XRI routing - ends here, so this single check covers them all.
-        // The scheduled cross-bank teleport does not use this method. Decided from the experiment state only.
+        TryTeleport();
+    }
+
+    /// <summary>
+    /// THE authoritative, only way a participant action moves the player across the river. Every participant entry point
+    /// ends here: pointer click, OnMouseDown, Select(), and the XRI anchor request that
+    /// GuardedTeleportationProvider routes to this point. (The scheduled Part 2 cross-bank teleport is
+    /// ExperimentManager.TeleportPlayerTo and is deliberately NOT a participant action.)
+    ///
+    /// Order: (1) availability - ExperimentManager.IsRiverTeleportAvailable, the single rule that also shows / hides the points
+    /// (Part 3 running, End Panel not shown); rejected requests change nothing and are reported as telemetry - (2) pairing and rig,
+    /// (3) cooldown, (4) Exploration Area (only relevant if the Part 3 restriction is switched off), (5) move + raise
+    /// OnPlayerTeleported. Returns what happened.
+    /// </summary>
+    public TeleportResult TryTeleport()
+    {
         if (experimentManager == null) experimentManager = FindObjectOfType<ExperimentManager>();
-        if (experimentManager != null && experimentManager.IsParticipantRiverTeleportBlocked)
+        if (experimentManager == null)
+        {
+            Debug.LogWarning($"RiverTeleportPoint ({gameObject.name}): no ExperimentManager - river teleport refused (phase unknown).");
+            return TeleportResult.RejectedNoExperimentManager;
+        }
+
+        if (!experimentManager.IsRiverTeleportAvailable)
         {
             if (Time.unscaledTime - lastBlockedLogTime > 0.5f)
             {
@@ -131,30 +164,32 @@ public class RiverTeleportPoint : MonoBehaviour, IPointerClickHandler
                 try { experimentManager.ReportParticipantTeleportRejected("river_point", ExperimentManager.RiverTeleportDisabledReason, rigPos, transform.position); }
                 catch (Exception e) { Debug.LogWarning("RiverTeleportPoint: rejection report failed: " + e.Message); }
             }
-            return;
+            return TeleportResult.RejectedNotAvailable;
         }
+
+        if (playerRig == null) playerRig = experimentManager.playerRig;
 
         if (pairedPoint == null)
         {
             Debug.LogWarning($"RiverTeleportPoint ({gameObject.name}): cannot teleport, pairedPoint is null.");
-            return;
+            return TeleportResult.RejectedNoPair;
         }
 
         if (playerRig == null)
         {
             Debug.LogWarning($"RiverTeleportPoint ({gameObject.name}): cannot teleport, playerRig is null.");
-            return;
+            return TeleportResult.RejectedNoRig;
         }
 
         // Cooldown guard to avoid immediate re-trigger.
         if (Time.time - lastTeleportTime < teleportCooldown)
         {
-            return;
+            return TeleportResult.RejectedCooldown;
         }
 
-        // Exploration Area boundary (Part 2): refuse a participant-triggered teleport whose destination lies
-        // outside the allowed area while boundary protection is active. No-op if the system is absent or
-        // protection is not currently active (IsTeleportDestinationAllowed returns true in those cases).
+        // Exploration Area boundary: refuse a destination outside the allowed area while boundary protection is active
+        // (Part 2 by default). Not reachable in the intended Part 3-only configuration; kept for when the Part 3
+        // restriction is switched off. No-op if the system is absent or not active (IsTeleportDestinationAllowed is true then).
         if (respectExplorationBoundary && ExplorationBoundary.Instance != null)
         {
             Vector3 destinationWorldPos = pairedPoint.position + Vector3.up * verticalOffset;
@@ -165,12 +200,13 @@ public class RiverTeleportPoint : MonoBehaviour, IPointerClickHandler
                     Debug.Log($"RiverTeleportPoint ({gameObject.name}): teleport to '{pairedPoint.name}' " +
                               $"blocked - destination is outside the Exploration Area.");
                 }
-                return;
+                return TeleportResult.RejectedBoundary;
             }
         }
 
         TeleportPlayerTo(pairedPoint);
         lastTeleportTime = Time.time;
+        return TeleportResult.Executed;
     }
 
     /// <summary>

@@ -150,10 +150,11 @@ public class ExperimentManager : MonoBehaviour
              "permanently placed under an active parent in the scene.")]
     public bool ensureExplorationBoundaryActive = true;
 
-    [Header("Part 2 participant teleport restrictions")]
-    [Tooltip("Participants cannot use the paired river teleport points (controller or UI click) while Part 2 runs. " +
-             "The scheduled cross-bank teleport at the Part 2 phase transition is unaffected.")]
-    public bool disableParticipantRiverTeleportInPart2 = true;
+    [Header("River teleport availability")]
+    [Tooltip("Participant-facing river teleport points (visuals, anchors, instruction signs) exist and work ONLY while Part 3 " +
+             "is running (part_start until its trial ends / End Panel). Part 1, Part 2 and idle: hidden and rejected. " +
+             "The scheduled cross-bank teleport in Part 2 is TeleportPlayerTo() and is not affected.")]
+    public bool restrictRiverTeleportToPart3 = true;
 
     [Header("Part durations (seconds)")]
     public float part1Duration = 60f;
@@ -421,17 +422,17 @@ public class ExperimentManager : MonoBehaviour
     /// </summary>
     public string RunningPartName => CurrentRunningPartString();
 
-    /// <summary>Rejection reason reported when a participant tries to use a river point while it is disabled.</summary>
-    public const string RiverTeleportDisabledReason = "river_teleport_disabled_in_part2";
+    /// <summary>Rejection reason reported when a participant tries to use a river point outside Part 3.</summary>
+    public const string RiverTeleportDisabledReason = "river_teleport_disabled_outside_part3";
 
     /// <summary>
-    /// True while a participant-initiated river teleport must be refused: Part 2 is running (from part_start until its End
-    /// Panel is confirmed) and the protocol switch is on. Single source of truth for GuardedTeleportationProvider and
-    /// RiverTeleportPoint, so the XRI and UI-click paths cannot diverge. The scheduled cross-bank transition is NOT a
-    /// river-point interaction: it is TeleportPlayerTo() and is unaffected.
+    /// The single rule for river teleport points: available only while Part 3 is actually running and its End Panel has not
+    /// been shown (running state, not the configured 'selectedPart'). Used by RiverPointAvailability (visibility of the
+    /// points and their signs) AND by RiverTeleportPoint.TryTeleport (execution), so visibility and permission cannot
+    /// disagree. The scheduled Part 2 cross-bank transition is NOT a river-point interaction.
     /// </summary>
-    public bool IsParticipantRiverTeleportBlocked =>
-        disableParticipantRiverTeleportInPart2 && currentRunningPart == RunningPart.Part2;
+    public bool IsRiverTeleportAvailable =>
+        !restrictRiverTeleportToPart3 || (currentRunningPart == RunningPart.Part3 && !EndPanelActive);
 
     /// <summary>
     /// A participant-initiated XRI teleport was EXECUTED. Raised through the existing "teleport" event so the

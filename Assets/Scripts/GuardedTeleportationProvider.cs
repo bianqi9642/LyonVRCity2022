@@ -125,12 +125,12 @@ public class GuardedTeleportationProvider : TeleportationProvider
 
     [Header("River points")]
     [Tooltip("Generic requests whose destination is within this horizontal distance (m) of a RiverTeleportPoint are " +
-             "rejected: river points teleport only through RiverTeleportPoint.Select() (pairing, cooldown, boundary, event).")]
+             "rejected: river points teleport only through RiverTeleportPoint.TryTeleport() (availability, pairing, cooldown, event).")]
     [SerializeField] private float riverPointExclusionRadius = 1f;
 
     [Tooltip("A request whose destination is on an ENABLED RiverTeleportPoint is not executed as a generic XRI " +
-             "teleport (which would land on the selected point itself). It is handed to RiverTeleportPoint.Select() - " +
-             "pairing, cooldown, boundary check, OnPlayerTeleported - and the XRI request is declined, so one participant " +
+             "teleport (which would land on the selected point itself). It is handed to RiverTeleportPoint.TryTeleport() - " +
+             "availability, pairing, cooldown, OnPlayerTeleported - and the XRI request is declined, so one participant " +
              "action causes exactly one operation. Requests near a river point that is not enabled stay rejected.")]
     [SerializeField] private bool routeRiverAnchorRequests = true;
 
@@ -205,20 +205,10 @@ public class GuardedTeleportationProvider : TeleportationProvider
     /// </summary>
     public override bool QueueTeleportRequest(TeleportRequest teleportRequest)
     {
-        // River points are paired-teleport-only: hand the action to RiverTeleportPoint.Select() and decline the
-        // generic request, so the rig is never moved to the selected river point's own anchor position.
-        // Part 2: participant-initiated river teleports are disabled. Decided from the experiment state alone (never from the
-        // boundary) and BEFORE the river-routing branch, which would otherwise reach RiverTeleportPoint.Select() ahead of
-        // the ordinary checks. Applies to every river point, active or not.
-        if (experimentManager != null && experimentManager.IsParticipantRiverTeleportBlocked &&
-            IsNearRiverPoint(teleportRequest.destinationPosition))
-        {
-            lastAnchorLabel = "river_point";
-            OnRequestRejected(teleportRequest, ExperimentManager.RiverTeleportDisabledReason,
-                              teleportRequest.destinationPosition, teleportRequest.destinationPosition);
-            return false;
-        }
-
+        // River points are paired-teleport-only: a request at an enabled river point is handed to that point's authoritative
+        // RiverTeleportPoint.TryTeleport() - which owns the Part 3 availability rule, pairing, cooldown and telemetry - and
+        // the generic request is ALWAYS declined here, accepted or not, so it can never become an ordinary teleport onto the
+        // river point itself.
         if (routeRiverAnchorRequests && TryRouteToRiverPoint(teleportRequest))
             return false;
 
@@ -444,21 +434,16 @@ public class GuardedTeleportationProvider : TeleportationProvider
         if (best == null) return false;
 
         if (logRequests || enableDebugLogs)
-            Debug.Log($"[GuardedTeleportationProvider] XRI request at {Fmt(request.destinationPosition)} routed to RiverTeleportPoint '{best.name}'.Select() (generic teleport declined).", this);
+            Debug.Log($"[GuardedTeleportationProvider] XRI request at {Fmt(request.destinationPosition)} routed to RiverTeleportPoint '{best.name}'.TryTeleport() (generic teleport declined).", this);
 
         Transform rig = RigRoot();
         Vector3 before = rig != null ? rig.position : Vector3.zero;
-        best.Select();
+        RiverTeleportPoint.TeleportResult result = best.TryTeleport();
 
-        // RiverTeleportPoint.Select() returns void and refuses silently (cooldown, boundary, missing refs), so the
-        // outcome is read from the rig: one line per participant action, never per frame.
         if (logRequests || enableDebugLogs)
         {
-            ExplorationBoundary eb = ExplorationBoundary.Instance;
             Vector3 after = rig != null ? rig.position : Vector3.zero;
-            bool moved = rig != null && (after - before).sqrMagnitude > 0.0001f;
-            Debug.Log($"[GuardedTeleportationProvider] River route '{best.name}' result: {(moved ? "MOVED" : "NOT MOVED (cooldown, Exploration Area refusal or missing reference)")}. " +
-                      $"rig {Fmt(before)} -> {Fmt(after)} part='{PartName()}' boundary={(eb != null ? (eb.ProtectionActive ? "live+protecting" : "live,idle") : "null")}.", this);
+            Debug.Log($"[GuardedTeleportationProvider] River route '{best.name}' result: {result}. rig {Fmt(before)} -> {Fmt(after)} part='{PartName()}'.", this);
         }
         return true;
     }

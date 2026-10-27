@@ -531,7 +531,8 @@ public class UIManager : MonoBehaviour
 
         // HeadLockedPanel is the single owner of this panel's pose. It places the panel once (lateral, height, horizontal
         // distance from the camera along its heading at this moment), fixes its world rotation, and from then on only
-        // translates it by the camera's world-position displacement - head rotation has no effect. It does nothing until
+        // translates it by the head's displacement in the XR rig's frame - physical head rotation has no effect, while
+        // controller (snap / continuous) turning of the rig rotates the panel with the player. It does nothing until
         // configured and detaches the panel from UIManager (so it never counts as an open full panel). Only the two shrunk
         // Destination panels are created here; the full-size panels never get this component.
         HeadLockedPanel lockPanel = instance.GetComponent<HeadLockedPanel>();

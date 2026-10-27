@@ -20,6 +20,10 @@
 //   * Visibility only. Whether a river teleport is ACCEPTED is decided where it executes, in
 //     RiverTeleportPoint.TryTeleport(), from the same ExperimentManager rule.
 //
+// Instruction sign position: 'signOffset' (+ optional 'perPointExtraOffset') on THIS component, applied when the signs are created. The
+// component is placed in the scene (GameObject 'RiverPointAvailability' at the Hierarchy root) so the values persist; it is created
+// automatically with defaults only if the scene has none.
+//
 // Instruction sign: world-space UGUI Canvas (dark panel, white TextMeshPro text) above the point. It has NO raycaster, NO
 // collider and no raycast-target graphic, so it cannot intercept the controller ray, the UI pointer or the point's own
 // collider. A YawBillboard turns it about the vertical axis toward the HMD.
@@ -44,11 +48,27 @@ public class RiverPointAvailability : MonoBehaviour
     [Header("References (explicit slot -> auto-find -> warn)")]
     [SerializeField] private ExperimentManager experimentManager;
 
-    [Header("Instruction sign")]
-    [Tooltip("Height of the sign centre above the river point (m).")]
-    [SerializeField] private float signHeightAbovePoint = 3.5f;
+    [Header("Instruction sign position (adjust here; applied when the signs are created at startup)")]
+    [Tooltip("Offset of EVERY sign from its river point, in WORLD axes and metres (X = east/west, Y = up, Z = north/south), " +
+             "measured from the river point's anchor root position. It is not rotated with the point or the camera. " +
+             "Default (0, 3.25, 0) = 3.25 m straight above the point. Lower the sign: reduce Y. Moves ONLY the sign: the " +
+             "river point, its anchor, its destination and the pairing are never touched.")]
+    [SerializeField] private Vector3 signOffset = new Vector3(0f, 3.25f, 0f);
+
+    [Tooltip("Optional EXTRA offset (world axes, metres) for individual signs, added to 'Sign Offset'. 'Key' is the point's " +
+             "'ParentName/Name' as it appears in the Hierarchy at startup: LeftBank/South, LeftBank/North, RightBank/South, " +
+             "RightBank/North. The four rows below are pre-filled with zero; set Y negative to lower just that sign.")]
+    [SerializeField] private PointOffset[] perPointExtraOffset = new PointOffset[0];
+
     [Tooltip("World width of the sign (m). Its height is 30% of the width.")]
     [SerializeField] private float signWidthMetres = 4f;
+
+    [System.Serializable]
+    private struct PointOffset
+    {
+        public string key;
+        public Vector3 extraOffset;
+    }
 
     [Header("Debug")]
     [SerializeField] private bool enableDebugLogs = false;
@@ -76,12 +96,17 @@ public class RiverPointAvailability : MonoBehaviour
             if (anchor == null)
                 Debug.LogWarning($"[RiverPointAvailability] '{rp.name}' has no TeleportationAnchor parent; only its own object is controlled.", rp);
 
+            // Key for per-point overrides, read BEFORE the root is detached from its LeftBank / RightBank parent.
+            string key = root.transform.parent != null ? root.transform.parent.name + "/" + root.name : root.name;
+
             // Hide FIRST (nothing is rendered or registered), then detach from the shared inactive hierarchy.
             root.SetActive(false);
             if (root.transform.parent != null) root.transform.SetParent(null, worldPositionStays: true);
 
-            CreateSign(root.transform);
+            Vector3 offset = signOffset + ExtraOffsetFor(key);
+            CreateSign(root.transform, offset);
             roots.Add(root);
+            if (enableDebugLogs) Debug.Log($"[RiverPointAvailability] Sign for '{key}' at world offset {offset} from the point.", this);
         }
 
         if (experimentManager != null)
@@ -123,7 +148,15 @@ public class RiverPointAvailability : MonoBehaviour
     }
 
     // ---------------------------------------------------------------- sign
-    private GameObject CreateSign(Transform pointRoot)
+    private Vector3 ExtraOffsetFor(string key)
+    {
+        if (perPointExtraOffset != null)
+            foreach (PointOffset o in perPointExtraOffset)
+                if (o.key == key) return o.extraOffset;
+        return Vector3.zero;
+    }
+
+    private GameObject CreateSign(Transform pointRoot, Vector3 worldOffset)
     {
         const float pxW = 1000f, pxH = 300f;
 
@@ -143,7 +176,7 @@ public class RiverPointAvailability : MonoBehaviour
         rt.localScale = new Vector3(worldPerPx / Mathf.Max(parentScale.x, 1e-4f),
                                     worldPerPx / Mathf.Max(parentScale.y, 1e-4f),
                                     worldPerPx / Mathf.Max(parentScale.z, 1e-4f));
-        rt.localPosition = new Vector3(0f, signHeightAbovePoint / Mathf.Max(parentScale.y, 1e-4f), 0f);
+        rt.localPosition = pointRoot.InverseTransformVector(worldOffset);   // world-axis offset, correct under the root's scale
 
         var bgGo = new GameObject("Background", typeof(RectTransform));
         bgGo.transform.SetParent(go.transform, false);

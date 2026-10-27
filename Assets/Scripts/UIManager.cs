@@ -529,10 +529,11 @@ public class UIManager : MonoBehaviour
             default:                localPos = topRightLocalPos; break;   // TopRight
         }
 
-        // HeadLockedPanel is the single owner of this panel's pose. It follows the camera's position and horizontal heading
-        // (yaw) but ignores pitch and roll: x = lateral offset, y = height above the camera, z = horizontal distance. It
-        // does nothing until configured and detaches the panel from UIManager (so it never counts as an open full panel).
-        // Only the two shrunk Destination panels are created here; the full-size panels never get this component.
+        // HeadLockedPanel is the single owner of this panel's pose. It places the panel once (lateral, height, horizontal
+        // distance from the camera along its heading at this moment), fixes its world rotation, and from then on only
+        // translates it by the camera's world-position displacement - head rotation has no effect. It does nothing until
+        // configured and detaches the panel from UIManager (so it never counts as an open full panel). Only the two shrunk
+        // Destination panels are created here; the full-size panels never get this component.
         HeadLockedPanel lockPanel = instance.GetComponent<HeadLockedPanel>();
         if (lockPanel == null) lockPanel = instance.AddComponent<HeadLockedPanel>();
         lockPanel.enableDebugLogs = enableDebugLogs;
@@ -541,8 +542,8 @@ public class UIManager : MonoBehaviour
         if (enableDebugLogs)
         {
             float elevation = Mathf.Atan2(localPos.y, localPos.z) * Mathf.Rad2Deg;
-            Debug.Log($"[UIManager] Shrunk panel '{shrunkTemplate.name}' follows camera '{head.name}' in yaw only at offset {localPos} " +
-                      $"(lateral, height, horizontal distance), scale {shrunkLocalScale} ({elevation:F1} deg above the level line of sight); " +
+            Debug.Log($"[UIManager] Shrunk panel '{shrunkTemplate.name}' placed once relative to camera '{head.name}' at offset {localPos} " +
+                      $"(lateral, height, horizontal distance); it then follows the camera's translation only. Scale {shrunkLocalScale} ({elevation:F1} deg above the level line of sight); " +
                       $"active={instance.activeInHierarchy}.", this);
         }
 

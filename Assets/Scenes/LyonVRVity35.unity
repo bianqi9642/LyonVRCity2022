@@ -61005,21 +61005,24 @@ MonoBehaviour:
   forceActiveForTesting: 0
   enableDebugLogs: 1
   generation:
-    wallHeight: 3
     wallThickness: 0.15
     wallOffset: 0
     extraCornerOverlap: 0.02
+    maxSectionLength: 20
+    sectionOverlap: 0.4
     minEdgeLength: 0.05
     generateCornerPosts: 1
     cornerPostSize: 0
-    verticalMode: 0
-    groundRaycastMask:
-      serializedVersion: 2
-      m_Bits: 0
-    wallSkirtBelowGround: 0.5
-    fixedBaseY: 168
+    groundMarginBelow: 6
+    groundMarginAbove: 8
+    sampleSpacing: 2
+    minValidFraction: 0.5
+    gapReviewLength: 20
+    inferMaxDistance: 150
+    interiorSampleSpacing: 20
     wallLayerName: Ignore Raycast
     containerName: GeneratedSegments
+    removeLegacyWalls: 1
     showAreaPerimeter: 1
     showGeneratedBoundary: 1
 --- !u!1 &560509418 stripped
@@ -109384,6 +109387,7 @@ Transform:
   - {fileID: 1947343306}
   - {fileID: 2139592828}
   - {fileID: 224290817}
+  - {fileID: 1700000002}
   - {fileID: 744017213}
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
@@ -171894,7 +171898,7 @@ MonoBehaviour:
   spawner: {fileID: 1947343305}
   currentProfile: {fileID: 11400000, guid: 8ec1ac8d266554c54874ed3d7f9ce83e, type: 2}
   ensureExplorationBoundaryActive: 1
-  disableParticipantRiverTeleportInPart2: 1
+  restrictRiverTeleportToPart3: 1
   part1Duration: 15
   part2FirstDuration: 15
   part2SecondDuration: 15
@@ -176930,6 +176934,63 @@ MeshCollider:
   m_Convex: 0
   m_CookingOptions: 30
   m_Mesh: {fileID: -4026746660908277063, guid: 59cb92be506734990bef11cd2dfa35f1, type: 3}
+--- !u!1 &1700000001
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1700000002}
+  - component: {fileID: 1700000003}
+  m_Layer: 0
+  m_Name: RiverPointAvailability
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!4 &1700000002
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1700000001}
+  serializedVersion: 2
+  m_LocalRotation: {x: -0, y: -0, z: -0, w: 1}
+  m_LocalPosition: {x: -2062.1785, y: -168.80946, z: -793.52997}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 1023763774}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &1700000003
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1700000001}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 3b8f20c6a7d14e59b1e4f7a09c2d6e83, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  experimentManager: {fileID: 1652900175}
+  signOffset: {x: 0, y: 2.5, z: 0}
+  perPointExtraOffset:
+  - key: LeftBank/South
+    extraOffset: {x: 0, y: 0, z: 0}
+  - key: LeftBank/North
+    extraOffset: {x: 0, y: 0, z: 0}
+  - key: RightBank/South
+    extraOffset: {x: 0, y: 0, z: 0}
+  - key: RightBank/North
+    extraOffset: {x: 0, y: 0, z: 0}
+  signWidthMetres: 4
+  enableDebugLogs: 0
 --- !u!1001 &1701642962
 PrefabInstance:
   m_ObjectHideFlags: 0

@@ -113,6 +113,7 @@ public class RiverPointAvailability : MonoBehaviour
         {
             experimentManager.OnExperimentEvent += OnExperimentEvent;
             experimentManager.OnEndPanelShown += Refresh;
+            experimentManager.OnParticipantControlChanged += OnControlChanged;
         }
         Apply(Available());
         if (enableDebugLogs)
@@ -125,8 +126,12 @@ public class RiverPointAvailability : MonoBehaviour
         {
             experimentManager.OnExperimentEvent -= OnExperimentEvent;
             experimentManager.OnEndPanelShown -= Refresh;
+            experimentManager.OnParticipantControlChanged -= OnControlChanged;
         }
     }
+
+    // The rule now also needs ExperimentManager.ParticipantControlEnabled (Running state), so the points follow it.
+    private void OnControlChanged(bool enabled) { Refresh(); }
 
     private void OnExperimentEvent(ExperimentEventInfo info)
     {

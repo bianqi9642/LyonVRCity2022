@@ -18706,6 +18706,14 @@ PrefabInstance:
     serializedVersion: 3
     m_TransformParent: {fileID: 0}
     m_Modifications:
+    - target: {fileID: 2728902658200667494, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
+      propertyPath: m_Enabled
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 3711799367079663623, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
+      propertyPath: m_SmoothTurnEnabled
+      value: 1
+      objectReference: {fileID: 0}
     - target: {fileID: 4134505312059479865, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
       propertyPath: m_LocalPosition.x
       value: 1991.3
@@ -163516,7 +163524,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!114 &1476784966
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -181452,6 +181460,7 @@ MonoBehaviour:
     npcCaptureEnabled: 1
     gazeCaptureEnabled: 1
     trajectoryCaptureEnabled: 1
+  enableLifecycleLogs: 1
   npcWarmupDuration: 30
   part1StartPosition: {fileID: 1571442372}
   part1TargetBuildings:
@@ -214194,7 +214203,7 @@ MonoBehaviour:
   maxWanderingPointsPerAgent: 8
   wanderLookAheadDistance: 15
   agentPrefab: {fileID: 3132995531446026970, guid: c34a3349d586043c09271e3b19db0437, type: 3}
-  maxAgents: 5000
+  maxAgents: 500
   spawnInterval: 0.1
   spawnSampleRadius: 1
   spawnSampleMaxAttempts: 8
@@ -214212,7 +214221,7 @@ MonoBehaviour:
   entranceSpawnRadius: 5
   entranceSpawnMaxAttempts: 12
   usePooling: 1
-  poolPrewarm: 5000
+  poolPrewarm: 500
   navmeshWaitTimeout: 5
   agentFactory: {fileID: 2139592827}
   defaultProfile: {fileID: 11400000, guid: 8ec1ac8d266554c54874ed3d7f9ce83e, type: 2}
@@ -214220,6 +214229,7 @@ MonoBehaviour:
   gateSpawningByTrialState: 1
   pauseLiveAgentsOutsideTrial: 1
   despawnLiveAgentsOnTrialEnd: 0
+  simulationIndependentOfTrial: 1
   navMeshPathfindingIterationsPerFrame: 1500
   enableDebugLogs: 1
 --- !u!4 &1947343306

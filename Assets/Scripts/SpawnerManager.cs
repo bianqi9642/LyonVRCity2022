@@ -38,6 +38,12 @@
 //   MoveToTarget       <- PauseExternal / ResumeExternal (trial pause, End-Panel hard stop)
 //   DataCaptureManager <- AgentSpawned / AgentDespawned / ActiveAgents (observer only)
 //
+// NPC SIMULATION LIFECYCLE (independent of the participant)
+//   The NPC simulation is open from the Part's NPC lifecycle (ExperimentManager.RunNpcWarmup -> BeginNpcSimulation) until the
+//   session ends (ExperimentManager.OnSessionEnded, i.e. the participant confirmed the End panel). It does NOT depend on the
+//   Start panel, on OnTrialStart/OnTrialEnd, or on the End panel being visible. With 'simulationIndependentOfTrial' = false the
+//   previous trial-window behaviour (pause at trial end, hard stop at the End panel) is kept.
+//
 // HISTORY OF NOTE (kept short; see the methods for details)
 //   - Trial-state gating and the NPC warm-up window are two independent flags (trialActive, npcWarmupActive)
 //     because they carry different experimental meaning; ExperimentManager sequences them so they never overlap.
@@ -200,6 +206,13 @@ public class SpawnerManager : MonoBehaviour
              "simply wait, frozen, until the next trial resumes them.")]
     public bool despawnLiveAgentsOnTrialEnd = false;
 
+    [Tooltip("If true (default), the NPC simulation is independent of the participant's Start / End panel interaction: spawning " +
+             "and movement continue while the Start panel waits, across the trial boundary and while the End panel is visible, " +
+             "and stop only when the session ends (End confirmed). Live agents are then never paused/resumed/despawned at " +
+             "trial boundaries and the End panel does not freeze them. If false, the previous behaviour applies (spawning " +
+             "gated by trial/warm-up windows, pause at trial end, hard stop at the End panel).")]
+    public bool simulationIndependentOfTrial = true;
+
     [Header("NavMesh Pathfinding Budget (global)")]
     [Min(1)]
     [Tooltip("NavMesh Pathfinding Iterations Per Frame. Written once to the global UnityEngine.AI.NavMesh." +
@@ -234,6 +247,8 @@ public class SpawnerManager : MonoBehaviour
     private bool trialActive = false;
     private bool npcWarmupActive = false;
     private bool endPanelActive = false;
+    private bool simulationActive = false;   // NPC simulation open (BeginNpcSimulation) until the session ends
+    private bool sessionEnded = false;       // terminal: set once by HandleSessionEnded, never cleared
 
     // The spawn loop must not run before the NavMesh wait + prewarm finished.
     private bool poolInitializationComplete = false;
@@ -350,6 +365,7 @@ public class SpawnerManager : MonoBehaviour
         if (experimentManager != null)
         {
             experimentManager.OnEndPanelShown += HandleEndPanelShown;
+            experimentManager.OnSessionEnded += HandleSessionEnded;
         }
 
         // Start sequence that waits/attempts NavMesh prewarm and only then starts spawn loop.
@@ -364,6 +380,7 @@ public class SpawnerManager : MonoBehaviour
             experimentManager.OnTrialStart -= HandleTrialStart;
             experimentManager.OnTrialEnd -= HandleTrialEnd;
             experimentManager.OnEndPanelShown -= HandleEndPanelShown;
+            experimentManager.OnSessionEnded -= HandleSessionEnded;
         }
     }
 
@@ -411,8 +428,8 @@ public class SpawnerManager : MonoBehaviour
     //   - The population cap applies last.
     private bool ShouldSpawnNow()
     {
-        bool gateOpen = !endPanelActive && NpcsEnabledForActivePart() &&
-            ((!gateSpawningByTrialState) || trialActive || npcWarmupActive);
+        bool gateOpen = !sessionEnded && !endPanelActive && NpcsEnabledForActivePart() &&
+            ((!gateSpawningByTrialState) || trialActive || npcWarmupActive || (simulationIndependentOfTrial && simulationActive));
 
         return gateOpen && liveAgents < maxAgents;
     }
@@ -426,7 +443,9 @@ public class SpawnerManager : MonoBehaviour
         trialActive = true;
         if (enableDebugLogs) Debug.Log("[SpawnerManager] Trial started -> NPC spawning enabled.");
 
-        if (pauseLiveAgentsOutsideTrial)
+        // Independent simulation: agents are never paused outside the trial, so there is nothing to resume - and resuming would
+        // interrupt agents that are dwelling at an attractor (the Start click must not touch the NPC simulation).
+        if (pauseLiveAgentsOutsideTrial && !simulationIndependentOfTrial)
         {
             ResumeAllActiveAgents();
         }
@@ -442,6 +461,9 @@ public class SpawnerManager : MonoBehaviour
         trialActive = false;
         if (enableDebugLogs) Debug.Log("[SpawnerManager] Trial ended -> NPC spawning disabled.");
 
+        // Independent simulation: the trial boundary does not touch live agents (they stop only when the session ends).
+        if (simulationIndependentOfTrial) return;
+
         if (despawnLiveAgentsOnTrialEnd)
         {
             ForceFinishAllActiveAgents();
@@ -450,6 +472,18 @@ public class SpawnerManager : MonoBehaviour
         {
             PauseAllActiveAgents();
         }
+    }
+
+    /// <summary>
+    /// Opens the NPC simulation for the Part that is starting (only called when that Part has NPCs enabled). From now until
+    /// the session ends, spawning and movement do not depend on the Start panel, the trial window or the End panel.
+    /// Idempotent; ignored after the session ended. Does not spawn, reset, pause or resume anything by itself.
+    /// </summary>
+    public void BeginNpcSimulation()
+    {
+        if (sessionEnded) return;
+        simulationActive = true;
+        if (enableDebugLogs) Debug.Log("[SpawnerManager] NPC simulation open (independent of the Start/End panels).");
     }
 
     /// <summary>
@@ -486,6 +520,7 @@ public class SpawnerManager : MonoBehaviour
     public void ResetForNewPart()
     {
         endPanelActive = false;
+        simulationActive = false;   // re-opened by BeginNpcSimulation() if the new Part has NPCs enabled
         if (enableDebugLogs) Debug.Log("[SpawnerManager] New Part starting -> End-Panel hard stop cleared.");
     }
 
@@ -503,6 +538,10 @@ public class SpawnerManager : MonoBehaviour
     /// </summary>
     private void HandleEndPanelShown()
     {
+        // Independent simulation: the End panel only locks the participant (ExperimentManager); NPCs keep running until End is
+        // confirmed (HandleSessionEnded).
+        if (simulationIndependentOfTrial) return;
+
         endPanelActive = true;
         HardStopAllActiveAgents();
         if (enableDebugLogs) Debug.Log("[SpawnerManager] End Panel shown -> NPC spawning and movement hard-stopped.");
@@ -527,6 +566,55 @@ public class SpawnerManager : MonoBehaviour
 
         UncertainBehavior ub = go.GetComponent<UncertainBehavior>();
         if (ub != null) ub.enabled = false;
+    }
+
+    /// <summary>
+    /// Terminal NPC shutdown, raised once by ExperimentManager when the End panel is confirmed. Closes every spawn gate for good,
+    /// stops this spawner's coroutines (spawn loop, prewarm) and freezes every live agent permanently WITHOUT destroying it:
+    /// the agent's own coroutines (dwell, facing, capacity polling, start-movement wait) are stopped and its mover / behaviour
+    /// components are disabled, so nothing can resume it (MoveTo, ResumeExternal, an arriving dwell timer). Idempotent.
+    /// </summary>
+    private void HandleSessionEnded()
+    {
+        if (sessionEnded) return;
+        sessionEnded = true;
+        simulationActive = false;
+        StopAllCoroutines();   // SpawnLoop / prewarm: no scheduled spawn can run after this point
+
+        int frozen = 0;
+        for (int i = 0; i < activeAgents.Count; i++)
+        {
+            GameObject go = activeAgents[i];
+            if (go == null) continue;
+            FreezeAgentPermanently(go);
+            frozen++;
+        }
+        if (enableDebugLogs) Debug.Log($"[SpawnerManager] Session ended -> spawning stopped, {frozen} live agent(s) frozen.");
+    }
+
+    private void FreezeAgentPermanently(GameObject go)
+    {
+        MoveToTarget mt = go.GetComponent<MoveToTarget>();
+        if (mt != null) mt.PauseExternal(true, true);   // halts the NavMeshAgent and freezes the animator
+
+        PedestrianAgent pa = go.GetComponent<PedestrianAgent>();
+        if (pa != null) { pa.StopAllCoroutines(); pa.enabled = false; }
+
+        UncertainBehavior ub = go.GetComponent<UncertainBehavior>();
+        if (ub != null) { ub.StopAllCoroutines(); ub.enabled = false; }
+
+        if (mt != null) { mt.StopAllCoroutines(); mt.enabled = false; }
+
+        NavMeshAgent nav = go.GetComponent<NavMeshAgent>();
+        if (nav != null)
+        {
+            if (nav.enabled && nav.isOnNavMesh) { nav.isStopped = true; nav.ResetPath(); }
+            nav.velocity = Vector3.zero;
+            nav.enabled = false;
+        }
+
+        Animator[] animators = go.GetComponentsInChildren<Animator>(true);
+        for (int i = 0; i < animators.Length; i++) animators[i].speed = 0f;   // also stops any root motion
     }
 
     private void HardStopAllActiveAgents()
@@ -667,6 +755,12 @@ public class SpawnerManager : MonoBehaviour
 
         if (!navAvailable && enableDebugLogs)
             Debug.LogWarning($"SpawnerManager: NavMesh not found near sample origin within {navmeshWaitTimeout}s. {failureNote}");
+
+        // Not gated by enableDebugLogs: with no NavMesh loaded at all, no NPC can be placed or routed (every spawn fails or idles
+        // until it is skipped), which is a scene configuration error rather than a diagnostic detail. Runs once per pool init.
+        if (!navAvailable && NavMesh.CalculateTriangulation().vertices.Length == 0)
+            Debug.LogError("[SpawnerManager] No NavMesh data is loaded in the scene, so NPCs cannot be placed or routed. " +
+                           "Check that the GameObject holding the NavMeshSurface (baked NavMesh data) is ACTIVE in the scene.");
     }
 
     // Instantiates 'poolPrewarm' inactive NPCs, each placed on the NavMesh near the sample origin (or parked out of

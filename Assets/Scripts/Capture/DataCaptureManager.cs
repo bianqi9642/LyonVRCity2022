@@ -232,6 +232,7 @@ public class DataCaptureManager : MonoBehaviour
             _experimentManager.OnTrialEnd   += OnTrialEnd;
             _experimentManager.OnExperimentEvent += OnExperimentEvent;
             _experimentManager.OnEndPanelShown += OnEndPanelShown;
+            _experimentManager.OnSessionEnded += OnSessionEnded;
         }
         else Debug.LogWarning("[DataCapture] No ExperimentManager found; event capture / scope tracking limited.");
 
@@ -269,6 +270,7 @@ public class DataCaptureManager : MonoBehaviour
             _experimentManager.OnTrialEnd   -= OnTrialEnd;
             _experimentManager.OnExperimentEvent -= OnExperimentEvent;
             _experimentManager.OnEndPanelShown -= OnEndPanelShown;
+            _experimentManager.OnSessionEnded -= OnSessionEnded;
         }
         if (_spawner != null)
         {
@@ -287,6 +289,17 @@ public class DataCaptureManager : MonoBehaviour
             WriteManifestEnd("on_destroy");
             _endWritten = true;
         }
+    }
+
+    // The participant confirmed the End panel: part_end was already written (ExperimentManager raises it first). Every row is
+    // appended and closed immediately, so nothing is buffered; this writes the same session_end row and manifest end that
+    // OnApplicationQuit/OnDestroy would, now, with the reason 'end_confirmed'. Idempotent via _endWritten.
+    void OnSessionEnded()
+    {
+        if (_endWritten) return;
+        WriteEventRow(CaptureConstants.EvtSessionEnd, CurrentPart, CurrentPhase, "", "", "", "", "", 0.0, "end_confirmed", Vector3.zero, Vector3.zero);
+        WriteManifestEnd("end_confirmed");
+        _endWritten = true;
     }
 
     void OnApplicationFocus(bool hasFocus)

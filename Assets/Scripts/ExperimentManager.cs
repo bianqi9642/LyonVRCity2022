@@ -80,6 +80,14 @@ using UnityEngine;
 ///  - part_end (raised after the participant confirms the End Panel) is UNCHANGED and still fires exactly
 ///    where it always did; this feature does not move it earlier and does not alter panel/UI semantics.
 ///
+/// SESSION LIFECYCLE (additive; supersedes the End-Panel freeze above while SpawnerManager.simulationIndependentOfTrial is true):
+///  - ParticipantControlEnabled is true only between OnTrialStart and OnTrialEnd. Before the Start panel is confirmed and from
+///    the End panel on, the participant cannot move, turn, teleport or select buildings (ParticipantControlLock,
+///    GuardedTeleportationProvider, RiverTeleportPoint, TargetSelectable all read it); the Start/End buttons stay usable.
+///  - The NPC simulation does not use that flag: it is open from the Part's NPC lifecycle (spawner.BeginNpcSimulation) and stops
+///    only when the End panel is confirmed (TerminateSession -> OnSessionEnded -> SpawnerManager freezes agents,
+///    DataCaptureManager writes session_end). After that no Part can be started and no scripted teleport runs.
+///
 /// OnTrialStart / OnTrialEnd still fire exactly once each, for every Part including Part1.
 /// </summary>
 public class ExperimentManager : MonoBehaviour
@@ -95,6 +103,29 @@ public class ExperimentManager : MonoBehaviour
     /// all continuous data capture for the remainder of the End Panel's visible duration.
     /// </summary>
     public event Action OnEndPanelShown;
+
+    // ---- Session lifecycle: participant control vs. NPC simulation (additive) -----------------------------------------------
+    // Three logical states, kept deliberately separate from the NPC simulation:
+    //   WaitingForStart  from Part start until the participant confirms the Start panel   participant locked
+    //   Running          OnTrialStart .. OnTrialEnd                                        participant control enabled
+    //   Ended            End panel shown (locked) ... End button confirmed (session terminal)
+    // ParticipantControlEnabled is the single permission flag for virtual locomotion, turning, teleportation (generic XRI and
+    // river points) and world selection. It is NOT used by the NPC system: NPCs run from the Part's NPC lifecycle until
+    // SessionEnded (see SpawnerManager.BeginNpcSimulation / HandleSessionEnded).
+    //
+    // OnParticipantControlChanged fires on every change; OnSessionEnded fires exactly once, after part_end was raised.
+
+    /// <summary>True only while the timed trial is running (OnTrialStart..OnTrialEnd). False before Start, from the End Panel on, and after the session ended.</summary>
+    public bool ParticipantControlEnabled { get; private set; }
+
+    /// <summary>True once the participant confirmed the End panel. Terminal: no Part can be started afterwards.</summary>
+    public bool SessionEnded { get; private set; }
+
+    /// <summary>Raised whenever <see cref="ParticipantControlEnabled"/> changes (argument = new value).</summary>
+    public event Action<bool> OnParticipantControlChanged;
+
+    /// <summary>Raised exactly once when the End panel is confirmed (after part_end). Subscribers freeze their systems.</summary>
+    public event Action OnSessionEnded;
 
     /// <summary>Additive observer event for the data-capture layer (Revision 2). Never affects control flow.</summary>
     public event Action<ExperimentEventInfo> OnExperimentEvent;
@@ -215,6 +246,10 @@ public class ExperimentManager : MonoBehaviour
     /// event itself rather than polling this.
     /// </summary>
     public bool EndPanelActive { get; private set; }
+
+    [Header("Session lifecycle")]
+    [Tooltip("Log one line when the session ends (End panel confirmed). Never logged per frame.")]
+    public bool enableLifecycleLogs = true;
 
     [Header("NPC Warm-up")]
     [Tooltip("Seconds of NPC-only warm-up run at the start of a Part that has 'Npc Enabled' = true in its " +
@@ -432,7 +467,7 @@ public class ExperimentManager : MonoBehaviour
     /// disagree. The scheduled Part 2 cross-bank transition is NOT a river-point interaction.
     /// </summary>
     public bool IsRiverTeleportAvailable =>
-        !restrictRiverTeleportToPart3 || (currentRunningPart == RunningPart.Part3 && !EndPanelActive);
+        ParticipantControlEnabled && (!restrictRiverTeleportToPart3 || (currentRunningPart == RunningPart.Part3 && !EndPanelActive));
 
     /// <summary>
     /// A participant-initiated XRI teleport was EXECUTED. Raised through the existing "teleport" event so the
@@ -455,22 +490,70 @@ public class ExperimentManager : MonoBehaviour
 
     #endregion
 
+    #region Session lifecycle helpers
+
+    private void SetParticipantControl(bool enabled)
+    {
+        if (ParticipantControlEnabled == enabled) return;
+        ParticipantControlEnabled = enabled;
+        OnParticipantControlChanged?.Invoke(enabled);
+    }
+
+    // Start of the timed trial: participant control is enabled first so listeners of OnTrialStart already see the Running state.
+    private void BeginTrial()
+    {
+        if (SessionEnded) return;
+        SetParticipantControl(true);
+        OnTrialStart?.Invoke();
+    }
+
+    // End of the timed trial: participant control is locked before OnTrialEnd / the End panel, so there is no unlocked gap.
+    private void EndTrial()
+    {
+        SetParticipantControl(false);
+        OnTrialEnd?.Invoke();
+    }
+
+    // Called as the last statement of RunPartN, after the End panel was confirmed and part_end was raised (so the capture layer
+    // has the part_end row). Idempotent: a repeated confirm or stale callback cannot end the session twice.
+    private void TerminateSession(string part)
+    {
+        if (SessionEnded) return;
+        SessionEnded = true;
+        SetParticipantControl(false);
+        runningCoroutine = null;
+        if (enableLifecycleLogs) Debug.Log($"[ExperimentManager] Session ended after {part}: participant locked, NPC simulation stopping, no further Part can start.", this);
+        OnSessionEnded?.Invoke();
+    }
+
+    private bool RefuseStartAfterEnd(string what)
+    {
+        if (!SessionEnded) return false;
+        Debug.LogWarning($"[ExperimentManager] {what} refused: the session has ended (End panel was confirmed).", this);
+        return true;
+    }
+
+    #endregion
+
     #region Public API to start each part
 
     public void StartPart1()
     {
+        if (RefuseStartAfterEnd("StartPart1")) return;
         if (runningCoroutine != null) StopCoroutine(runningCoroutine);
         runningCoroutine = StartCoroutine(RunPart1());
     }
 
     public void StartPart2()
     {
+        if (RefuseStartAfterEnd("StartPart2")) return;
         if (runningCoroutine != null) StopCoroutine(runningCoroutine);
         runningCoroutine = StartCoroutine(RunPart2());
     }
 
     public void StartPart3()
     {
+        if (RefuseStartAfterEnd("StartPart3")) return;
         if (runningCoroutine != null) StopCoroutine(runningCoroutine);
         runningCoroutine = StartCoroutine(RunPart3());
     }
@@ -512,7 +595,12 @@ public class ExperimentManager : MonoBehaviour
             yield break;
 
         if (spawner != null)
+        {
             spawner.defaultProfile = currentProfile;
+            // The NPC simulation runs from here until the session ends, independent of the Start panel, the trial window and
+            // the End panel (see SpawnerManager.BeginNpcSimulation).
+            spawner.BeginNpcSimulation();
+        }
 
         if (npcWarmupDuration <= 0f)
             yield break;
@@ -559,7 +647,7 @@ public class ExperimentManager : MonoBehaviour
         uiManager.ShowPart1StartPanel(() => { started = true; RaiseEvt("panel_confirmed", "Part1", label: "part1_start"); });
         yield return new WaitUntil(() => started);
 
-        OnTrialStart?.Invoke();
+        BeginTrial();
 
         targetWasSelected = false;
         float t = 0f;
@@ -569,7 +657,7 @@ public class ExperimentManager : MonoBehaviour
             yield return null;
         }
 
-        OnTrialEnd?.Invoke();
+        EndTrial();
 
         // Requirement 2: the End Panel hard stop. Raised BEFORE the panel is instantiated/shown, so
         // subscribers (SpawnerManager, DataCaptureManager) freeze NPCs/capture before the participant can
@@ -584,6 +672,7 @@ public class ExperimentManager : MonoBehaviour
 
         RaiseEvt("part_end", "Part1");
         currentRunningPart = RunningPart.None;
+        TerminateSession("Part1");
     }
 
     private IEnumerator RunPart2()
@@ -614,7 +703,7 @@ public class ExperimentManager : MonoBehaviour
         uiManager.ShowPart2StartPanel(() => { started = true; RaiseEvt("panel_confirmed", "Part2", label: "part2_start"); });
         yield return new WaitUntil(() => started);
 
-        OnTrialStart?.Invoke();
+        BeginTrial();
 
         targetWasSelected = false;
         float t = 0f;
@@ -642,7 +731,7 @@ public class ExperimentManager : MonoBehaviour
             yield return null;
         }
 
-        OnTrialEnd?.Invoke();
+        EndTrial();
 
         // Requirement 2: the End Panel hard stop (see RunPart1() for the full explanation).
         EndPanelActive = true;
@@ -655,6 +744,7 @@ public class ExperimentManager : MonoBehaviour
 
         RaiseEvt("part_end", "Part2");
         currentRunningPart = RunningPart.None;
+        TerminateSession("Part2");
     }
 
     private IEnumerator RunPart3()
@@ -744,7 +834,7 @@ public class ExperimentManager : MonoBehaviour
         uiManager.ShowPart3StartPanel(() => { started = true; RaiseEvt("panel_confirmed", "Part3", label: "part3_start"); });
         yield return new WaitUntil(() => started);
 
-        OnTrialStart?.Invoke();
+        BeginTrial();
         SetPhase("d1_pending");
 
         double phaseStartRealtime = Time.realtimeSinceStartupAsDouble;
@@ -933,7 +1023,7 @@ public class ExperimentManager : MonoBehaviour
         AppendPart3Log("phase_end", groupNumber, def, startPoint, destination1Building, destination2Building,
             selectedId: "", found: (d1Found && d2Found), elapsedSeconds: phaseTotalElapsed, notes: endReason);
 
-        OnTrialEnd?.Invoke();
+        EndTrial();
         SetPhase("ended");
 
         // Phase 3 is over: no Phase 3 target-specific interaction remains anywhere.
@@ -950,6 +1040,7 @@ public class ExperimentManager : MonoBehaviour
 
         RaiseEvt("part_end", "Part3");
         currentRunningPart = RunningPart.None;
+        TerminateSession("Part3");
     }
     #endregion
 
@@ -969,6 +1060,7 @@ public class ExperimentManager : MonoBehaviour
     private void TeleportPlayerTo(Transform dest)
     {
         if (dest == null || playerRig == null) return;
+        if (SessionEnded) return;   // terminal session: no scripted relocation from a stale callback
 
         // Part 2 invariant: no movement may leave the Exploration Area. The scheduled/scripted teleports are the
         // experiment's own moves (start position, cross-bank transition), so they are validated against the SAME

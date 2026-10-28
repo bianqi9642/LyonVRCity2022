@@ -62,6 +62,9 @@ public class TargetSelectable : MonoBehaviour, IPointerClickHandler
     // Public method that can be called by XR Interactors or other systems
     public void Select()
     {
+        // Participant locked (before Start, End panel visible, session ended): a building click does nothing and is not recorded.
+        if (experimentManager != null && !experimentManager.ParticipantControlEnabled) return;
+
         // Data-capture observer hook (never changes control flow).
         try { Clicked?.Invoke(this); }
         catch (System.Exception e) { Debug.LogWarning("[TargetSelectable] Clicked observer threw: " + e.Message); }

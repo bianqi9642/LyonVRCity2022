@@ -159,9 +159,11 @@ public class RiverTeleportPoint : MonoBehaviour, IPointerClickHandler
             if (Time.unscaledTime - lastBlockedLogTime > 0.5f)
             {
                 lastBlockedLogTime = Time.unscaledTime;
-                Debug.Log($"RiverTeleportPoint ({gameObject.name}): participant river teleport rejected - {ExperimentManager.RiverTeleportDisabledReason}.");
+                string blockReason = experimentManager.ParticipantControlEnabled ? ExperimentManager.RiverTeleportDisabledReason
+                                   : (experimentManager.SessionEnded ? "session_ended" : "participant_locked");
+                Debug.Log($"RiverTeleportPoint ({gameObject.name}): participant river teleport rejected - {blockReason}.");
                 Vector3 rigPos = playerRig != null ? playerRig.position : Vector3.zero;
-                try { experimentManager.ReportParticipantTeleportRejected("river_point", ExperimentManager.RiverTeleportDisabledReason, rigPos, transform.position); }
+                try { experimentManager.ReportParticipantTeleportRejected("river_point", blockReason, rigPos, transform.position); }
                 catch (Exception e) { Debug.LogWarning("RiverTeleportPoint: rejection report failed: " + e.Message); }
             }
             return TeleportResult.RejectedNotAvailable;

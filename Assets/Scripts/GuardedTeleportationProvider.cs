@@ -257,6 +257,14 @@ public class GuardedTeleportationProvider : TeleportationProvider
             return false;
         }
 
+        // Session lifecycle lock: before Start, from the End panel on, and after the session ended, no participant teleport is
+        // executed whatever the Part policy or anchor category says.
+        if (!experimentManager.ParticipantControlEnabled)
+        {
+            reason = experimentManager.SessionEnded ? "session_ended" : "participant_locked";
+            return false;
+        }
+
         string part = PartName();
         GenericTeleportPolicy policy = PolicyFor(part);
 

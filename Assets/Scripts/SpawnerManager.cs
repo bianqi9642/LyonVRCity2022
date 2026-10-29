@@ -785,6 +785,8 @@ public class SpawnerManager : MonoBehaviour
         {
             // instantiate the prefab (Awake will run here)
             GameObject go = Instantiate(agentPrefab, sampleOrigin + Random.insideUnitSphere * 0.5f, Quaternion.identity);
+            double createdTAbs = CaptureClock.TAbs;
+            long createdTUnix = CaptureClock.TUnixMs;
 
             // attempt to place on NavMesh near sampleOrigin using improved sampling
             Vector3 navPos = SampleNavMeshNear(sampleOrigin, sampleRadius, spawnSampleMaxAttempts);
@@ -843,6 +845,9 @@ public class SpawnerManager : MonoBehaviour
             // Deactivate and add to pool
             go.SetActive(false);
             pool.Add(go);
+
+            // Data capture: the object now exists as a reusable, INACTIVE pool member. This is not a live NPC and consumes no lifetime.
+            RecordPoolObjectCreated(go, CaptureConstants.NpcEvtPrewarmCreated, "prewarm", i, createdTAbs, createdTUnix);
 
             // yield occasionally to avoid editor freeze
             if (i % 8 == 0) yield return null;
@@ -903,11 +908,13 @@ public class SpawnerManager : MonoBehaviour
 
         // 2. ACQUIRE ------------------------------------------------------------------------------------------
         bool reused = usePooling && pool.Count > 0;
+        double acquireTAbs = CaptureClock.TAbs;
         GameObject go = reused ? TakeFromPool(spawnPos) : InstantiateNewAgent(spawnPos);
         if (go == null)
             return;
 
         PedestrianAgent agentScript = go.GetComponent<PedestrianAgent>();
+        RecordPoolAcquired(agentScript, reused, acquireTAbs);
 
         ApplyAgentProfile(go);
         BindMoverToAgent(go);
@@ -1521,6 +1528,8 @@ public class SpawnerManager : MonoBehaviour
     private GameObject InstantiateNewAgent(Vector3 spawnPos)
     {
         GameObject go = Instantiate(agentPrefab, spawnPos, Quaternion.identity);
+        double createdTAbs = CaptureClock.TAbs;
+        long createdTUnix = CaptureClock.TUnixMs;
 
         if (go.GetComponent<PedestrianAgent>() == null)
         {
@@ -1528,6 +1537,8 @@ public class SpawnerManager : MonoBehaviour
             Destroy(go);
             return null;
         }
+
+        RecordPoolObjectCreated(go, CaptureConstants.NpcEvtPoolObjectCreated, "runtime_instantiate", -1, createdTAbs, createdTUnix);
 
         PlaceNewAgent(go, spawnPos);
         return go;
@@ -1657,6 +1668,7 @@ public class SpawnerManager : MonoBehaviour
         activeAgents.Add(go); // track for trial-state pause/resume/despawn
         agentScript.onAgentFinished += OnAgentFinished;
         RaiseAgentSpawned(agentScript);
+        // The npc_spawn lifecycle event itself is raised by PedestrianAgent.Initialize() (the lifetime boundary), before any movement event.
     }
 
     #endregion
@@ -1677,6 +1689,8 @@ public class SpawnerManager : MonoBehaviour
         liveAgents--;
         activeAgents.Remove(agent.gameObject); // stop tracking this agent for trial-state pause/despawn
         RaiseAgentDespawned(agent); // data-capture observer (after list mutation)
+        RaiseLifecycle(CaptureConstants.NpcEvtDespawn, agent, CaptureClock.TAbs, CaptureClock.TUnixMs,
+            "spawn_t_abs=" + CaptureClock.F4(agent.LifetimeSpawnTAbs) + ";live_agents=" + liveAgents);
 
         if (usePooling)
         {
@@ -1709,11 +1723,69 @@ public class SpawnerManager : MonoBehaviour
 
             go.SetActive(false);
             pool.Add(go);
+            RaiseLifecycle(CaptureConstants.NpcEvtPoolReturn, agent, CaptureClock.TAbs, CaptureClock.TUnixMs, "pool_size=" + pool.Count);
         }
         else
         {
             Destroy(agent.gameObject);
         }
+    }
+
+    #endregion
+
+    // =================================================================================================================
+    #region 12b. Data-capture notifications (observation only: no spawning, pooling, itinerary or timing decision depends on them)
+    // =================================================================================================================
+
+    // Records that a pool object exists. For a prewarmed object this is NOT a live NPC: it is inactive, has no itinerary and consumes no
+    // lifetime index. The stable AgentID is assigned here if Awake did not run yet.
+    private void RecordPoolObjectCreated(GameObject go, string eventType, string kind, int index, double tAbs, long tUnixMs)
+    {
+        PedestrianAgent pa = go != null ? go.GetComponent<PedestrianAgent>() : null;
+        if (pa == null) return;
+
+        pa.EnsureAgentId();
+        pa.ObjectCreatedTAbs = tAbs;
+        pa.ObjectCreatedTUnixMs = tUnixMs;
+        pa.ObjectCreatedKind = kind;
+
+        string prefab = agentPrefab != null ? agentPrefab.name : "";
+        RaiseLifecycle(eventType, pa, tAbs, tUnixMs, "prefab=" + prefab + ";object=" + go.name + ";index=" + index + ";kind=" + kind + ";active_npc=0");
+    }
+
+    private void RecordPoolAcquired(PedestrianAgent pa, bool fromPool, double tAbs)
+    {
+        if (pa == null) return;
+
+        // A lifetime that was never closed must not leak into the next one (should not happen: Finish/ForceFinish close it).
+        if (pa.HasOpenLifetime)
+            Debug.LogWarning($"[SpawnerManager] {pa.AgentID} was reacquired while lifetime {pa.LifetimeId} was still open.");
+
+        pa.PoolAcquiredTAbs = tAbs;
+        pa.SpawnSource = fromPool ? "pool" : "new";
+        if (fromPool)
+            RaiseLifecycle(CaptureConstants.NpcEvtPoolAcquired, pa, tAbs, CaptureClock.TUnixMs, "pool_size=" + pool.Count);
+    }
+
+    private void RaiseLifecycle(string type, PedestrianAgent pa, double tAbs, long tUnixMs, string value)
+    {
+        if (pa == null) return;
+        Vector3 pos = pa.transform.position;
+        NpcLifecycleBus.Raise(new NpcLifecycleEvent
+        {
+            type = type,
+            tAbs = tAbs,
+            tUnixMs = tUnixMs,
+            agent = pa,
+            agentId = pa.AgentID,
+            lifetimeId = (type == CaptureConstants.NpcEvtSpawn || type == CaptureConstants.NpcEvtDespawn || type == CaptureConstants.NpcEvtPoolReturn) ? pa.LastLifetimeId : "",
+            lifetimeIndex = (type == CaptureConstants.NpcEvtSpawn || type == CaptureConstants.NpcEvtDespawn || type == CaptureConstants.NpcEvtPoolReturn) ? pa.LifetimeIndex : 0,
+            pos = pos,
+            yaw = pa.transform.eulerAngles.y,
+            itineraryIndex = -1,
+            targetId = "",
+            value = value ?? ""
+        });
     }
 
     #endregion

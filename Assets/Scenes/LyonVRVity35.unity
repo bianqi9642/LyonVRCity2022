@@ -131734,7 +131734,7 @@ MonoBehaviour:
   enableROIRaycast: 1
   roiLayerMask:
     serializedVersion: 2
-    m_Bits: 4294967291
+    m_Bits: 123
   roiMaxDistance: 50
   enableDebugLogs: 1
 --- !u!1001 &1121243365
@@ -139605,6 +139605,13 @@ MonoBehaviour:
   npcHz: 10
   writeFullBatiRegistry: 1
   registryScanChunk: 500
+  npcStateSamplingIntervalSeconds: 0.1
+  npcStateDataBudgetMBPerMinute: 0
+  npcStateMaxIntervalSeconds: 2
+  readoutEffectiveIntervalSeconds: 0
+  readoutObservedMBPerMinute: 0
+  readoutActiveNpcs: 0
+  readoutBudgetStatus: unlimited
   enableDebugLogs: 1
 --- !u!1 &1186876274
 GameObject:
@@ -190171,7 +190178,7 @@ MonoBehaviour:
     gazeCaptureEnabled: 1
     trajectoryCaptureEnabled: 1
   enableLifecycleLogs: 1
-  npcWarmupDuration: 0
+  npcWarmupDuration: 10
   part1StartPosition: {fileID: 1571442372}
   part1TargetBuildings:
   - {fileID: 1707754393}
@@ -225015,7 +225022,7 @@ MonoBehaviour:
   maxWanderingPointsPerAgent: 8
   wanderLookAheadDistance: 15
   agentPrefab: {fileID: 3132995531446026970, guid: c34a3349d586043c09271e3b19db0437, type: 3}
-  maxAgents: 5000
+  maxAgents: 100
   spawnInterval: 0.1
   spawnSampleRadius: 1
   spawnSampleMaxAttempts: 8
@@ -225033,7 +225040,7 @@ MonoBehaviour:
   entranceSpawnRadius: 5
   entranceSpawnMaxAttempts: 12
   usePooling: 1
-  poolPrewarm: 5000
+  poolPrewarm: 100
   navmeshWaitTimeout: 5
   agentFactory: {fileID: 2139592827}
   defaultProfile: {fileID: 11400000, guid: 8ec1ac8d266554c54874ed3d7f9ce83e, type: 2}

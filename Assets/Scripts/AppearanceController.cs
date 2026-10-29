@@ -44,6 +44,13 @@ public class AppearanceController : MonoBehaviour
     public AgentGender CurrentGender { get; private set; }
 
     /// <summary>
+    /// Data capture (observation only): what the MOST RECENT ApplyProfile call actually produced - the realised option index, mesh and material
+    /// assets per part. A new immutable instance is created per call, so a holder of an older instance (an earlier NPC lifetime) is never affected
+    /// by a later re-skin of this pooled object. Null until ApplyProfile has run.
+    /// </summary>
+    public AppliedAppearance LastApplied { get; private set; }
+
+    /// <summary>
     /// Apply the profile visuals to all assigned renderers. Gender is rolled from the profile.
     /// Null-safe: missing renderers or missing profile data are skipped.
     /// </summary>
@@ -64,12 +71,14 @@ public class AppearanceController : MonoBehaviour
         // Gender is decided ONCE here and reused for every gender-restricted part below.
         CurrentGender = gender;
 
-        ApplyPart(profile, profile.bodyOptions,        bodyRenderer,        CurrentGender);
-        ApplyPart(profile, profile.hairOptions,        hairRenderer,        CurrentGender);
-        ApplyPart(profile, profile.topOptions,         topRenderer,         CurrentGender);
-        ApplyPart(profile, profile.bottomOptions,      bottomRenderer,      CurrentGender);
-        ApplyPart(profile, profile.shoesOptions,       shoesRenderer,       CurrentGender);
-        ApplyPart(profile, profile.accessoriesOptions, accessoriesRenderer, CurrentGender);
+        var applied = new AppliedAppearance { appliedTAbs = CaptureClock.TAbs, gender = gender };
+        applied.body        = ApplyPart(profile, profile.bodyOptions,        bodyRenderer,        CurrentGender);
+        applied.hair        = ApplyPart(profile, profile.hairOptions,        hairRenderer,        CurrentGender);
+        applied.top         = ApplyPart(profile, profile.topOptions,         topRenderer,         CurrentGender);
+        applied.bottom      = ApplyPart(profile, profile.bottomOptions,      bottomRenderer,      CurrentGender);
+        applied.shoes       = ApplyPart(profile, profile.shoesOptions,       shoesRenderer,       CurrentGender);
+        applied.accessories = ApplyPart(profile, profile.accessoriesOptions, accessoriesRenderer, CurrentGender);
+        LastApplied = applied;
     }
 
     /// <summary>
@@ -77,13 +86,18 @@ public class AppearanceController : MonoBehaviour
     /// Uses the profile's gender-filtered chooser to pick a PartOption by weight.
     /// Unisex options are always eligible, so shoes/accessories/body are unaffected.
     /// </summary>
-    private void ApplyPart(AgentProfile profile, AgentProfile.PartOption[] options,
+    private AppliedPartRecord ApplyPart(AgentProfile profile, AgentProfile.PartOption[] options,
                            SkinnedMeshRenderer renderer, AgentGender gender)
     {
-        if (renderer == null) return;
-        if (options == null || options.Length == 0) return;
+        var record = new AppliedPartRecord();   // observation only: nothing below depends on it
+        if (renderer == null) return record;
+        record.hasRenderer = true;
+        record.mesh = renderer.sharedMesh;
+        record.materials = renderer.sharedMaterials;
+        if (options == null || options.Length == 0) return record;   // optionIndex stays -2: the profile offers nothing for this part
 
         var chosen = profile.ChooseWeightedOption(options, gender);
+        record.optionIndex = chosen == null ? -1 : System.Array.IndexOf(options, chosen);
 
         if (chosen == null)
         {
@@ -98,7 +112,8 @@ public class AppearanceController : MonoBehaviour
                                      $"no PartOption is available for gender {gender}. Renderer cleared to " +
                                      $"avoid a cross-gender mesh. Add at least one Unisex/{gender} option.");
             }
-            return;
+            record.mesh = renderer.sharedMesh;
+            return record;
         }
 
         // Apply mesh if provided
@@ -117,9 +132,11 @@ public class AppearanceController : MonoBehaviour
                 slotCount = renderer.sharedMaterials.Length;
 
             Material[] newMats = new Material[slotCount];
+            record.materialIndices = new int[slotCount];
             for (int s = 0; s < slotCount; s++)
             {
                 int matIndex = Random.Range(0, chosen.materials.Length);
+                record.materialIndices[s] = matIndex;
                 Material baseMat = chosen.materials[matIndex];
 
                 // If the selected base material is null, fallback to existing material in that slot if possible
@@ -139,6 +156,10 @@ public class AppearanceController : MonoBehaviour
 
             // Set materials (this will create instances so each renderer can be modified independently at runtime)
             renderer.materials = newMats;
+            record.materials = newMats;   // the chosen source assets, not the runtime "(Instance)" copies
         }
+
+        record.mesh = renderer.sharedMesh;
+        return record;
     }
 }

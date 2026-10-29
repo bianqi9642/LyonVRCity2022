@@ -31,6 +31,7 @@
 
 using System;
 using System.Collections;
+using System.Globalization;
 using System.IO;
 using UnityEngine;
 
@@ -99,11 +100,28 @@ public class GazeRecorder : MonoBehaviour
     public bool enableDebugLogs = true;
 
     // Internal recording state
+    // isRecording      : a recording session is open (OnTrialStart..OnTrialEnd, or a manual StartRecording()).
+    //                    It stays true while sampling is suspended by an application pause.
+    // samplingCoroutine: the single sampling loop; null while suspended or stopped.
+    // suspendedByPause : sampling was stopped by OnApplicationPause(true) inside an open session and is
+    //                    waiting to be resumed. The session (path, header, relative-time origin) is kept.
+    // terminated       : the component was destroyed or the application is quitting; never restart.
     bool isRecording = false;
     string fullPath = "";
     bool headerWritten = false;
     Coroutine samplingCoroutine = null;
     double recordingStartRealtime = 0.0;
+    bool suspendedByPause = false;
+    bool terminated = false;
+
+    /// <summary>True while the sampling loop is running (false while suspended by a pause or stopped).</summary>
+    public bool IsSampling => samplingCoroutine != null;
+
+    /// <summary>True while an open recording session is suspended by an application pause.</summary>
+    public bool IsSuspendedByPause => suspendedByPause;
+
+    /// <summary>Test hook: when non-empty, gaze rows are written to this exact file instead of the session folder / persistentDataPath.</summary>
+    [NonSerialized] public string outputPathOverride = "";
 
     // Revision 2: shared capture context (may be null - the recorder still works, fail-open).
     DataCaptureManager dataCapture;
@@ -162,6 +180,7 @@ public class GazeRecorder : MonoBehaviour
 
     void OnDestroy()
     {
+        terminated = true;
         if (experimentManager != null)
         {
             experimentManager.OnTrialStart -= OnExperimentTrialStart;
@@ -170,20 +189,80 @@ public class GazeRecorder : MonoBehaviour
         StopRecording();
     }
 
+    // F-01: a pause only SUSPENDS sampling (the open recording session, file path and relative-time origin are kept), and a resume
+    // restarts the loop if - and only if - the session is still open. Previously a pause called StopRecording(), which discarded the
+    // session, so nothing ever restarted gaze sampling while trajectory.csv kept recording.
     void OnApplicationPause(bool pauseStatus)
     {
-        if (pauseStatus && isRecording)
-        {
-            if (enableDebugLogs)
-                Debug.LogWarning("[GazeRecorder] Application paused while recording - stopping recording " +
-                    "defensively. Data already written is safe (each row is flushed on write).");
-            StopRecording();
-        }
+        if (pauseStatus) SuspendSampling();
+        else ResumeSampling();
+    }
+
+    // Some devices deliver focus gain without a matching pause(false) (or in the opposite order). Resuming is idempotent and only
+    // acts on a session suspended by a pause, so handling it here cannot create a second loop or start a recording on its own.
+    void OnApplicationFocus(bool hasFocus)
+    {
+        if (hasFocus) ResumeSampling();
     }
 
     void OnApplicationQuit()
     {
+        terminated = true;
         if (isRecording) StopRecording();
+    }
+
+    void SuspendSampling()
+    {
+        if (!isRecording || suspendedByPause) return;
+
+        StopSamplingLoop();
+        suspendedByPause = true;
+
+        if (enableDebugLogs)
+            Debug.LogWarning("[GazeRecorder] Application paused while recording - sampling suspended; it resumes with the application " +
+                "if the trial is still open. Data already written is safe (each row is flushed on write).");
+    }
+
+    void ResumeSampling()
+    {
+        if (!suspendedByPause) return;
+
+        // The trial ended (StopRecording clears the flag), the recorder was destroyed, or the session ended: never restart.
+        if (!isRecording || terminated || (experimentManager != null && experimentManager.SessionEnded))
+        {
+            suspendedByPause = false;
+            return;
+        }
+
+        if (samplingCoroutine != null)
+        {
+            suspendedByPause = false;
+            return;
+        }
+
+        if (!isActiveAndEnabled || string.IsNullOrEmpty(fullPath))
+        {
+            // Stay suspended so a later resume callback can retry. Always logged: gaze rows are missing until it succeeds.
+            Debug.LogWarning("[GazeRecorder] Could not resume gaze sampling after pause (component inactive or no output path); " +
+                "gaze.csv will have a gap until sampling restarts.");
+            return;
+        }
+
+        suspendedByPause = false;
+        // The per-sample GazeCaptureActive gate in SamplingLoop still applies. Header, file and recordingStartRealtime are untouched.
+        samplingCoroutine = StartCoroutine(SamplingLoop());
+
+        if (enableDebugLogs)
+            Debug.Log($"[GazeRecorder] Sampling resumed after pause. path={fullPath}");
+    }
+
+    void StopSamplingLoop()
+    {
+        if (samplingCoroutine != null)
+        {
+            StopCoroutine(samplingCoroutine);
+            samplingCoroutine = null;
+        }
     }
 
     void OnExperimentTrialStart() { StartRecording(); }
@@ -198,6 +277,13 @@ public class GazeRecorder : MonoBehaviour
         if (isRecording)
         {
             if (enableDebugLogs) Debug.LogWarning("[GazeRecorder] StartRecording() called while already recording; ignoring.");
+            return;
+        }
+
+        // A destroyed / quitting recorder or an ended session can never start a new recording.
+        if (terminated || (experimentManager != null && experimentManager.SessionEnded))
+        {
+            if (enableDebugLogs) Debug.LogWarning("[GazeRecorder] StartRecording() ignored: the recorder was terminated or the session has ended.");
             return;
         }
 
@@ -223,11 +309,8 @@ public class GazeRecorder : MonoBehaviour
     {
         if (!isRecording && samplingCoroutine == null) return;
 
-        if (samplingCoroutine != null)
-        {
-            StopCoroutine(samplingCoroutine);
-            samplingCoroutine = null;
-        }
+        StopSamplingLoop();
+        suspendedByPause = false;   // a stopped session can no longer be resumed by a later pause(false) / focus callback
 
         if (isRecording && enableDebugLogs)
             Debug.Log($"[GazeRecorder] Recording stopped. path={fullPath}");
@@ -237,6 +320,8 @@ public class GazeRecorder : MonoBehaviour
 
     string BuildFullPath()
     {
+        if (!string.IsNullOrEmpty(outputPathOverride)) return outputPathOverride;
+
         if (dataCapture == null) dataCapture = FindObjectOfType<DataCaptureManager>();
 
         if (dataCapture != null && !string.IsNullOrEmpty(dataCapture.SessionFolder))
@@ -416,44 +501,44 @@ public class GazeRecorder : MonoBehaviour
             double tRel = tAbs - recordingStartRealtime;
             long unixMs = CaptureClock.TUnixMs;
             string sessionId = (dataCapture != null && !string.IsNullOrEmpty(dataCapture.SessionId))
-                ? dataCapture.SessionId : (SafeCsvField(subjectId) + "_" + SafeCsvField(trialId));
+                ? dataCapture.SessionId : (subjectId + "_" + trialId);
 
             Vector3 hp = didHit ? hit.point : Vector3.zero;
 
             string row = string.Join(",", new string[]
             {
                 // ----- existing columns -----
-                tRel.ToString("F4"),
-                unixMs.ToString(),
+                F4(tRel),
+                Inv(unixMs),
                 SafeCsvField(subjectId),
                 SafeCsvField(trialId),
-                left.confidence.ToString("F3"),
+                F3(left.confidence),
                 left.valid ? "1" : "0",
-                left.origin.x.ToString("F4"), left.origin.y.ToString("F4"), left.origin.z.ToString("F4"),
-                left.direction.x.ToString("F4"), left.direction.y.ToString("F4"), left.direction.z.ToString("F4"),
-                right.confidence.ToString("F3"),
+                F4(left.origin.x), F4(left.origin.y), F4(left.origin.z),
+                F4(left.direction.x), F4(left.direction.y), F4(left.direction.z),
+                F3(right.confidence),
                 right.valid ? "1" : "0",
-                right.origin.x.ToString("F4"), right.origin.y.ToString("F4"), right.origin.z.ToString("F4"),
-                right.direction.x.ToString("F4"), right.direction.y.ToString("F4"), right.direction.z.ToString("F4"),
+                F4(right.origin.x), F4(right.origin.y), F4(right.origin.z),
+                F4(right.direction.x), F4(right.direction.y), F4(right.direction.z),
                 combinedValid ? "1" : "0",
-                combinedConfidence.ToString("F3"),
-                combinedOrigin.x.ToString("F4"), combinedOrigin.y.ToString("F4"), combinedOrigin.z.ToString("F4"),
-                combinedDirection.x.ToString("F4"), combinedDirection.y.ToString("F4"), combinedDirection.z.ToString("F4"),
-                headPos.x.ToString("F4"), headPos.y.ToString("F4"), headPos.z.ToString("F4"),
-                headRot.x.ToString("F4"), headRot.y.ToString("F4"), headRot.z.ToString("F4"), headRot.w.ToString("F4"),
+                F3(combinedConfidence),
+                F4(combinedOrigin.x), F4(combinedOrigin.y), F4(combinedOrigin.z),
+                F4(combinedDirection.x), F4(combinedDirection.y), F4(combinedDirection.z),
+                F4(headPos.x), F4(headPos.y), F4(headPos.z),
+                F4(headRot.x), F4(headRot.y), F4(headRot.z), F4(headRot.w),
                 roiName,
-                float.IsNaN(roiDistance) ? "" : roiDistance.ToString("F3"),
+                float.IsNaN(roiDistance) ? "" : F3(roiDistance),
                 // ----- Revision 2 appended columns -----
-                tAbs.ToString("F4"),
+                F4(tAbs),
                 SafeCsvField(sessionId),
-                Time.frameCount.ToString(),
+                Inv(Time.frameCount),
                 gazeRaySource,
                 didHit ? "1" : "0",
-                didHit ? hp.x.ToString("F4") : "", didHit ? hp.y.ToString("F4") : "", didHit ? hp.z.ToString("F4") : "",
+                didHit ? F4(hp.x) : "", didHit ? F4(hp.y) : "", didHit ? F4(hp.z) : "",
                 SafeCsvField(aoi.colliderName),
                 SafeCsvField(aoi.objectName),
-                didHit ? aoi.instanceId.ToString() : "",
-                aoi.layer >= 0 ? aoi.layer.ToString() : "",
+                didHit ? Inv(aoi.instanceId) : "",
+                aoi.layer >= 0 ? Inv(aoi.layer) : "",
                 SafeCsvField(aoi.tag),
                 aoi.semanticClass,
                 SafeCsvField(aoi.buildingId),
@@ -503,9 +588,20 @@ public class GazeRecorder : MonoBehaviour
         }
     }
 
+    // F-02: every number in gaze.csv is formatted with the invariant culture. The row is comma-joined without quoting, so a
+    // culture-specific decimal comma (e.g. fr-FR) or minus sign would add columns / corrupt values. Precision is unchanged.
+    static string F3(float v)   => v.ToString("F3", CultureInfo.InvariantCulture);
+    static string F4(float v)   => v.ToString("F4", CultureInfo.InvariantCulture);
+    static string F4(double v)  => v.ToString("F4", CultureInfo.InvariantCulture);
+    static string Inv(long v)   => v.ToString(CultureInfo.InvariantCulture);
+
+    // Existing convention: commas / line breaks become spaces. A field containing a double quote is additionally wrapped in quotes
+    // with embedded quotes doubled (RFC 4180), so a name that starts with or contains '"' can no longer merge columns in a CSV parser.
     string SafeCsvField(string s)
     {
         if (string.IsNullOrEmpty(s)) return "";
-        return s.Replace(",", " ").Replace("\n", " ").Replace("\r", " ");
+        s = s.Replace(",", " ").Replace("\n", " ").Replace("\r", " ");
+        if (s.IndexOf('"') >= 0) s = "\"" + s.Replace("\"", "\"\"") + "\"";
+        return s;
     }
 }

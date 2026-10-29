@@ -3,7 +3,7 @@
 //  - LAZY: file + header written only on the first actual row (a stream with no rows leaves no file).
 //  - open/write/close per row (or per batch) -> at most one row/tick at risk on abnormal termination.
 //  - one-shot failure flag per stream: first I/O error disables the stream + logs ONE LogError.
-//  - a reusable StringBuilder for comma-joining (no per-row string[] allocation).
+//  - a reusable StringBuilder for comma-joining (no per-row string[] allocation); Join() quotes any field containing , " or a line break.
 // All comments in English per project convention.
 
 using System;
@@ -24,20 +24,37 @@ public sealed class CaptureCsvWriter
 
     public string Path => _path;
 
+    /// <summary>Bytes (UTF-8, including line terminators and the header) successfully written by this writer. Used for data-volume budgeting.</summary>
+    public long BytesWritten { get; private set; }
+
+    /// <summary>Size of the header line (written once, with the first row).</summary>
+    public long HeaderBytes => Encoding.UTF8.GetByteCount(_header) + s_newlineBytes;
+
+    static readonly int s_newlineBytes = Environment.NewLine.Length;
+
     public CaptureCsvWriter(string path, string header)
     {
         _path = path;
         _header = header;
     }
 
-    /// <summary>Comma-join already-formatted fields into one CSV line (no quoting; sanitise upstream).</summary>
+    static readonly char[] s_special = { ',', '"', '\n', '\r' };
+
+    /// <summary>
+    /// Comma-join already-formatted fields into one CSV line. Upstream sanitising (commas / line breaks become spaces) is unchanged; as a
+    /// last line of defence any field that still contains a comma, double quote or line break is quoted RFC 4180 style (quotes doubled), so
+    /// it can never add a column or merge two. Ordinary fields are written verbatim.
+    /// </summary>
     public string Join(IReadOnlyList<string> fields)
     {
         _sb.Length = 0;
         for (int i = 0; i < fields.Count; i++)
         {
             if (i > 0) _sb.Append(',');
-            _sb.Append(fields[i] ?? string.Empty);
+            string v = fields[i];
+            if (string.IsNullOrEmpty(v)) continue;
+            if (v.IndexOfAny(s_special) < 0) _sb.Append(v);
+            else _sb.Append('"').Append(v.Replace("\"", "\"\"")).Append('"');
         }
         return _sb.ToString();
     }
@@ -50,6 +67,7 @@ public sealed class CaptureCsvWriter
         {
             using (var w = new StreamWriter(_path, append: true))
                 w.WriteLine(line);
+            BytesWritten += Encoding.UTF8.GetByteCount(line) + s_newlineBytes;
         }
         catch (Exception e) { Fail(e); }
     }
@@ -60,9 +78,14 @@ public sealed class CaptureCsvWriter
         if (!EnsureHeader()) return;
         try
         {
+            long bytes = 0;
             using (var w = new StreamWriter(_path, append: true))
                 for (int i = 0; i < lines.Count; i++)
+                {
                     w.WriteLine(lines[i]);
+                    bytes += Encoding.UTF8.GetByteCount(lines[i]) + s_newlineBytes;
+                }
+            BytesWritten += bytes;
         }
         catch (Exception e) { Fail(e); }
     }
@@ -80,6 +103,7 @@ public sealed class CaptureCsvWriter
             {
                 using (var w = new StreamWriter(_path, append: false))
                     w.WriteLine(_header);
+                BytesWritten += Encoding.UTF8.GetByteCount(_header) + s_newlineBytes;
             }
             _headerWritten = true;
         }

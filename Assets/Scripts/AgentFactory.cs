@@ -27,9 +27,11 @@ public class AgentFactory : MonoBehaviour
 
         // Compute final speed: base profile.speed possibly multiplied by a chosen multiplier from speedOptions
         float appliedSpeed = profile.speed;
+        float speedMultiplier = 1f;   // recorded for data capture only
         if (profile.speedOptions != null && profile.speedOptions.Length > 0)
         {
             float mult = profile.ChooseWeightedSpeedMultiplier();
+            speedMultiplier = mult;
             appliedSpeed *= mult;
         }
 
@@ -63,6 +65,14 @@ public class AgentFactory : MonoBehaviour
         {
             // configure UncertainBehavior: either force, probabilistic, or off
             uncertain.enabled = profile.forceUncertain || Random.value < profile.uncertainProbability;
+        }
+
+        // Data capture (observation only): remember what was actually applied to this NPC so the recorder can write it once per lifetime.
+        PedestrianAgent pedestrian = go.GetComponent<PedestrianAgent>();
+        if (pedestrian != null)
+        {
+            pedestrian.SetProfileAttributes(profile.name, profile.speed, speedMultiplier, appliedSpeed, uncertain != null && uncertain.enabled);
+            pedestrian.SetAppliedProfile(profile, app != null ? app.LastApplied : null);
         }
     }
 }

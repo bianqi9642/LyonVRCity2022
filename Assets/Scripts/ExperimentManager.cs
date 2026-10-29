@@ -1095,7 +1095,8 @@ public class ExperimentManager : MonoBehaviour
 
         AppendPart3Log("d1_result", groupNumber, def, startPoint, destination1Building, destination2Building,
             selectedId: d1SelectedId, found: d1Found, elapsedSeconds: d1Elapsed,
-            notes: d1Found ? "found" : (totalTimeUpAfterD1 ? "total_time_reached" : "d1_timeout_10min"));
+            notes: d1Found ? "found" : (totalTimeUpAfterD1 ? "total_time_reached" : "d1_timeout_10min"),
+            terminationReason: p3Timing.D1EndReason);
 
         // ============================ DESTINATION 2 ============================
         bool d2Ran = false;
@@ -1226,8 +1227,11 @@ public class ExperimentManager : MonoBehaviour
             totalBudgetReached ? "total_time_15min_reached" :
             "d2_found_d1_missed";
 
+        // The structured reason (not the legacy note text) is what DataCaptureManager classifies as a timeout. A skipped D2 never ran,
+        // so it carries NoBudgetRemaining, which Part3TerminationReason.IsTimeout rejects.
         AppendPart3Log(d2Ran ? "d2_result" : "d2_skipped", groupNumber, def, startPoint, destination1Building, destination2Building,
-            selectedId: d2SelectedId, found: d2Found, elapsedSeconds: d2Elapsed, notes: endReason);
+            selectedId: d2SelectedId, found: d2Found, elapsedSeconds: d2Elapsed, notes: endReason,
+            terminationReason: d2Ran ? p3Timing.D2EndReason : Part3TerminationReason.NoBudgetRemaining);
         AppendPart3Log("phase_end", groupNumber, def, startPoint, destination1Building, destination2Building,
             selectedId: "", found: (d1Found && d2Found), elapsedSeconds: phaseTotalElapsed, notes: endReason);
 
@@ -1449,7 +1453,7 @@ public class ExperimentManager : MonoBehaviour
     /// </summary>
     private void AppendPart3Log(string eventName, int groupNumber, Part3GroupDef def,
         Transform startPoint, GameObject d1Building, GameObject d2Building,
-        string selectedId, bool found, double elapsedSeconds, string notes)
+        string selectedId, bool found, double elapsedSeconds, string notes, string terminationReason = "")
     {
         ExperimentEventInfo info = new ExperimentEventInfo
         {
@@ -1470,7 +1474,8 @@ public class ExperimentManager : MonoBehaviour
             d1Building = d1Building,
             d2Building = d2Building,
             d1TargetId = GetAssignedTargetId(d1Building) ?? "",
-            d2TargetId = GetAssignedTargetId(d2Building) ?? ""
+            d2TargetId = GetAssignedTargetId(d2Building) ?? "",
+            terminationReason = terminationReason ?? ""
         };
 
         try { OnExperimentEvent?.Invoke(info); }
@@ -1550,10 +1555,43 @@ public struct ExperimentEventInfo
     public GameObject d2Building;    // Part 3 assigned destination-2 building
     public string d1TargetId;       // TargetSelectable.targetId of d1Building (provenance only)
     public string d2TargetId;       // TargetSelectable.targetId of d2Building (provenance only)
+    public string terminationReason; // Part 3 d1_result / d2_result / d2_skipped: a Part3TerminationReason value, else ""
 
     public GameObject building;      // building referenced by candidate_interactable_on/off
     public Vector3 fromPos;          // teleport: player position before
     public Vector3 toPos;            // teleport: destination position
+}
+
+/// <summary>
+/// Structured Part 3 search-termination reasons (the single vocabulary used by <see cref="Part3ValidTiming"/>, the
+/// part3_d1_search_end / part3_d2_search_end rows and the d1_result / d2_result / d2_skipped events) and the one rule that decides
+/// whether a reason is a genuine timeout. DataCaptureManager emits phase_timeout from <see cref="IsTimeout"/>, never from the free-text notes.
+/// </summary>
+public static class Part3TerminationReason
+{
+    public const string TargetFound = "target_found";                       // the correct building was selected (either destination)
+    public const string D1CapReached = "d1_cap_reached";                    // D1 searched for part3Destination1MaxSeconds without success
+    public const string TotalBudgetExhausted = "total_budget_exhausted";    // D1 searched for the whole part3TotalMaxSeconds without success
+    public const string RemainingBudgetExhausted = "remaining_budget_exhausted"; // D2 used up max(0, total - interval 1) without success
+    public const string NoBudgetRemaining = "no_budget_remaining";          // D2 never started: D1 spent the whole total budget
+
+    /// <summary>
+    /// True only for a search that actually RAN and then stopped because its time limit expired. Found targets, a D2 that never started
+    /// (NoBudgetRemaining), and null / empty / unknown reasons (including "skipped") are not timeouts.
+    /// </summary>
+    public static bool IsTimeout(string reason)
+    {
+        return reason == D1CapReached || reason == TotalBudgetExhausted || reason == RemainingBudgetExhausted;
+    }
+
+    /// <summary>
+    /// The exact rule DataCaptureManager applies to a Part 3 result event (part3Event = d1_result / d2_result / d2_skipped): a timeout
+    /// row is due only for a timeout reason on an event that is not a skipped destination (a skipped D2 never ran, whatever reason it carries).
+    /// </summary>
+    public static bool ShouldEmitTimeout(string part3Event, string reason)
+    {
+        return part3Event != "d2_skipped" && IsTimeout(reason);
+    }
 }
 
 /// <summary>
@@ -1627,8 +1665,8 @@ public sealed class Part3ValidTiming
     /// <summary>Why a D1 search stops without its target: total_budget_exhausted | d1_cap_reached (found: target_found).</summary>
     public string D1ReasonFor(bool targetFound)
     {
-        if (targetFound) return "target_found";
-        return TotalMaxSeconds <= D1MaxSeconds ? "total_budget_exhausted" : "d1_cap_reached";
+        if (targetFound) return Part3TerminationReason.TargetFound;
+        return TotalMaxSeconds <= D1MaxSeconds ? Part3TerminationReason.TotalBudgetExhausted : Part3TerminationReason.D1CapReached;
     }
 
     /// <summary>
@@ -1677,8 +1715,8 @@ public sealed class Part3ValidTiming
     /// <summary>Why a D2 search stops without its target: no_budget_remaining | remaining_budget_exhausted (found: target_found).</summary>
     public string D2ReasonFor(bool targetFound)
     {
-        if (targetFound) return "target_found";
-        return D2BudgetSeconds <= 0.0 ? "no_budget_remaining" : "remaining_budget_exhausted";
+        if (targetFound) return Part3TerminationReason.TargetFound;
+        return D2BudgetSeconds <= 0.0 ? Part3TerminationReason.NoBudgetRemaining : Part3TerminationReason.RemainingBudgetExhausted;
     }
 
     /// <summary>The D2 search ended at 'endRealtime' (selection time when found, loop timeout time otherwise). First call wins.</summary>

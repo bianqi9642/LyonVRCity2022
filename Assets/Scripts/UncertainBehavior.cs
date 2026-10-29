@@ -144,6 +144,63 @@ public class UncertainBehavior : MonoBehaviour
     /// </summary>
     public bool IsDetouring => isActiveAndEnabled && !suspendedBecauseArrived && state == State.Detour;
 
+    // ---- Data capture (observation only; nothing below changes behaviour) ----
+
+    /// <summary>
+    /// Stable, human-readable label of the state machine for the data-capture layer:
+    /// "walking" | "pause" | "hesitate" | "slow" | "detour" | "suspended_arrived" (uncertain logic parked because the NPC reached its main
+    /// waypoint / is dwelling). "" while the component is disabled (the NPC is not an uncertain walker in this lifetime).
+    /// NOTE: this is the raw state machine. After an arrival-suspend the underlying state is not reset (existing behaviour), so after
+    /// ResumeAfterArrival() the label can show a lingering "pause"/"slow"/"hesitate" until that state's own timer expires.
+    /// </summary>
+    public string StateLabel => !isActiveAndEnabled ? "" : (suspendedBecauseArrived ? "suspended_arrived" : LabelOf(state));
+
+    /// <summary>"idle" | "turning" | "holding" | "returning" while Hesitate runs its look-around; "" otherwise.</summary>
+    public string LookPhaseLabel
+    {
+        get
+        {
+            if (!isActiveAndEnabled || suspendedBecauseArrived || state != State.Hesitate || !lookAroundEnabled) return "";
+            switch (lookPhase)
+            {
+                case LookPhase.Turning: return "turning";
+                case LookPhase.Holding: return "holding";
+                case LookPhase.Returning: return "returning";
+                default: return "idle";
+            }
+        }
+    }
+
+    static string LabelOf(State s)
+    {
+        switch (s)
+        {
+            case State.Walking: return "walking";
+            case State.Pause: return "pause";
+            case State.Hesitate: return "hesitate";
+            case State.Slow: return "slow";
+            case State.Detour: return "detour";
+            default: return s.ToString().ToLowerInvariant();
+        }
+    }
+
+    /// <summary>
+    /// Raised ONCE per change of StateLabel: (fromLabel, toLabel, plannedDurationSeconds). plannedDuration is the timer of the state being
+    /// entered (0 when the new label is walking / suspended_arrived). Never raised by ResetForReuse() (that is a lifetime boundary).
+    /// </summary>
+    public event Action<string, string, float> StateChanged;
+
+    string lastNotifiedLabel = "";
+
+    void NotifyLabel(float plannedDuration)
+    {
+        string now = StateLabel;
+        if (now == lastNotifiedLabel) return;
+        string prev = lastNotifiedLabel;
+        lastNotifiedLabel = now;
+        StateChanged?.Invoke(prev, now, plannedDuration);
+    }
+
     /// <summary>
     /// Registers (or clears, with null) the owner-supplied main-target restorer used when a Detour ends.
     /// See 'mainTargetRestorer'. Called by PedestrianAgent.Initialize() once per life.
@@ -222,6 +279,7 @@ public class UncertainBehavior : MonoBehaviour
         mainTargetOnDetourStart = Vector3.zero;
         suspendedBecauseArrived = false;
         ResetLookAroundImmediate();
+        lastNotifiedLabel = StateLabel;   // lifetime boundary: re-baseline silently, never a transition event
 
         // Re-subscribe the main-arrival handler for this life (idempotent: only subscribes if not already).
         if (moveController != null && onMainArrivalHandler == null)
@@ -248,6 +306,7 @@ public class UncertainBehavior : MonoBehaviour
                 LogStateExit(state);
                 ExitCurrentState();
                 state = State.Walking;
+                NotifyLabel(0f);
             }
         }
         else
@@ -309,6 +368,8 @@ public class UncertainBehavior : MonoBehaviour
             Debug.LogWarning($"[UncertainBehavior] [{gameObject.name}] EnterPause: moveController is null; cannot pause movement.");
         }
 
+        NotifyLabel(stateTimer);
+
         LogStateEnter(State.Pause, stateTimer);
     }
 
@@ -333,6 +394,8 @@ public class UncertainBehavior : MonoBehaviour
             Debug.LogWarning($"[UncertainBehavior] [{gameObject.name}] EnterHesitate: moveController is null; cannot apply soft pause.");
         }
 
+        NotifyLabel(stateTimer);
+
         LogStateEnter(State.Hesitate, stateTimer);
     }
 
@@ -353,6 +416,8 @@ public class UncertainBehavior : MonoBehaviour
         {
             Debug.LogWarning($"[UncertainBehavior] [{gameObject.name}] EnterSlow: moveController is null; cannot reduce speed.");
         }
+
+        NotifyLabel(stateTimer);
 
         LogStateEnter(State.Slow, stateTimer);
     }
@@ -422,6 +487,8 @@ public class UncertainBehavior : MonoBehaviour
             else if (enableLogging)
                 Debug.LogWarning($"[UncertainBehavior] [{gameObject.name}] EnterDetour: no valid detour point found and moveController is null; cannot pause movement.");
 
+            NotifyLabel(stateTimer);
+
             LogStateEnter(State.Pause, stateTimer);
             return;
         }
@@ -457,6 +524,8 @@ public class UncertainBehavior : MonoBehaviour
         // fallback timer so detour doesn't run forever if something blocks movement visually
         stateTimer = detourDuration;
         stateStartTime = Time.time;
+
+        NotifyLabel(stateTimer);
 
         LogStateEnter(State.Detour, stateTimer);
     }
@@ -519,6 +588,8 @@ public class UncertainBehavior : MonoBehaviour
                 {
                     moveController.PauseExternal(true, true);
                 }
+
+                NotifyLabel(stateTimer);
 
                 LogStateEnter(State.Pause, stateTimer);
                 return;
@@ -785,6 +856,7 @@ public class UncertainBehavior : MonoBehaviour
 
         // Mark as suspended so Update() will early-out and no new states will be entered.
         suspendedBecauseArrived = true;
+        NotifyLabel(0f);
 
         // Optionally, unsubscribe the main arrival handler as well to avoid future calls.
         if (moveController != null && onMainArrivalHandler != null)
@@ -814,6 +886,7 @@ public class UncertainBehavior : MonoBehaviour
         if (enableLogging) Debug.Log($"[UncertainBehavior] [{gameObject.name}] Resuming uncertain behavior after prior arrival.");
 
         suspendedBecauseArrived = false;
+        NotifyLabel(0f);
 
         // Re-subscribe main arrival handler if we have a MoveToTarget
         if (moveController != null && onMainArrivalHandler == null)

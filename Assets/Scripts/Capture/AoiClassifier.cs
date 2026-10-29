@@ -51,6 +51,12 @@ public static class AoiClassifier
     static TargetSelectable s_ts;   // may be null
     static PedestrianAgent  s_pa;   // may be null
 
+    /// <summary>Number of gaze hits on an NPC that had no open lifetime (blank npc_spawn_instance_id). Diagnostic; see DataCaptureManager.NoteUnresolvedNpcHit.</summary>
+    public static int UnresolvedNpcHits { get; private set; }
+
+    /// <summary>Resets the diagnostic counter (tests).</summary>
+    public static void ResetDiagnostics() { UnresolvedNpcHits = 0; s_col = null; }
+
     static readonly Regex s_batiRe = new Regex(@"^\d{5}[A-Z]{2}\d+$", RegexOptions.Compiled);
 
     static int s_uiLayer = -2, s_groundLayer = -2, s_waterLayer = -2;
@@ -81,8 +87,23 @@ public static class AoiClassifier
         info.tag                = s_tag;
         info.instanceId         = s_instanceId;
         info.layer              = s_layer;
-        info.npcId              = (s_pa != null) ? SafeStr(s_pa.AgentID) : "";
-        info.npcSpawnInstanceId = (s_pa != null && dcm != null) ? dcm.GetSpawnInstanceId(s_pa) : "";
+        // NPC identity is research data of the NPC recorder: it is filled only while the NPC master switch (npcCaptureEnabled) is on. With it off
+        // the class stays "NPC" (a geometric fact about the collider) but both IDs are blank - "unavailable by configuration", not "not looked at".
+        info.npcId = "";
+        info.npcSpawnInstanceId = "";
+        if (s_pa != null && dcm != null && dcm.NpcRecordingEnabled)
+        {
+            info.npcId = SafeStr(s_pa.AgentID);
+            // Lifetime ID of the NPC that was hit, resolved from the agent itself (the same value npc_state / npc_events / events use).
+            // It is looked up on EVERY call, never cached: after despawn the ended lifetime resolves to "" and after reuse to the new one.
+            // A hit on an NPC with no open lifetime is left blank (unresolved) and counted - it is never given an invented ID.
+            info.npcSpawnInstanceId = SafeStr(dcm.GetSpawnInstanceId(s_pa));
+            if (info.npcSpawnInstanceId.Length == 0)
+            {
+                UnresolvedNpcHits++;
+                dcm.NoteUnresolvedNpcHit(s_pa);
+            }
+        }
         info.isInteractable     = (s_ts != null) ? (s_ts.enabled ? "1" : "0") : "";
         return info;
     }

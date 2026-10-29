@@ -166,6 +166,183 @@ public class PedestrianAgent : MonoBehaviour
     public string AgentID => agentID;
 
     /// <summary>
+    /// Assigns the stable pooled-object ID if it is still empty (idempotent). Awake() calls it; SpawnerManager also calls it when it
+    /// creates a pool object so an instance that was created inactive still has its ID before its creation is recorded.
+    /// </summary>
+    public string EnsureAgentId()
+    {
+        if (string.IsNullOrEmpty(agentID))
+        {
+            long id = System.Threading.Interlocked.Increment(ref s_globalAgentCounter);
+            agentID = $"NPC-{id:000000}";
+        }
+        return agentID;
+    }
+
+    // -----------------------------
+    // Lifetime identity (data capture)
+    // -----------------------------
+    // AgentID identifies the pooled GAMEOBJECT and never changes. A LIFETIME is one active simulated life of that object: it begins
+    // when SpawnerManager hands the object a new itinerary (Initialize) and ends when the itinerary finishes (Finish / ForceFinish).
+    // Each lifetime gets "<AgentID>-S<n>", n counting this object's lifetimes (1, 2, 3 ...). Prewarming, pooling and pool
+    // acquisition do not consume an index. The counter lives on the object that owns the ID, so a destroyed object never hands its IDs
+    // to a replacement (the replacement has a new AgentID).
+    int lifetimeCounter = 0;
+    bool lifetimeOpen = false;
+    string lifetimeId = "";
+    double lifetimeSpawnTAbs = double.NaN;
+    long lifetimeSpawnTUnixMs = 0;
+    string finishReason = "itinerary_complete";
+    bool movementStartedThisLife = false;
+    int lastLegIndexEmitted = -1;
+
+    /// <summary>"&lt;AgentID&gt;-S&lt;n&gt;" while a lifetime is open, otherwise "" (an ended lifetime never resolves again).</summary>
+    public string LifetimeId => lifetimeOpen ? lifetimeId : "";
+    /// <summary>The ID of the most recent lifetime, open or already ended (used to label its closing events).</summary>
+    public string LastLifetimeId => lifetimeId;
+    public bool HasOpenLifetime => lifetimeOpen;
+    public int LifetimeIndex => lifetimeCounter;
+    public double LifetimeSpawnTAbs => lifetimeSpawnTAbs;
+    public long LifetimeSpawnTUnixMs => lifetimeSpawnTUnixMs;
+
+    // Provenance of this pooled object / this lifetime, filled by SpawnerManager (observation only).
+    public double ObjectCreatedTAbs { get; set; } = double.NaN;
+    public long   ObjectCreatedTUnixMs { get; set; }
+    public string ObjectCreatedKind { get; set; } = "";      // "prewarm" or "runtime_instantiate"
+    public double PoolAcquiredTAbs { get; set; } = double.NaN;
+    public string SpawnSource { get; set; } = "";            // "pool" or "new" for the current lifetime
+
+    // Actual profile values applied to this lifetime by AgentFactory (observation only; see AgentFactory.ApplyProfileToInstance).
+    public string ProfileName { get; private set; } = "";
+    public float ProfileBaseSpeed { get; private set; }
+    public float SpeedMultiplier { get; private set; } = 1f;
+    public float ConfiguredSpeed { get; private set; }
+    public bool UncertainBehaviorEnabled { get; private set; }
+
+    public void SetProfileAttributes(string profileName, float baseSpeed, float multiplier, float configuredSpeed, bool uncertainEnabled)
+    {
+        ProfileName = profileName ?? "";
+        ProfileBaseSpeed = baseSpeed;
+        SpeedMultiplier = multiplier;
+        ConfiguredSpeed = configuredSpeed;
+        UncertainBehaviorEnabled = uncertainEnabled;
+    }
+
+    // What AgentFactory/AppearanceController applied most recently (set before Initialize()). Frozen into LifetimeProfile when a lifetime begins.
+    AgentProfile appliedProfileRef;
+    AppliedAppearance appliedAppearanceRef;
+    NpcLifetimeProfile lifetimeProfile = NpcLifetimeProfile.None;
+
+    public void SetAppliedProfile(AgentProfile profile, AppliedAppearance appearance)
+    {
+        appliedProfileRef = profile;
+        appliedAppearanceRef = appearance;
+    }
+
+    /// <summary>
+    /// Immutable record of the profile/appearance/uncertain configuration that was in force when the CURRENT (or most recent) lifetime began. A later
+    /// re-skin or re-roll of this pooled object does not change an instance already handed out.
+    /// </summary>
+    public NpcLifetimeProfile LifetimeProfile => lifetimeProfile;
+
+    // Uncertain behaviour as seen by the recorder (observation only).
+    /// <summary>True when the prefab carries an UncertainBehavior component at all.</summary>
+    public bool HasUncertainComponent => uncertainBehavior != null;
+    /// <summary>True when the UncertainBehavior component is active and enabled right now (configured ON for this lifetime by AgentFactory).</summary>
+    public bool UncertainActive => uncertainBehavior != null && uncertainBehavior.isActiveAndEnabled;
+    public string UncertainStateLabel => uncertainBehavior != null ? uncertainBehavior.StateLabel : "";
+    public string UncertainLookPhaseLabel => uncertainBehavior != null ? uncertainBehavior.LookPhaseLabel : "";
+
+    void OnUncertainStateChanged(string from, string to, float plannedSeconds)
+    {
+        if (!lifetimeOpen) return;
+        Emit(CaptureConstants.NpcEvtUncertainState,
+            "from=" + from + ";to=" + to + ";planned_s=" + plannedSeconds.ToString("F2", System.Globalization.CultureInfo.InvariantCulture));
+    }
+
+    // Read-only view of the itinerary for the recorder.
+    public NpcMovementMode MovementMode => movementMode;
+    public float DwellSeconds => dwellTime;
+    public float WanderLookAheadDistance => wanderLookAheadDistance;
+    public int ItineraryCount => itineraryTransforms != null ? itineraryTransforms.Count : 0;
+    public int CurrentItineraryIndex => currentIndex;
+    public IReadOnlyList<Transform> ItineraryTransformsView => itineraryTransforms;
+    public string CurrentTargetName
+    {
+        get
+        {
+            if (itineraryTransforms == null || currentIndex < 0 || currentIndex >= itineraryTransforms.Count) return "";
+            Transform t = itineraryTransforms[currentIndex];
+            return t != null ? t.name : "";
+        }
+    }
+
+    /// <summary>
+    /// Opens a new lifetime and stamps its spawn time. Idempotent within one lifetime: a repeated call while the lifetime is open
+    /// returns false and changes nothing. Called by Initialize(), i.e. right after SpawnerManager activated the object and before it is
+    /// registered in the live population, so the ID exists before any sampler or gaze ray can see this NPC.
+    /// </summary>
+    bool BeginLifetime()
+    {
+        if (lifetimeOpen) return false;
+        EnsureAgentId();
+        lifetimeCounter++;
+        lifetimeId = agentID + "-S" + lifetimeCounter.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        lifetimeOpen = true;
+        lifetimeSpawnTAbs = CaptureClock.TAbs;
+        lifetimeSpawnTUnixMs = CaptureClock.TUnixMs;
+        movementStartedThisLife = false;
+        lastLegIndexEmitted = -1;
+        finishReason = "itinerary_complete";
+        // Freeze what was applied to this lifetime (profile content, realised appearance, uncertain parameters) now, at the spawn boundary.
+        lifetimeProfile = AgentProfileSnapshot.Capture(appliedProfileRef, appliedAppearanceRef, UncertainBehaviorEnabled ? uncertainBehavior : null);
+        return true;
+    }
+
+    /// <summary>Closes the current lifetime. The ID stays readable through LastLifetimeId but LifetimeId resolves to "" from now on.</summary>
+    void EndLifetime() { lifetimeOpen = false; }
+
+    /// <summary>Raises one lifecycle event stamped NOW. Observation only.</summary>
+    void Emit(string type, string value = "", bool hasDest = false, Vector3 dest = default, Vector3? posOverride = null,
+              double tAbsOverride = double.NaN, long tUnixOverride = 0)
+    {
+        NpcLifecycleBus.Raise(new NpcLifecycleEvent
+        {
+            type = type,
+            tAbs = double.IsNaN(tAbsOverride) ? CaptureClock.TAbs : tAbsOverride,
+            tUnixMs = tUnixOverride != 0 ? tUnixOverride : CaptureClock.TUnixMs,
+            agent = this,
+            agentId = agentID,
+            lifetimeId = lifetimeId,
+            lifetimeIndex = lifetimeCounter,
+            pos = posOverride ?? transform.position,
+            yaw = transform.eulerAngles.y,
+            hasDest = hasDest,
+            dest = dest,
+            itineraryIndex = currentIndex,
+            targetId = CurrentTargetName,
+            value = value ?? ""
+        });
+    }
+
+    // Raised when a leg towards itinerary[index] was really handed to MoveToTarget. The first one of a lifetime is also the movement start.
+    void NoteLegIssued(int index, Transform target)
+    {
+        if (!lifetimeOpen) return;
+        Vector3 dest = target != null ? target.position : transform.position;
+        if (!movementStartedThisLife)
+        {
+            movementStartedThisLife = true;
+            Emit(CaptureConstants.NpcEvtMovementStart, "mode=" + movementMode + ";itinerary_count=" + ItineraryCount, true, dest);
+        }
+        if (index != lastLegIndexEmitted)
+        {
+            lastLegIndexEmitted = index;
+            Emit(CaptureConstants.NpcEvtTargetSet, "kind=itinerary_leg", true, dest);
+        }
+    }
+
+    /// <summary>
     /// Read-only view of the existing internal state (data-capture, Revision 2). Observation only:
     /// this getter never changes NPC behaviour, itinerary, dwell timing, randomisation, or NavMesh state.
     /// </summary>
@@ -194,11 +371,7 @@ public class PedestrianAgent : MonoBehaviour
     void Awake()
     {
         // Assign unique ID if not already assigned (prewarm / pool instantiation will call Awake once)
-        if (string.IsNullOrEmpty(agentID))
-        {
-            long id = System.Threading.Interlocked.Increment(ref s_globalAgentCounter);
-            agentID = $"NPC-{id:000000}";
-        }
+        EnsureAgentId();
 
         // Append ID to GameObject name for easier identification in Hierarchy and Debug logs.
         if (!gameObject.name.Contains(agentID))
@@ -221,6 +394,7 @@ public class PedestrianAgent : MonoBehaviour
         // Cache UncertainBehavior if present. We'll call ResumeAfterArrival() when movement is resumed
         // or when the agent is reinitialized (pooled reuse).
         uncertainBehavior = GetComponent<UncertainBehavior>();
+        if (uncertainBehavior != null) uncertainBehavior.StateChanged += OnUncertainStateChanged;   // data capture: state transitions -> npc_events
         detourRestorer = ResumeWanderTargetAfterDetour;
 
         // Part 2: allocate once, reused across every reachability check for the lifetime of this instance
@@ -255,6 +429,9 @@ public class PedestrianAgent : MonoBehaviour
                            float dwellSeconds, float lookAheadDistance)
     {
         if (itinerary == null) itinerary = new List<Transform>();
+
+        // New lifetime (idempotent while one is open) - before anything else can observe this NPC as part of the live population.
+        bool newLifetime = BeginLifetime();
 
         this.movementMode = mode;
         this.itineraryTransforms = new List<Transform>(itinerary);
@@ -298,6 +475,12 @@ public class PedestrianAgent : MonoBehaviour
             // over from a previous Part 2 life of this pooled instance).
             uncertainBehavior.SetMainTargetRestorer(IsWanderingItinerary ? detourRestorer : null);
         }
+
+        // Data capture: the spawn boundary. Raised HERE - itinerary, mode and dwell are set, no movement command has been issued yet - because
+        // BeginMovementWhenReady() below can already run the first movement step synchronously (the coroutine only yields while the mover is not
+        // ready), so a later event from SpawnerManager could arrive after the first movement events. Stamped with the lifetime's own begin time.
+        if (newLifetime)
+            Emit(CaptureConstants.NpcEvtSpawn, "source=" + SpawnSource, false, default, null, lifetimeSpawnTAbs, lifetimeSpawnTUnixMs);
 
         // NEW (fix for pooled-agent reactivation race): rather than issuing the first leg synchronously here
         // (which could race with MoveToTarget's own pooled-reuse re-warp onto the NavMesh, see
@@ -402,6 +585,7 @@ public class PedestrianAgent : MonoBehaviour
         if (itineraryTransforms == null || itineraryTransforms.Count < 2)
         {
             // Nothing to walk (SpawnerManager never generates this) - end the life instead of idling forever.
+            finishReason = "no_itinerary";
             Finish();
             return;
         }
@@ -418,8 +602,10 @@ public class PedestrianAgent : MonoBehaviour
         else if (moveToTarget != null && entrance != null)
         {
             // Original exact placement: distribution disabled (entranceSpawnRadius <= 0) or itinerary[0] is not an Entrance.
+            Vector3 before = transform.position;
             moveToTarget.TeleportTo(entrance.position);
             SyncMoverStartToCurrentPosition();
+            Emit(CaptureConstants.NpcEvtEntranceTeleport, "entrance=" + entrance.name, true, transform.position, before);
         }
 
         awaitingEntrancePlacement = false;
@@ -496,6 +682,8 @@ public class PedestrianAgent : MonoBehaviour
         if (isExit)
             moveToTarget.SetLegArriveRadius(arriveTolerance);
 
+        NoteLegIssued(index, target);
+
         // MoveTo(Transform) records the previous target as startTransform; a first-life MoveToTarget.Start() would
         // otherwise move the NPC onto it. Keep the mover's start == where the NPC actually is.
         SyncMoverStartToCurrentPosition();
@@ -541,8 +729,10 @@ public class PedestrianAgent : MonoBehaviour
         if (!manager.TryFindEntranceSpawnPosition(entrance, gameObject, out position))
             return false;
 
+        Vector3 before = transform.position;
         moveToTarget.TeleportTo(position);
         SyncMoverStartToCurrentPosition();
+        Emit(CaptureConstants.NpcEvtEntranceTeleport, "entrance=" + (entrance != null ? entrance.name : ""), true, transform.position, before);
         return true;
     }
 
@@ -565,6 +755,7 @@ public class PedestrianAgent : MonoBehaviour
             awaitingEntrancePlacement = false;
             Debug.LogWarning($"[PedestrianAgent][{agentID}] No valid spawn position around its Entrance after " +
                 $"{k_MaxEntrancePlacementRetries} retries; skipping this NPC (returned to the pool).");
+            finishReason = "entrance_placement_failed";
             Finish();
             return;
         }
@@ -781,6 +972,7 @@ public class PedestrianAgent : MonoBehaviour
                 // Existing public overload - MoveToTarget's movement implementation is NOT modified.
                 moveToTarget.MoveTo(attractorStop);
                 moveToTarget.SetLegArriveRadius(arriveTolerance); // after MoveTo(), which resets it
+                NoteLegIssued(currentIndex, target);
             }
             else
             {
@@ -793,6 +985,7 @@ public class PedestrianAgent : MonoBehaviour
                 // MoveToTarget will handle movement and arrival
                 moveToTarget.MoveTo(target);
                 moveToTarget.SetLegArriveRadius(arriveTolerance); // after MoveTo(), which resets it
+                NoteLegIssued(currentIndex, target);
             }
         }
         else
@@ -875,6 +1068,12 @@ public class PedestrianAgent : MonoBehaviour
         Transform target = itineraryTransforms[currentIndex];
         bool isExit = (currentIndex == itineraryTransforms.Count - 1);
 
+        if (lifetimeOpen)
+        {
+            string kind = isExit ? "exit" : (manager != null && manager.FindAttractorInfo(target) != null ? "attractor" : "waypoint");
+            Emit(CaptureConstants.NpcEvtArrived, "kind=" + kind + ";index=" + currentIndex, false, default);
+        }
+
         // Part 2: wandering points never dwell and are never attractors; the exit ends the life like Part 3's.
         if (IsWanderingItinerary)
         {
@@ -945,7 +1144,11 @@ public class PedestrianAgent : MonoBehaviour
         // No-op when the Plane has no AttractorDwell or no facingTarget (existing rotation is preserved).
         FaceDwellTargetIfConfigured(info);
 
+        if (lifetimeOpen) Emit(CaptureConstants.NpcEvtDwellStart, "dwell_s=" + dwellTime.ToString("F2", System.Globalization.CultureInfo.InvariantCulture));
+
         yield return new WaitForSeconds(dwellTime);
+
+        if (lifetimeOpen) Emit(CaptureConstants.NpcEvtDwellEnd);
 
         // release slot in attractor
         if (manager != null && info != null)
@@ -973,6 +1176,8 @@ public class PedestrianAgent : MonoBehaviour
         // Additive: the agent is already standing at its random stop point, so face the target while it waits.
         FaceDwellTargetIfConfigured(info);
 
+        if (lifetimeOpen) Emit(CaptureConstants.NpcEvtDwellStart, "capacity_wait=1");
+
         float timeout = 30f;
         float start = Time.time;
         while (Time.time - start < timeout)
@@ -981,6 +1186,8 @@ public class PedestrianAgent : MonoBehaviour
             {
                 // once admitted, dwell and then release + advance
                 yield return new WaitForSeconds(dwellTime);
+
+                if (lifetimeOpen) Emit(CaptureConstants.NpcEvtDwellEnd);
 
                 if (manager != null)
                     manager.ReleaseAttractor(info, this);
@@ -999,6 +1206,8 @@ public class PedestrianAgent : MonoBehaviour
         }
 
         // timed out waiting -> give up and advance
+        if (lifetimeOpen) Emit(CaptureConstants.NpcEvtDwellEnd, "capacity_timeout=1");
+
         if (moveToTarget != null)
             moveToTarget.ResumeExternal();
 
@@ -1118,6 +1327,13 @@ public class PedestrianAgent : MonoBehaviour
     {
         state = State.Finished;
 
+        // Close the lifetime BEFORE notifying the spawner so every observer of onAgentFinished sees an ended lifetime.
+        if (lifetimeOpen)
+        {
+            Emit(CaptureConstants.NpcEvtItineraryComplete, "reason=" + finishReason);
+            EndLifetime();
+        }
+
         // Ensure unsubscribe to avoid lingering event handlers
         UnsubscribeFromMoveToArrived();
 
@@ -1137,6 +1353,12 @@ public class PedestrianAgent : MonoBehaviour
     public void ForceFinish()
     {
         if (state == State.Finished) return;
+
+        if (lifetimeOpen)
+        {
+            Emit(CaptureConstants.NpcEvtItineraryComplete, "reason=force_finish");
+            EndLifetime();
+        }
 
         // Release any claimed attractor for current index if present
         ReleaseCurrentAttractorIfAny();
@@ -1198,6 +1420,7 @@ public class PedestrianAgent : MonoBehaviour
 
     void OnDestroy()
     {
+        if (uncertainBehavior != null) uncertainBehavior.StateChanged -= OnUncertainStateChanged;
         UnsubscribeFromMoveToArrived();
 
         if (moveToTarget != null)

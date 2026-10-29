@@ -12,7 +12,9 @@ public static class CaptureConstants
         "t_abs,t_unix_ms,event_type,part,phase,label," +
         "building_id,target_id,npc_id,npc_spawn_instance_id," +
         "from_pos_x,from_pos_y,from_pos_z,to_pos_x,to_pos_y,to_pos_z," +
-        "value_num,value_str";
+        "value_num,value_str," +
+        // Appended (schema v2): same session key as every other stream.
+        "session_id";
 
     public const string TrajectoryHeader =
         "t_abs,t_unix_ms,frame_index," +
@@ -32,12 +34,41 @@ public static class CaptureConstants
         "nav_dest_x,nav_dest_y,nav_dest_z," +
         "state,speed,agent_desired_vel_x,agent_desired_vel_z," +
         "mt_target_x,mt_target_y,mt_target_z," +
-        "nav_has_path,nav_path_pending,los_clear_to_participant";
+        "nav_has_path,nav_path_pending,los_clear_to_participant," +
+        // Appended (schema v2). npc_spawn_instance_id is now the composite lifetime ID "<AgentID>-S<n>" (it was a bare "S<n>").
+        "session_id,part,phase,capture_period,sample_seq,lifetime_index," +
+        "rot_x,rot_y,rot_z,rot_w," +
+        "nav_agent_speed,itinerary_index,itinerary_count,target_id,nav_on_mesh," +
+        // Appended (schema v3): UncertainBehavior. uncertain_enabled = configured ON for this lifetime; uncertain_state / uncertain_look_phase = runtime.
+        "uncertain_enabled,uncertain_state,uncertain_look_phase";
 
     public const string NpcEventsHeader =
         "t_abs,t_unix_ms,npc_id,npc_spawn_instance_id,event_type," +
         "pos_x,pos_y,pos_z,yaw,dest_x,dest_y,dest_z," +
-        "speed_setting,path_corners,value_str";
+        "speed_setting,path_corners,value_str," +
+        // Appended (schema v2). For prewarm / pool events npc_spawn_instance_id and lifetime_index are blank (no active lifetime).
+        "session_id,part,phase,lifetime_index,itinerary_index,target_id";
+
+    // One row per ACTIVE NPC LIFETIME, written at its spawn boundary. Termination is recorded in npc_events.csv (npc_despawn).
+    public const string NpcLifetimesHeader =
+        "session_id,npc_spawn_instance_id,npc_id,lifetime_index,part,phase,capture_period_at_spawn," +
+        "prefab_name,object_name,object_created_t_abs,object_created_kind,pool_acquired_t_abs," +
+        "spawn_t_abs,spawn_t_unix_ms,registered_t_abs,registration,spawn_source," +
+        "spawn_x,spawn_y,spawn_z," +
+        "movement_mode,itinerary_count,entrance_id,first_target_id,final_target_id,itinerary_ids," +
+        "configured_speed,profile_name,profile_base_speed,speed_multiplier,uncertain_behavior_enabled,gender,dwell_time_s," +
+        "wander_look_ahead_m,nav_radius,nav_height,nav_acceleration,nav_angular_speed,nav_avoidance_priority," +
+        // Appended (schema v3): the profile content in force and the REALISED appearance (see NpcAppliedProfile.cs).
+        "profile_content_hash,profile_female_probability,profile_force_uncertain,profile_uncertain_probability,uncertain_config," +
+        "appearance_hash,appearance_applied_t_abs," +
+        "app_body_option,app_body_mesh,app_body_materials,app_hair_option,app_hair_mesh,app_hair_materials," +
+        "app_top_option,app_top_mesh,app_top_materials,app_bottom_option,app_bottom_mesh,app_bottom_materials," +
+        "app_shoes_option,app_shoes_mesh,app_shoes_materials,app_accessories_option,app_accessories_mesh,app_accessories_materials";
+
+    // One row per distinct AgentProfile CONTENT (profile_content_hash) seen in a session: the full description needed to reconstruct what a hash means,
+    // so a profile asset edited later cannot make old lifetimes ambiguous.
+    public const string NpcProfilesHeader =
+        "session_id,profile_content_hash,profile_name,first_seen_t_abs,profile_json";
 
     public const string BuildingRegistryHeader =
         "building_id,gameobject_name,gameobject_instance_id,hierarchy_path," +
@@ -90,7 +121,35 @@ public static class CaptureConstants
     public const string NpcEvtDwellEnd   = "npc_dwell_end";
     public const string NpcEvtArrived    = "npc_arrived";
     public const string NpcEvtDestChange = "npc_dest_change";
-    public const string NpcEvtLegStart   = "npc_leg_start";
+    public const string NpcEvtLegStart   = "npc_leg_start";   // RETIRED in schema v3: identical to npc_dest_change by construction; no longer emitted
+
+    // Added with the lifetime identity work (schema v2). Every one has a real code trigger.
+    public const string NpcEvtPrewarmCreated     = "prewarm_created";       // pool object instantiated at prewarm; INACTIVE, not a live NPC
+    public const string NpcEvtPoolObjectCreated  = "pool_object_created";   // pool object instantiated on demand because the pool was empty
+    public const string NpcEvtPoolAcquired       = "pool_acquired";         // object taken from the pool for a new lifetime
+    public const string NpcEvtMovementStart      = "npc_movement_start";    // first leg handed to MoveToTarget
+    public const string NpcEvtEntranceTeleport   = "npc_entrance_teleport"; // placement at the itinerary entrance (pos = before, dest = after)
+    public const string NpcEvtTargetSet          = "npc_target_set";        // itinerary leg issued (itinerary-level target change)
+    public const string NpcEvtItineraryComplete  = "npc_itinerary_complete";// itinerary finished / force-finished (lifetime ends)
+    public const string NpcEvtPoolReturn         = "npc_pool_return";       // inactive object is back in the pool
+    public const string NpcEvtUncertainState    = "npc_uncertain_state";   // UncertainBehavior label changed (value_str from=..;to=..;planned_s=..)
+    public const string NpcEvtOpenAtEnd          = "npc_lifetime_open_at_end"; // lifetime still open when the NPC simulation was frozen (End panel)
+    public const string NpcEvtSuperseded         = "npc_lifetime_superseded";  // diagnostic: a lifetime was replaced without a despawn
+
+    // Identity / schema metadata written to session_manifest.json.
+    public const int    SchemaVersion   = 3;
+    public const string NpcIdScheme     = "agent-lifetime-v1: npc_id=AgentID (stable pooled GameObject); npc_spawn_instance_id=<AgentID>-S<n> (n = per-AgentID lifetime index, from 1)";
+    public const string NpcCaptureModeText =
+        "master_switch: npc_state.csv holds every active NPC lifetime of a Part whose npcCaptureEnabled is true, from the moment NPCs exist (warm-up, " +
+        "Start-panel wait, pre-trial, trial) until the End-panel freeze; there is no trial-state gate";
+    public const string NpcMasterSwitchText =
+        "PartCaptureConfig.npcCaptureEnabled is the only NPC recording switch. When false for the running Part: no npc_state / npc_events / npc_lifetimes " +
+        "rows, no npc_spawn/npc_despawn/npc_warmup rows in events.csv, no NPC identity (hit_npc_id, hit_npc_spawn_instance_id) in gaze.csv, nothing queued " +
+        "or replayed; the NPC simulation, gaze and trajectory recording are unaffected";
+    public const string NpcBudgetScopeText =
+        "npcStateDataBudgetMBPerMinute (decimal MB/min, 0 = unlimited) limits ONLY the frequency of complete npc_state.csv snapshots, from measured bytes; " +
+        "npc_events.csv, npc_lifetimes.csv, events.csv, headers and the manifest are never throttled and may exceed it";
+    public const string SessionKeyScheme = "logical cross-file key = (session_id, npc_spawn_instance_id); session_id is the session folder name and gaze.csv session_id";
 
     // Part labels used by the scope machine
     public const string Part1    = "Part1";

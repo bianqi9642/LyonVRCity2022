@@ -501,14 +501,14 @@ public class DataCaptureManager : MonoBehaviour
 
     /// <summary>
     /// NEW (End Panel hard stop, Requirement 2/2A). Called when ExperimentManager raises OnEndPanelShown for
-    /// the Part currently running - immediately before that Part's End Panel is shown to the participant,
+    /// the Part currently running - at the moment that Part's End Panel becomes visible to the participant,
     /// strictly before part_end. Sets _endPanelActive, which TrajectoryCaptureActive / GazeCaptureActive /
     /// NpcCaptureActive all require to be false - so TrajectoryLoop()/NpcLoop() stop producing rows on their
     /// very next tick, and GazeRecorder's own per-sample check (dataCapture.GazeCaptureActive) does the same
-    /// for gaze.csv. No event row is written here beyond this in-memory flag flip: the moment is already
-    /// fully timestamped in events.csv by the existing "panel_shown" row (label "partX_end"), raised by
-    /// ExperimentManager immediately after this handler runs - a dedicated new event type would only
-    /// duplicate that timestamp (see Requirement 8).
+    /// for gaze.csv. No event row is written here beyond this in-memory flag flip: ExperimentManager writes the
+    /// visible-moment row itself ("end_panel_visible", label "partX_end") right after this handler returns; the
+    /// existing "panel_shown" row (same label) is raised just before the panel is requested and is unchanged.
+    /// Event rows are not gated by _endPanelActive, so those rows and the Part 3 valid-interval rows are still written.
     /// </summary>
     void OnEndPanelShown()
     {

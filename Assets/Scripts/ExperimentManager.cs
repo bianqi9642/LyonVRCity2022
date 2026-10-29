@@ -15,7 +15,9 @@ using UnityEngine;
 ///  - Destination1Zone / Destination2Zone each have exactly two candidate buildings; exactly ONE per
 ///    destination is chosen RANDOMLY and INDEPENDENTLY per session and kept fixed (coroutine locals).
 ///  - VISIBILITY vs INTERACTABILITY vs TARGET ASSIGNMENT remain three separate concepts (unchanged).
-///  - Timing: D1 search capped at part3Destination1MaxSeconds; whole phase capped at part3TotalMaxSeconds.
+///  - Timing (valid exposure, see Part3ValidTiming): the D1 search is capped at part3Destination1MaxSeconds counted from the D1
+///    Continue click; the D1 + D2 searches together are capped at part3TotalMaxSeconds, D2 receiving the budget left after the
+///    MEASURED interval 1. Reading the destination panels never consumes either budget.
 ///
 /// DATA CAPTURE (Revision 2):
 ///  - The old standalone Part 3 CSV ({subj}_Part3_Session_{UTC}.csv) has been REMOVED. AppendPart3Log(...)
@@ -70,9 +72,9 @@ using UnityEngine;
 ///    on; Part3 = everything on (attractor itinerary, as it always was).
 ///
 /// END PANEL HARD STOP (additive):
-///  - OnEndPanelShown is a new event, raised immediately before uiManager.ShowPartXEndPanel(...) is called
-///    (i.e. at the exact moment identified by auditing the actual panel-show call sites - NOT at part_end,
-///    which only fires later, after the participant confirms the panel). SpawnerManager subscribes to freeze
+///  - OnEndPanelShown is raised from HandleEndPanelDisplayed, i.e. at the moment the End panel actually becomes visible
+///    (UIManager 'onShown': right after the one-time placement, or after the settle wait ends) - NOT at EndTrial(), and NOT at
+///    part_end, which only fires later, after the participant confirms the panel. SpawnerManager subscribes to freeze
 ///    NPC movement (via MoveToTarget.PauseExternal + disabling UncertainBehavior - existing public APIs
 ///    only) and close the spawn gate; DataCaptureManager subscribes to hard-stop trajectory/gaze/NPC capture.
 ///    Both remain frozen/stopped through the entire End Panel wait, and only resume readiness for the NEXT
@@ -80,13 +82,25 @@ using UnityEngine;
 ///  - part_end (raised after the participant confirms the End Panel) is UNCHANGED and still fires exactly
 ///    where it always did; this feature does not move it earlier and does not alter panel/UI semantics.
 ///
-/// SESSION LIFECYCLE (additive; supersedes the End-Panel freeze above while SpawnerManager.simulationIndependentOfTrial is true):
-///  - ParticipantControlEnabled is true only between OnTrialStart and OnTrialEnd. Before the Start panel is confirmed and from
-///    the End panel on, the participant cannot move, turn, teleport or select buildings (ParticipantControlLock,
-///    GuardedTeleportationProvider, RiverTeleportPoint, TargetSelectable all read it); the Start/End buttons stay usable.
+/// SESSION LIFECYCLE (additive; the End-panel moment below now applies in every NPC mode):
+///  - ParticipantControlEnabled is true from OnTrialStart until the End panel actually becomes VISIBLE (HandleEndPanelDisplayed,
+///    called by UIManager at the display moment). EndTrial()/OnTrialEnd do not lock by themselves. Before the Start panel is
+///    confirmed and from the End panel on, the participant cannot move, turn, teleport or select buildings
+///    (ParticipantControlLock, GuardedTeleportationProvider, RiverTeleportPoint, TargetSelectable all read it); the Start/End
+///    buttons stay usable.
 ///  - The NPC simulation does not use that flag: it is open from the Part's NPC lifecycle (spawner.BeginNpcSimulation) and stops
-///    only when the End panel is confirmed (TerminateSession -> OnSessionEnded -> SpawnerManager freezes agents,
-///    DataCaptureManager writes session_end). After that no Part can be started and no scripted teleport runs.
+///    when the End panel becomes visible (OnEndPanelShown -> SpawnerManager stops spawning and freezes every agent for good).
+///    Confirming the panel (TerminateSession -> OnSessionEnded) finalises the session: DataCaptureManager writes session_end and
+///    no Part can be started any more. A Part also cannot be started while the End panel is visible.
+///
+/// PART 3 VALID EXPOSURE INTERVALS (measurement only; both maximum-duration mechanisms are untouched):
+///  - Search intervals, like the Part 1 / Part 2 timers (they exclude panel display and reading time):
+///    interval_1 = D1 search end - D1 Continue confirmed;  interval_2 = D2 search end - D2 Continue confirmed.
+///    A search end is the target-selection click (found) or the frame time at which the timeout branch was taken.
+///  - Written to events.csv as event_type 'part3_valid_interval' (label interval_1 / interval_2) by HandleEndPanelDisplayed, plus
+///    the endpoint events part3_d1_continue_confirmed, part3_d1_search_end, part3_d2_continue_confirmed, part3_d2_search_end and the
+///    separate UI events part3_d2_panel_visible, end_panel_visible (diagnostics; never interval endpoints).
+///    An endpoint that was never reached yields status=unavailable with a reason, never an invented duration.
 ///
 /// OnTrialStart / OnTrialEnd still fire exactly once each, for every Part including Part1.
 /// </summary>
@@ -96,11 +110,11 @@ public class ExperimentManager : MonoBehaviour
     public event Action OnTrialEnd;
 
     /// <summary>
-    /// NEW: raised exactly once per Part, immediately before that Part's End Panel is shown to the
-    /// participant (before uiManager.ShowPartXEndPanel(...) is called) - i.e. strictly BEFORE part_end,
-    /// which only fires later once the participant confirms the panel. This is the authoritative
-    /// "hard stop" boundary: subscribers (SpawnerManager, DataCaptureManager) use it to freeze NPCs and stop
-    /// all continuous data capture for the remainder of the End Panel's visible duration.
+    /// Raised exactly once per Part, at the moment that Part's End Panel becomes visible to the participant
+    /// (HandleEndPanelDisplayed) - i.e. strictly BEFORE part_end, which only fires later once the participant confirms the
+    /// panel, and after the participant lock was applied. This is the authoritative "hard stop" boundary: subscribers
+    /// (SpawnerManager, DataCaptureManager) use it to freeze NPCs and stop all continuous data capture for the remainder of
+    /// the End Panel's visible duration.
     /// </summary>
     public event Action OnEndPanelShown;
 
@@ -191,9 +205,13 @@ public class ExperimentManager : MonoBehaviour
     public float part1Duration = 60f;
     public float part2FirstDuration = 60f;
     public float part2SecondDuration = 60f;
-    [Tooltip("Maximum time (seconds) to search for Destination 1, measured from when its instruction panel is confirmed. Protocol: 600 (10 minutes).")]
+    [Tooltip("Maximum Destination 1 search time (seconds), counted from the moment the Destination 1 panel's Continue is confirmed " +
+             "(reading that panel is excluded). When it is reached - or earlier, when Target 1 is selected - the Destination 2 panel appears. " +
+             "It can never exceed 'Part3 Total Max Seconds'. Protocol: 600 (10 minutes).")]
     public float part3Destination1MaxSeconds = 600f;
-    [Tooltip("Maximum total Phase 3 duration (seconds), measured from when the Start panel is confirmed. Protocol: 900 (15 minutes).")]
+    [Tooltip("Maximum combined ACTIVE search time (seconds): interval 1 (D1 Continue -> end of the D1 search) + interval 2 (D2 Continue -> " +
+             "end of the D2 search). Destination 2 receives only what is left after the MEASURED interval 1: max(0, total - interval 1). " +
+             "Panel placement, panel reading and other UI waiting never consume this budget. Protocol: 900 (15 minutes).")]
     public float part3TotalMaxSeconds = 900f;
 
     [Header("Part 1 Configuration")]
@@ -355,12 +373,27 @@ public class ExperimentManager : MonoBehaviour
     // Part 3 selection window: every accepted building selection is queued (in click order) while a destination's
     // search window is open and scored once per entry by the Part 3 loops. Outside a window nothing is queued, so
     // stale or unrelated clicks can never be scored later.
-    private readonly Queue<string> pendingSelections = new Queue<string>();
+    // Each entry carries the click's own realtime stamp (taken in RegisterTargetSelection, i.e. in the click callback): when the
+    // target is found, that stamp - not the later frame in which the loop notices it - is the search endpoint.
+    private struct PendingSelection { public string id; public double realtime; }
+    private readonly Queue<PendingSelection> pendingSelections = new Queue<PendingSelection>();
     private bool selectionWindowOpen;
 
     private enum RunningPart { None, Part1, Part2, Part3 }
     private RunningPart currentRunningPart = RunningPart.None;
     private bool part1ContinuePanelOpen = false;
+
+    // End-panel display transition (all Parts). HandleEndPanelDisplayed runs once per Part, at the moment the End panel becomes
+    // visible: it locks the participant, raises OnEndPanelShown (NPC freeze, capture hard stop, river-point refresh) and, for
+    // Part 3, emits the valid-interval results. Reset at the top of every RunPartN.
+    private bool endPanelDisplayHandled;
+    private double endPanelVisibleRealtime = double.NaN;   // NaN = the display moment was not observed
+
+    // Part 3 valid-exposure timing (see Part3ValidTiming): drives the D1 / D2 search limits AND the interval results from the same
+    // recorded endpoints. Created at the top of RunPart3 from the two Inspector maxima. Clock: Time.realtimeSinceStartupAsDouble,
+    // the same as events.csv t_abs.
+    private Part3ValidTiming p3Timing;
+    private bool p3D2Ran;
 
     private void Awake()
     {
@@ -437,7 +470,7 @@ public class ExperimentManager : MonoBehaviour
         Debug.Log("Target selected: " + (targetData ?? "unknown"));
 
         if (selectionWindowOpen)
-            pendingSelections.Enqueue(targetData != null ? targetData.ToString() : "");
+            pendingSelections.Enqueue(new PendingSelection { id = targetData != null ? targetData.ToString() : "", realtime = Time.realtimeSinceStartupAsDouble });
 
         if (currentRunningPart == RunningPart.Part1 && !part1ContinuePanelOpen && uiManager != null)
         {
@@ -507,11 +540,43 @@ public class ExperimentManager : MonoBehaviour
         OnTrialStart?.Invoke();
     }
 
-    // End of the timed trial: participant control is locked before OnTrialEnd / the End panel, so there is no unlocked gap.
+    // End of the timed trial: raises OnTrialEnd (capture scope) only. Participant control is deliberately NOT changed here: it stays
+    // enabled until the End panel actually becomes visible (HandleEndPanelDisplayed), so ending the timer / the search loop never
+    // locks the participant by itself. In the normal case the End panel is shown synchronously right after this call.
     private void EndTrial()
     {
-        SetParticipantControl(false);
         OnTrialEnd?.Invoke();
+    }
+
+    // The End panel is on screen (UIManager 'onShown'), or - safety net - was confirmed without the display being observed.
+    // The single place where, in this order: the participant is locked (movement, turning, teleports, river points, building
+    // selection - every consumer reads ParticipantControlEnabled), EndPanelActive is set, OnEndPanelShown is raised (SpawnerManager
+    // stops spawning and freezes every NPC; DataCaptureManager stops continuous capture; RiverPointAvailability refreshes), and the
+    // visible-moment events are written. The UI path is untouched, so the panel stays clickable. Idempotent: the first call wins.
+    private void HandleEndPanelDisplayed(string part, bool displayObserved)
+    {
+        if (endPanelDisplayHandled) return;
+        endPanelDisplayHandled = true;
+
+        double nowRt = Time.realtimeSinceStartupAsDouble;   // first statement: nothing below may shift the recorded endpoint
+        if (displayObserved)
+        {
+            endPanelVisibleRealtime = nowRt;
+            if (currentRunningPart == RunningPart.Part3 && p3Timing != null) p3Timing.RecordEndPanelVisible(nowRt);   // UI diagnostic only; interval 2 already ended with the D2 search
+        }
+
+        SetParticipantControl(false);
+        EndPanelActive = true;
+
+        try { OnEndPanelShown?.Invoke(); }
+        catch (Exception ex) { Debug.LogError("[ExperimentManager] OnEndPanelShown subscriber threw: " + ex); }
+
+        if (displayObserved)
+            RaiseEvt("end_panel_visible", part, label: part.ToLowerInvariant() + "_end");
+        else
+            Debug.LogWarning($"[ExperimentManager] {part}: the End panel was confirmed without its display being observed; the participant lock and NPC shutdown were applied only now and 'end_panel_visible' was not recorded.", this);
+
+        if (currentRunningPart == RunningPart.Part3) EmitPart3ValidIntervals();
     }
 
     // Called as the last statement of RunPartN, after the End panel was confirmed and part_end was raised (so the capture layer
@@ -528,9 +593,91 @@ public class ExperimentManager : MonoBehaviour
 
     private bool RefuseStartAfterEnd(string what)
     {
-        if (!SessionEnded) return false;
-        Debug.LogWarning($"[ExperimentManager] {what} refused: the session has ended (End panel was confirmed).", this);
+        // The End panel being visible is already terminal for the participant lock and the NPC simulation, so a Part cannot be
+        // (re)started from that moment either - it would run with a dead NPC system.
+        if (!SessionEnded && !EndPanelActive) return false;
+        Debug.LogWarning($"[ExperimentManager] {what} refused: the End panel is visible or the session has ended.", this);
         return true;
+    }
+
+    // Writes the Part 3 valid-interval results (events.csv: event_type 'part3_valid_interval', label interval_1 / interval_2 /
+    // total_valid_exposure, value_num = seconds when measured, value_str = key=value pairs). Each interval is a SEARCH interval:
+    // it ends at the search endpoint (target-selection click, or the timeout branch), never at the next panel's visibility, and the
+    // numbers come from the SAME Part3ValidTiming endpoints that decided the search limits and the D2 budget. The UI-transition gaps
+    // (search end -> next panel visible, D2 panel reading time) are carried as separate diagnostics keys. An interval whose endpoint
+    // was never reached is written as status=unavailable with a reason and NO duration; a measured zero-length interval is
+    // status=complete (value_num is blank for an exact 0, so always read the status first). Called once, from
+    // HandleEndPanelDisplayed - the durable search-end rows (part3_d1_search_end / part3_d2_search_end) were written earlier.
+    private void EmitPart3ValidIntervals()
+    {
+        Part3ValidTiming t = p3Timing;
+        if (t == null) return;
+        var ci = System.Globalization.CultureInfo.InvariantCulture;
+
+        // Interval 1: D1 Continue clicked -> D1 search end.
+        string reason1 =
+            double.IsNaN(t.D1ContinueRealtime) ? "d1_continue_not_recorded" :
+            double.IsNaN(t.D1SearchEndRealtime) ? "d1_search_end_not_recorded" : "";
+        double i1 = EmitPart3Interval("interval_1", "d1_continue_confirmed", "d1_search_end",
+            t.D1ContinueRealtime, t.D1SearchEndRealtime, reason1,
+            $"d1_end={t.D1EndReason};d1_max_s={t.D1MaxSeconds.ToString("F3", ci)};total_max_s={t.TotalMaxSeconds.ToString("F3", ci)};d1_search_end_to_d2_panel_visible_s={Fs(t.D1EndToD2PanelVisibleSeconds)}");
+
+        // Interval 2: D2 Continue clicked -> D2 search end.
+        string reason2 =
+            !p3D2Ran ? "d2_skipped_total_budget_exhausted" :
+            double.IsNaN(t.D2ContinueRealtime) ? "d2_continue_not_recorded" :
+            double.IsNaN(t.D2SearchEndRealtime) ? "d2_search_end_not_recorded" : "";
+        string d2End = p3D2Ran ? t.D2EndReason : "skipped";
+        double i2 = EmitPart3Interval("interval_2", "d2_continue_confirmed", "d2_search_end",
+            t.D2ContinueRealtime, t.D2SearchEndRealtime, reason2,
+            $"d2_end={d2End};d2_budget_s={Fs(t.D2BudgetSeconds)};total_max_s={t.TotalMaxSeconds.ToString("F3", ci)};d2_panel_reading_s={Fs(t.D2PanelReadingSeconds)};d2_search_end_to_end_panel_visible_s={Fs(t.D2EndToEndPanelVisibleSeconds)}");
+
+        // Total valid search duration = interval 1 + interval 2, only when both were really measured.
+        if (!double.IsNaN(i1) && !double.IsNaN(i2))
+        {
+            double total = i1 + i2;
+            RaiseEvt("part3_valid_interval", "Part3", label: "total_valid_exposure", numValue: total,
+                stringValue: $"status=complete;interval_1_s={i1.ToString("F6", ci)};interval_2_s={i2.ToString("F6", ci)};duration_s={total.ToString("F6", ci)};total_max_s={t.TotalMaxSeconds.ToString("F3", ci)}");
+        }
+        else
+        {
+            string why = double.IsNaN(i1) && double.IsNaN(i2) ? "interval_1_and_interval_2_unavailable" : (double.IsNaN(i1) ? "interval_1_unavailable" : "interval_2_unavailable");
+            RaiseEvt("part3_valid_interval", "Part3", label: "total_valid_exposure",
+                stringValue: $"status=unavailable;reason={why};total_max_s={t.TotalMaxSeconds.ToString("F3", ci)}");
+        }
+    }
+
+    // Invariant-culture seconds with 6 decimals; "" for NaN (unavailable) so a missing value is never printed as a number.
+    private static string Fs(double v) => double.IsNaN(v) ? "" : v.ToString("F6", System.Globalization.CultureInfo.InvariantCulture);
+
+    // value_str for part3_d1_search_end / part3_d2_search_end: the search endpoint, why it happened, and the interval it closes.
+    private static string SearchEndText(string reason, double startT, double endT, double interval, double nextBudget)
+    {
+        return $"reason={reason};start_t_abs={Fs(startT)};end_t_abs={Fs(endT)};interval_s={Fs(interval)};d2_budget_s={Fs(nextBudget)}";
+    }
+
+    // Returns the measured duration, or NaN when the interval is unavailable.
+    private double EmitPart3Interval(string label, string startName, string endName, double start, double end, string unavailableReason, string extra)
+    {
+        var ci = System.Globalization.CultureInfo.InvariantCulture;
+        double duration = end - start;
+        if (string.IsNullOrEmpty(unavailableReason) && duration < 0.0) unavailableReason = "endpoints_out_of_order";
+
+        string text;
+        double num = 0.0;
+        if (string.IsNullOrEmpty(unavailableReason))
+        {
+            num = duration;
+            text = $"status=complete;start={startName};end={endName};start_t_abs={start.ToString("F6", ci)};end_t_abs={end.ToString("F6", ci)};duration_s={duration.ToString("F6", ci)};{extra}";
+        }
+        else
+        {
+            string s = double.IsNaN(start) ? "" : start.ToString("F6", ci);
+            string e = double.IsNaN(end) ? "" : end.ToString("F6", ci);
+            text = $"status=unavailable;reason={unavailableReason};start={startName};end={endName};start_t_abs={s};end_t_abs={e};{extra}";
+        }
+        RaiseEvt("part3_valid_interval", "Part3", label: label, stringValue: text, numValue: num);
+        return string.IsNullOrEmpty(unavailableReason) ? duration : double.NaN;
     }
 
     #endregion
@@ -632,6 +779,8 @@ public class ExperimentManager : MonoBehaviour
         currentRunningPart = RunningPart.Part1;
         CurrentPartConfig = part1Config;
         EndPanelActive = false;
+        endPanelDisplayHandled = false;
+        endPanelVisibleRealtime = double.NaN;
         RaiseEvt("part_start", "Part1");
 
         ConfigureTargetsForPart1();
@@ -659,15 +808,14 @@ public class ExperimentManager : MonoBehaviour
 
         EndTrial();
 
-        // Requirement 2: the End Panel hard stop. Raised BEFORE the panel is instantiated/shown, so
-        // subscribers (SpawnerManager, DataCaptureManager) freeze NPCs/capture before the participant can
-        // see anything - not after they confirm it (that remains part_end, raised further below, unchanged).
-        EndPanelActive = true;
-        OnEndPanelShown?.Invoke();
-
+        // End Panel hard stop: the participant lock, EndPanelActive and OnEndPanelShown (NPC freeze, capture stop) all happen in
+        // HandleEndPanelDisplayed, which UIManager calls at the moment the panel becomes visible (the confirm callback repeats
+        // the call as an idempotent safety net) - not at EndTrial() and not after the participant confirms (part_end below).
         bool confirmed = false;
         RaiseEvt("panel_shown", "Part1", label: "part1_end");
-        uiManager.ShowPart1EndPanel(() => { confirmed = true; RaiseEvt("panel_confirmed", "Part1", label: "part1_end"); });
+        uiManager.ShowPart1EndPanel(
+            () => { HandleEndPanelDisplayed("Part1", false); confirmed = true; RaiseEvt("panel_confirmed", "Part1", label: "part1_end"); },
+            () => HandleEndPanelDisplayed("Part1", true));
         yield return new WaitUntil(() => confirmed);
 
         RaiseEvt("part_end", "Part1");
@@ -680,6 +828,8 @@ public class ExperimentManager : MonoBehaviour
         currentRunningPart = RunningPart.Part2;
         CurrentPartConfig = part2Config;
         EndPanelActive = false;
+        endPanelDisplayHandled = false;
+        endPanelVisibleRealtime = double.NaN;
         RaiseEvt("part_start", "Part2");
 
         int gIdx = (sessionController != null) ? sessionController.part2GroupIndex : 0;
@@ -733,13 +883,12 @@ public class ExperimentManager : MonoBehaviour
 
         EndTrial();
 
-        // Requirement 2: the End Panel hard stop (see RunPart1() for the full explanation).
-        EndPanelActive = true;
-        OnEndPanelShown?.Invoke();
-
+        // End Panel hard stop at the moment the panel becomes visible (see RunPart1() for the full explanation).
         bool confirmed = false;
         RaiseEvt("panel_shown", "Part2", label: "part2_end");
-        uiManager.ShowPart2EndPanel(() => { confirmed = true; RaiseEvt("panel_confirmed", "Part2", label: "part2_end"); });
+        uiManager.ShowPart2EndPanel(
+            () => { HandleEndPanelDisplayed("Part2", false); confirmed = true; RaiseEvt("panel_confirmed", "Part2", label: "part2_end"); },
+            () => HandleEndPanelDisplayed("Part2", true));
         yield return new WaitUntil(() => confirmed);
 
         RaiseEvt("part_end", "Part2");
@@ -752,6 +901,10 @@ public class ExperimentManager : MonoBehaviour
         currentRunningPart = RunningPart.Part3;
         CurrentPartConfig = part3Config;
         EndPanelActive = false;
+        endPanelDisplayHandled = false;
+        endPanelVisibleRealtime = double.NaN;
+        p3Timing = new Part3ValidTiming(part3Destination1MaxSeconds, part3TotalMaxSeconds);
+        p3D2Ran = false;
         RaiseEvt("part_start", "Part3");
         SetPhase("idle");
 
@@ -837,7 +990,9 @@ public class ExperimentManager : MonoBehaviour
         BeginTrial();
         SetPhase("d1_pending");
 
-        double phaseStartRealtime = Time.realtimeSinceStartupAsDouble;
+        // Diagnostic only (phase_end elapsed time, a wall-clock trial window that INCLUDES panel reading). It no longer limits any
+        // search: the D1 / D2 limits come from p3Timing, started by the D1 / D2 Continue callbacks.
+        double trialStartRealtime = Time.realtimeSinceStartupAsDouble;
 
         // ============================ DESTINATION 1 ============================
         bool dest1Confirmed = false;
@@ -845,7 +1000,10 @@ public class ExperimentManager : MonoBehaviour
         RaiseEvt("panel_shown", "Part3", label: "part3_dest1");
         uiManager.ShowPart3Destination1Panel(() =>
         {
+            // Valid interval 1 starts at the actual Continue click: stamped before anything else in this callback.
+            bool firstD1Confirm = p3Timing.RecordD1Continue(Time.realtimeSinceStartupAsDouble);
             dest1Confirmed = true;
+            if (firstD1Confirm) RaiseEvt("part3_d1_continue_confirmed", "Part3", label: "D1");
             RaiseEvt("panel_confirmed", "Part3", label: "part3_dest1");
             RaiseEvt("destination_confirmed", "Part3", label: "D1");
         });
@@ -872,30 +1030,46 @@ public class ExperimentManager : MonoBehaviour
         pendingSelections.Clear();
         selectionWindowOpen = true;
         bool d1Found = false;
-        double d1StartRealtime = Time.realtimeSinceStartupAsDouble;
+        // The D1 search clock is the D1 Continue click recorded by the callback (this coroutine only resumes a frame later).
+        // Safety net: if the click was somehow not recorded, start the clock now so the search is still bounded.
+        p3Timing.RecordD1Continue(Time.realtimeSinceStartupAsDouble);
+        double d1StartRealtime = p3Timing.D1ContinueRealtime;
 
-        while (!d1Found
-               && (Time.realtimeSinceStartupAsDouble - d1StartRealtime) < part3Destination1MaxSeconds
-               && (Time.realtimeSinceStartupAsDouble - phaseStartRealtime) < part3TotalMaxSeconds)
+        // Limit: min(part3Destination1MaxSeconds, part3TotalMaxSeconds) from the D1 Continue click (Part3ValidTiming.D1SearchOpen).
+        // Queued selections are swept BEFORE the deadline test, so a click made inside the window but only noticed on the frame that
+        // closes it still counts. Endpoint: the click's own stamp when found; otherwise d1Now, the frame time that failed the test.
+        double d1Now = Time.realtimeSinceStartupAsDouble;
+        double d1EndRealtime = double.NaN;
+        while (true)
         {
             // Score every queued selection in click order. correct <=> selected id == this stage's expected id.
             // Once Destination 1 is found, the remaining queued selections of that frame are discarded, so a
             // destination can be resolved (and its success event emitted) at most once.
             while (!d1Found && pendingSelections.Count > 0)
             {
-                string clickedId = pendingSelections.Dequeue();
+                PendingSelection sel = pendingSelections.Dequeue();
+                if (!p3Timing.D1SelectionInWindow(sel.realtime)) continue;   // clicked after the search limit: not part of the search
+                string clickedId = sel.id;
                 bool correct = !string.IsNullOrEmpty(d1AssignedId) && clickedId == d1AssignedId;
 
                 AppendPart3Log("d1_click", groupNumber, def, startPoint, destination1Building, destination2Building,
                     selectedId: clickedId, found: correct,
-                    elapsedSeconds: Time.realtimeSinceStartupAsDouble - d1StartRealtime,
+                    elapsedSeconds: sel.realtime - d1StartRealtime,
                     notes: correct ? "correct" : "wrong_building");
 
-                if (correct) d1Found = true;
+                if (correct) { d1Found = true; d1EndRealtime = sel.realtime; }
                 // A wrong-building selection does NOT end the sub-phase and shows no feedback.
             }
+            if (d1Found || !p3Timing.D1SearchOpen(d1Now)) break;
             yield return null;
+            d1Now = Time.realtimeSinceStartupAsDouble;
         }
+        if (!d1Found) d1EndRealtime = d1Now;   // timeout branch: the moment it was taken
+
+        // Interval 1 ends HERE (search endpoint), not when the D2 panel appears; this also fixes the D2 budget from that same value.
+        p3Timing.RecordD1SearchEnd(d1EndRealtime, d1Found);
+        RaiseEvt("part3_d1_search_end", "Part3", label: "D1", numValue: p3Timing.Interval1Seconds, stringValue: SearchEndText(
+            p3Timing.D1EndReason, p3Timing.D1ContinueRealtime, p3Timing.D1SearchEndRealtime, p3Timing.Interval1Seconds, p3Timing.D2BudgetSeconds));
 
         selectionWindowOpen = false;
         pendingSelections.Clear();
@@ -903,8 +1077,10 @@ public class ExperimentManager : MonoBehaviour
         lastSelectedTargetData = null;
 
         string d1SelectedId = d1Found ? d1AssignedId : "";
-        double d1Elapsed = Time.realtimeSinceStartupAsDouble - d1StartRealtime;
-        bool totalTimeUpAfterD1 = (Time.realtimeSinceStartupAsDouble - phaseStartRealtime) >= part3TotalMaxSeconds;
+        double d1Elapsed = p3Timing.Interval1Seconds;   // the same value the D2 budget was derived from
+        // Does any of the total budget remain for Destination 2? (If not, D2 is skipped, as before.)
+        bool budgetRemainsAfterD1 = p3Timing.D2MayRun;
+        bool totalTimeUpAfterD1 = !budgetRemainsAfterD1;
 
         if (dest1ShrunkInstance != null) { Destroy(dest1ShrunkInstance); dest1ShrunkInstance = null; }
 
@@ -927,9 +1103,10 @@ public class ExperimentManager : MonoBehaviour
         string d2SelectedId = "";
         double d2Elapsed = 0.0;
 
-        if ((Time.realtimeSinceStartupAsDouble - phaseStartRealtime) < part3TotalMaxSeconds)
+        if (budgetRemainsAfterD1)
         {
             d2Ran = true;
+            p3D2Ran = true;
             SetPhase("d2_pending");
 
             bool dest2Confirmed = false;
@@ -937,9 +1114,23 @@ public class ExperimentManager : MonoBehaviour
             RaiseEvt("panel_shown", "Part3", label: "part3_dest2");
             uiManager.ShowPart3Destination2Panel(() =>
             {
+                // Valid interval 2 starts at the actual Continue click: stamped before anything else in this callback.
+                bool firstD2Confirm = p3Timing.RecordD2Continue(Time.realtimeSinceStartupAsDouble);
                 dest2Confirmed = true;
+                if (firstD2Confirm) RaiseEvt("part3_d2_continue_confirmed", "Part3", label: "D2");
                 RaiseEvt("panel_confirmed", "Part3", label: "part3_dest2");
                 RaiseEvt("destination_confirmed", "Part3", label: "D2");
+            },
+            () =>
+            {
+                // UI event only: the D2 panel is visible. It is NOT an interval endpoint (interval 1 already ended with the D1
+                // search) and it changes no budget; the gap since the D1 search end is logged for transition analysis.
+                if (p3Timing.RecordD2PanelVisible(Time.realtimeSinceStartupAsDouble))
+                {
+                    double gap = p3Timing.D1EndToD2PanelVisibleSeconds;
+                    RaiseEvt("part3_d2_panel_visible", "Part3", label: "D2", numValue: double.IsNaN(gap) ? 0.0 : gap,
+                        stringValue: $"d1_search_end_to_panel_visible_s={Fs(gap)};panel_visible_t_abs={Fs(p3Timing.D2PanelVisibleRealtime)}");
+                }
             });
             yield return new WaitUntil(() => dest2Confirmed);
             SetPhase("d2_search");
@@ -963,27 +1154,43 @@ public class ExperimentManager : MonoBehaviour
             lastSelectedTargetData = null;
             pendingSelections.Clear();
             selectionWindowOpen = true;
-            double d2StartRealtime = Time.realtimeSinceStartupAsDouble;
+            // The D2 search clock is the D2 Continue click recorded by the callback; its budget is the REMAINING total budget
+            // (max(0, total - interval 1), fixed when the D1 search ended), not a fresh full one, and panel placement / reading
+            // time before the click is not part of it.
+            p3Timing.RecordD2Continue(Time.realtimeSinceStartupAsDouble);   // safety net only; the callback already recorded it
+            double d2StartRealtime = p3Timing.D2ContinueRealtime;
 
-            while (!d2Found
-                   && (Time.realtimeSinceStartupAsDouble - phaseStartRealtime) < part3TotalMaxSeconds)
+            // Same loop shape and endpoint rule as Destination 1.
+            double d2Now = Time.realtimeSinceStartupAsDouble;
+            double d2EndRealtime = double.NaN;
+            while (true)
             {
                 // Same rule as Destination 1, against Destination 2's OWN expected id: a building that was correct
                 // for Destination 1 is not correct here, and a destination resolves at most once.
                 while (!d2Found && pendingSelections.Count > 0)
                 {
-                    string clickedId = pendingSelections.Dequeue();
+                    PendingSelection sel = pendingSelections.Dequeue();
+                    if (!p3Timing.D2SelectionInWindow(sel.realtime)) continue;
+                    string clickedId = sel.id;
                     bool correct = !string.IsNullOrEmpty(d2AssignedId) && clickedId == d2AssignedId;
 
                     AppendPart3Log("d2_click", groupNumber, def, startPoint, destination1Building, destination2Building,
                         selectedId: clickedId, found: correct,
-                        elapsedSeconds: Time.realtimeSinceStartupAsDouble - d2StartRealtime,
+                        elapsedSeconds: sel.realtime - d2StartRealtime,
                         notes: correct ? "correct" : "wrong_building");
 
-                    if (correct) d2Found = true;
+                    if (correct) { d2Found = true; d2EndRealtime = sel.realtime; }
                 }
+                if (d2Found || !p3Timing.D2SearchOpen(d2Now)) break;
                 yield return null;
+                d2Now = Time.realtimeSinceStartupAsDouble;
             }
+            if (!d2Found) d2EndRealtime = d2Now;   // budget expired: the moment the timeout branch was taken
+
+            // Interval 2 ends HERE (search endpoint), not when the End panel appears.
+            p3Timing.RecordD2SearchEnd(d2EndRealtime, d2Found);
+            RaiseEvt("part3_d2_search_end", "Part3", label: "D2", numValue: p3Timing.Interval2Seconds, stringValue: SearchEndText(
+                p3Timing.D2EndReason, p3Timing.D2ContinueRealtime, p3Timing.D2SearchEndRealtime, p3Timing.Interval2Seconds, p3Timing.D2BudgetSeconds));
 
             selectionWindowOpen = false;
             pendingSelections.Clear();
@@ -991,7 +1198,7 @@ public class ExperimentManager : MonoBehaviour
             lastSelectedTargetData = null;
 
             d2SelectedId = d2Found ? d2AssignedId : "";
-            d2Elapsed = Time.realtimeSinceStartupAsDouble - d2StartRealtime;
+            d2Elapsed = p3Timing.Interval2Seconds;
 
             if (dest2ShrunkInstance != null) { Destroy(dest2ShrunkInstance); dest2ShrunkInstance = null; }
 
@@ -1006,17 +1213,18 @@ public class ExperimentManager : MonoBehaviour
         }
         else
         {
-            Debug.Log("[ExperimentManager] Part3: total 15-minute limit already reached after Destination 1; Destination 2 skipped.");
+            Debug.Log("[ExperimentManager] Part3: the total valid-exposure budget was already spent by the Destination 1 search; Destination 2 skipped.");
         }
 
         // ============================ END ============================
-        double phaseTotalElapsed = Time.realtimeSinceStartupAsDouble - phaseStartRealtime;
+        double phaseTotalElapsed = Time.realtimeSinceStartupAsDouble - trialStartRealtime;   // wall clock incl. panel reading; diagnostic
+        // A search that ends without its target can only have ended because the total valid-exposure budget ran out (D2 is skipped
+        // or limited by it); the label text is kept for downstream compatibility.
+        bool totalBudgetReached = !d2Ran || !d2Found;
         string endReason =
             (d1Found && d2Found) ? "both_destinations_found" :
-            (phaseTotalElapsed >= part3TotalMaxSeconds) ? "total_time_15min_reached" :
-            (!d2Ran) ? "d2_skipped_no_time" :
-            (d2Found) ? "d2_found_d1_missed" :
-            "d2_not_found";
+            totalBudgetReached ? "total_time_15min_reached" :
+            "d2_found_d1_missed";
 
         AppendPart3Log(d2Ran ? "d2_result" : "d2_skipped", groupNumber, def, startPoint, destination1Building, destination2Building,
             selectedId: d2SelectedId, found: d2Found, elapsedSeconds: d2Elapsed, notes: endReason);
@@ -1029,13 +1237,13 @@ public class ExperimentManager : MonoBehaviour
         // Phase 3 is over: no Phase 3 target-specific interaction remains anywhere.
         SetAllPart3CandidatesInteractable(false);
 
-        // Requirement 2: the End Panel hard stop (see RunPart1() for the full explanation).
-        EndPanelActive = true;
-        OnEndPanelShown?.Invoke();
-
+        // End Panel hard stop at the moment the panel becomes visible (see RunPart1() for the full explanation). For Part 3 the same
+        // transition also records the End-panel endpoint of valid interval 2 and writes both interval results.
         bool confirmed = false;
         RaiseEvt("panel_shown", "Part3", label: "part3_end");
-        uiManager.ShowPart3EndPanel(() => { confirmed = true; RaiseEvt("panel_confirmed", "Part3", label: "part3_end"); });
+        uiManager.ShowPart3EndPanel(
+            () => { HandleEndPanelDisplayed("Part3", false); confirmed = true; RaiseEvt("panel_confirmed", "Part3", label: "part3_end"); },
+            () => HandleEndPanelDisplayed("Part3", true));
         yield return new WaitUntil(() => confirmed);
 
         RaiseEvt("part_end", "Part3");
@@ -1346,4 +1554,176 @@ public struct ExperimentEventInfo
     public GameObject building;      // building referenced by candidate_interactable_on/off
     public Vector3 fromPos;          // teleport: player position before
     public Vector3 toPos;            // teleport: destination position
+}
+
+/// <summary>
+/// Part 3 valid-exposure timing: the SINGLE source of truth for both the search limits (what ends a search) and the interval
+/// results (what is logged). A plain class with no Unity dependencies - every method takes a monotonic time
+/// (ExperimentManager passes Time.realtimeSinceStartupAsDouble values), so the rules can be driven by a simulated clock.
+///
+/// Intervals measure ACTIVE SEARCH time only, like the Part 1 / Part 2 duration timers (BeginTrial -> loop exit -> EndTrial, which
+/// never include a panel's display or reading time):
+///   interval 1 = D1 search end - D1 Continue confirmed
+///   interval 2 = D2 search end - D2 Continue confirmed
+///   total valid search duration = interval 1 + interval 2
+/// A "search end" is the moment the search stopped, never the visibility of the next panel:
+///   - target found: the time of the participant's selection click (captured in the click callback);
+///   - timeout / budget: the time at which the search loop took its timeout branch (the frame time that failed the loop test).
+///
+///   part3Destination1MaxSeconds  limits the D1 search, counted from the D1 Continue click.
+///   part3TotalMaxSeconds         limits interval 1 + interval 2 together:
+///                                  - the D1 search can never run longer than the total budget either (limit = min(D1 max, total));
+///                                  - the D2 search budget = max(0, total - interval 1), fixed the moment the D1 search ends from
+///                                    that SAME recorded interval 1. D2 panel placement, reading time and any other wait before the
+///                                    D2 Continue click do not reduce it, and D2 never gets a fresh full budget.
+/// Panel-visibility stamps (D2 panel, End panel) are kept only as UI diagnostics; they never feed an interval or a budget.
+/// Every endpoint is recorded at most once. NaN means "never reached"; no duration is ever derived from a missing endpoint.
+/// </summary>
+public sealed class Part3ValidTiming
+{
+    public readonly double D1MaxSeconds;
+    public readonly double TotalMaxSeconds;
+
+    public double D1ContinueRealtime { get; private set; } = double.NaN;
+    public double D1SearchEndRealtime { get; private set; } = double.NaN;
+    public string D1EndReason { get; private set; } = "";
+
+    public double D2PanelVisibleRealtime { get; private set; } = double.NaN;   // UI diagnostic only
+    public double D2ContinueRealtime { get; private set; } = double.NaN;
+    public double D2SearchEndRealtime { get; private set; } = double.NaN;
+    public string D2EndReason { get; private set; } = "";
+
+    public double EndPanelVisibleRealtime { get; private set; } = double.NaN;   // UI diagnostic only
+
+    /// <summary>Seconds the D2 search may last, counted from the D2 Continue click. NaN until the D1 search has ended.</summary>
+    public double D2BudgetSeconds { get; private set; } = double.NaN;
+
+    public Part3ValidTiming(double d1MaxSeconds, double totalMaxSeconds)
+    {
+        D1MaxSeconds = d1MaxSeconds;
+        TotalMaxSeconds = totalMaxSeconds;
+    }
+
+    // ---- Destination 1 ---------------------------------------------------------------------------------------------------
+
+    /// <summary>D1 Continue clicked. Starts both the interval-1 clock and the D1 search clock. First call wins.</summary>
+    public bool RecordD1Continue(double now)
+    {
+        if (!double.IsNaN(D1ContinueRealtime)) return false;
+        D1ContinueRealtime = now;
+        return true;
+    }
+
+    /// <summary>The D1 search lasts at most min(D1 max, total budget) from the D1 Continue click.</summary>
+    public double D1SearchLimitSeconds => Math.Min(D1MaxSeconds, TotalMaxSeconds);
+
+    /// <summary>True while the D1 search may continue (a Continue click was recorded and its limit is not reached).</summary>
+    public bool D1SearchOpen(double now) => !double.IsNaN(D1ContinueRealtime) && (now - D1ContinueRealtime) < D1SearchLimitSeconds;
+
+    /// <summary>A selection counts for D1 only if it was made inside the search window [D1 Continue, D1 Continue + limit).</summary>
+    public bool D1SelectionInWindow(double selectionRealtime) =>
+        !double.IsNaN(D1ContinueRealtime) && selectionRealtime >= D1ContinueRealtime && (selectionRealtime - D1ContinueRealtime) < D1SearchLimitSeconds;
+
+    /// <summary>Why a D1 search stops without its target: total_budget_exhausted | d1_cap_reached (found: target_found).</summary>
+    public string D1ReasonFor(bool targetFound)
+    {
+        if (targetFound) return "target_found";
+        return TotalMaxSeconds <= D1MaxSeconds ? "total_budget_exhausted" : "d1_cap_reached";
+    }
+
+    /// <summary>
+    /// The D1 search ended at 'endRealtime' (selection time when found, loop timeout time otherwise). First call wins. This also
+    /// fixes the D2 budget from the interval just recorded: max(0, total - interval 1).
+    /// </summary>
+    public bool RecordD1SearchEnd(double endRealtime, bool targetFound)
+    {
+        if (!double.IsNaN(D1SearchEndRealtime)) return false;
+        D1SearchEndRealtime = double.IsNaN(D1ContinueRealtime) ? endRealtime : Math.Max(endRealtime, D1ContinueRealtime);
+        D1EndReason = D1ReasonFor(targetFound);
+        double i1 = Interval1Seconds;
+        if (!double.IsNaN(i1)) D2BudgetSeconds = Math.Max(0.0, TotalMaxSeconds - i1);
+        return true;
+    }
+
+    /// <summary>True when the D1 search left some of the total budget for Destination 2 (the D2 panel and search may follow).</summary>
+    public bool D2MayRun => !double.IsNaN(D2BudgetSeconds) && D2BudgetSeconds > 0.0;
+
+    // ---- Destination 2 ---------------------------------------------------------------------------------------------------
+
+    /// <summary>The D2 panel became visible. Diagnostic stamp only: it is not an interval endpoint and changes no budget. First call wins.</summary>
+    public bool RecordD2PanelVisible(double now)
+    {
+        if (!double.IsNaN(D2PanelVisibleRealtime)) return false;
+        D2PanelVisibleRealtime = now;
+        return true;
+    }
+
+    /// <summary>D2 Continue clicked: starts the interval-2 clock and the D2 search clock. First call wins.</summary>
+    public bool RecordD2Continue(double now)
+    {
+        if (!double.IsNaN(D2ContinueRealtime)) return false;
+        D2ContinueRealtime = now;
+        return true;
+    }
+
+    /// <summary>True while the D2 search may continue: a Continue click and a budget exist, and the budget is not yet spent.</summary>
+    public bool D2SearchOpen(double now) =>
+        !double.IsNaN(D2ContinueRealtime) && !double.IsNaN(D2BudgetSeconds) && (now - D2ContinueRealtime) < D2BudgetSeconds;
+
+    /// <summary>A selection counts for D2 only if it was made inside [D2 Continue, D2 Continue + remaining budget).</summary>
+    public bool D2SelectionInWindow(double selectionRealtime) =>
+        !double.IsNaN(D2ContinueRealtime) && !double.IsNaN(D2BudgetSeconds) && selectionRealtime >= D2ContinueRealtime && (selectionRealtime - D2ContinueRealtime) < D2BudgetSeconds;
+
+    /// <summary>Why a D2 search stops without its target: no_budget_remaining | remaining_budget_exhausted (found: target_found).</summary>
+    public string D2ReasonFor(bool targetFound)
+    {
+        if (targetFound) return "target_found";
+        return D2BudgetSeconds <= 0.0 ? "no_budget_remaining" : "remaining_budget_exhausted";
+    }
+
+    /// <summary>The D2 search ended at 'endRealtime' (selection time when found, loop timeout time otherwise). First call wins.</summary>
+    public bool RecordD2SearchEnd(double endRealtime, bool targetFound)
+    {
+        if (!double.IsNaN(D2SearchEndRealtime)) return false;
+        D2SearchEndRealtime = double.IsNaN(D2ContinueRealtime) ? endRealtime : Math.Max(endRealtime, D2ContinueRealtime);
+        D2EndReason = D2ReasonFor(targetFound);
+        return true;
+    }
+
+    // ---- End panel -------------------------------------------------------------------------------------------------------
+
+    /// <summary>The End panel became visible. Diagnostic stamp only (drives the participant lock / NPC shutdown elsewhere). First call wins.</summary>
+    public bool RecordEndPanelVisible(double now)
+    {
+        if (!double.IsNaN(EndPanelVisibleRealtime)) return false;
+        EndPanelVisibleRealtime = now;
+        return true;
+    }
+
+    // ---- Results (NaN = endpoint missing or out of order; never a fabricated number) ----------------------------------------
+
+    public double Interval1Seconds => Span(D1ContinueRealtime, D1SearchEndRealtime);
+    public double Interval2Seconds => Span(D2ContinueRealtime, D2SearchEndRealtime);
+
+    /// <summary>interval 1 + interval 2, only when both were measured.</summary>
+    public double TotalValidSeconds
+    {
+        get
+        {
+            double a = Interval1Seconds, b = Interval2Seconds;
+            return double.IsNaN(a) || double.IsNaN(b) ? double.NaN : a + b;
+        }
+    }
+
+    // UI-transition diagnostics (kept apart from the intervals so each can be calculated independently from the log).
+    public double D1EndToD2PanelVisibleSeconds => Span(D1SearchEndRealtime, D2PanelVisibleRealtime);
+    public double D2PanelReadingSeconds => Span(D2PanelVisibleRealtime, D2ContinueRealtime);
+    public double D2EndToEndPanelVisibleSeconds => Span(D2SearchEndRealtime, EndPanelVisibleRealtime);
+
+    private static double Span(double start, double end)
+    {
+        if (double.IsNaN(start) || double.IsNaN(end)) return double.NaN;
+        double d = end - start;
+        return d < 0.0 ? double.NaN : d;
+    }
 }

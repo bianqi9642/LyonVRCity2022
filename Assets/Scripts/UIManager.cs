@@ -336,9 +336,11 @@ public class UIManager : MonoBehaviour
         ShowFullPanel(part1ContinuePanelTemplate, "Continue (confirm)", onContinue);
     }
 
-    public void ShowPart1EndPanel(Action onConfirm)
+    /// <param name="onShown">Optional. Invoked exactly once, synchronously, at the moment the panel actually becomes visible
+    /// (see <see cref="PlaceFullPanel"/>); before 'onConfirm' can possibly fire.</param>
+    public void ShowPart1EndPanel(Action onConfirm, Action onShown = null)
     {
-        ShowFullPanel(part1EndPanelTemplate, "This stage has ended. Press confirm to continue.", onConfirm);
+        ShowFullPanel(part1EndPanelTemplate, "This stage has ended. Press confirm to continue.", onConfirm, onShown);
     }
 
     #endregion
@@ -355,9 +357,10 @@ public class UIManager : MonoBehaviour
         ShowFullPanel(part2ContinuePanelTemplate, "Press Teleport to continue.", onContinue);
     }
 
-    public void ShowPart2EndPanel(Action onConfirm)
+    /// <param name="onShown">Optional visible-moment callback, see <see cref="ShowPart1EndPanel"/>.</param>
+    public void ShowPart2EndPanel(Action onConfirm, Action onShown = null)
     {
-        ShowFullPanel(part2EndPanelTemplate, "This stage has ended. Press confirm to continue.", onConfirm);
+        ShowFullPanel(part2EndPanelTemplate, "This stage has ended. Press confirm to continue.", onConfirm, onShown);
     }
 
     #endregion
@@ -381,14 +384,16 @@ public class UIManager : MonoBehaviour
     /// <summary>
     /// Show the Destination 2 full panel (with the prepared D2 building image) and return its PanelController.
     /// </summary>
-    public PanelController ShowPart3Destination2Panel(Action onConfirm)
+    /// <param name="onShown">Optional visible-moment callback, see <see cref="ShowPart1EndPanel"/>.</param>
+    public PanelController ShowPart3Destination2Panel(Action onConfirm, Action onShown = null)
     {
-        return ShowFullPanelAndReturnController(part3Dest2FullTemplate, "Destination 2", onConfirm, destination2Image);
+        return ShowFullPanelAndReturnController(part3Dest2FullTemplate, "Destination 2", onConfirm, destination2Image, onShown);
     }
 
-    public void ShowPart3EndPanel(Action onConfirm)
+    /// <param name="onShown">Optional visible-moment callback, see <see cref="ShowPart1EndPanel"/>.</param>
+    public void ShowPart3EndPanel(Action onConfirm, Action onShown = null)
     {
-        ShowFullPanel(part3EndPanelTemplate, "This stage has ended. Press confirm to continue.", onConfirm);
+        ShowFullPanel(part3EndPanelTemplate, "This stage has ended. Press confirm to continue.", onConfirm, onShown);
     }
 
     #endregion
@@ -399,11 +404,12 @@ public class UIManager : MonoBehaviour
     /// Instantiate the provided template GameObject (must not be null) and position it in front of the camera.
     /// This helper does not return the PanelController.
     /// </summary>
-    private void ShowFullPanel(GameObject template, string fallbackMessage, Action onConfirm)
+    private void ShowFullPanel(GameObject template, string fallbackMessage, Action onConfirm, Action onShown = null)
     {
         if (template == null)
         {
             Debug.LogWarning("UIManager.ShowFullPanel: template is null. No panel shown.");
+            NotifyShown(onShown);   // nothing will ever be displayed: report the (non-)display before the auto-confirm
             onConfirm?.Invoke(); // avoid deadlock if missing
             return;
         }
@@ -418,7 +424,7 @@ public class UIManager : MonoBehaviour
         if (pc == null)
         {
             Debug.LogWarning("UIManager.ShowFullPanel: instantiated panel has no PanelController component (search included children).");
-            PlaceFullPanel(instance.transform);
+            PlaceFullPanel(instance.transform, onShown);
             return;
         }
 
@@ -433,7 +439,7 @@ public class UIManager : MonoBehaviour
         pc.Setup(textToPass, onConfirm, showCancel: false);
 
         // position the panel in front of the HMD
-        PlaceFullPanel(instance.transform);
+        PlaceFullPanel(instance.transform, onShown);
     }
 
     /// <summary>
@@ -441,11 +447,12 @@ public class UIManager : MonoBehaviour
     /// The created full panel is positioned in front of the camera. If 'destinationImage' is non-null it is applied
     /// to the first RawImage in the instantiated panel (used by the Phase 3 destination panels).
     /// </summary>
-    private PanelController ShowFullPanelAndReturnController(GameObject template, string fallbackMessage, Action onConfirm, Texture2D destinationImage = null)
+    private PanelController ShowFullPanelAndReturnController(GameObject template, string fallbackMessage, Action onConfirm, Texture2D destinationImage = null, Action onShown = null)
     {
         if (template == null)
         {
             Debug.LogWarning("UIManager.ShowFullPanelAndReturnController: template is null.");
+            NotifyShown(onShown);
             onConfirm?.Invoke();
             return null;
         }
@@ -460,7 +467,7 @@ public class UIManager : MonoBehaviour
         {
             Debug.LogWarning("UIManager.ShowFullPanelAndReturnController: no PanelController found.");
             ApplyDestinationImage(instance, destinationImage);
-            PlaceFullPanel(instance.transform);
+            PlaceFullPanel(instance.transform, onShown);
             onConfirm?.Invoke();
             return null;
         }
@@ -473,7 +480,7 @@ public class UIManager : MonoBehaviour
 
         pc.Setup(textToPass, onConfirm, showCancel: false);
         ApplyDestinationImage(instance, destinationImage);   // before placement: it can change what is active in the layout
-        PlaceFullPanel(instance.transform);
+        PlaceFullPanel(instance.transform, onShown);
         return pc;
     }
 
@@ -562,20 +569,35 @@ public class UIManager : MonoBehaviour
     /// steady pose (bounded by 'settleTimeout'), and only then is the panel positioned and shown. It is positioned exactly
     /// once and never moves afterwards.
     /// </summary>
-    private void PlaceFullPanel(Transform panel)
+    /// <remarks>
+    /// 'onShown' (optional) marks the moment the panel becomes visible, exactly once: right after the one-time positioning in
+    /// the immediate path (same synchronous call that instantiated the panel, so before the first rendered frame), or right
+    /// after the Canvases are re-enabled in the settle path. It is NOT invoked while the Canvases are still hidden by the
+    /// settle wait, and not at all if the panel is destroyed during that wait.
+    /// </remarks>
+    private void PlaceFullPanel(Transform panel, Action onShown = null)
     {
         if (panel == null) return;
 
         if (IsHeadPoseSettled)
         {
             PositionPanelInFront(panel, panelLocalOffset, "immediate");
+            NotifyShown(onShown);
             return;
         }
 
-        StartCoroutine(PlaceWhenSettled(panel));
+        StartCoroutine(PlaceWhenSettled(panel, onShown));
     }
 
-    private IEnumerator PlaceWhenSettled(Transform panel)
+    // A throwing observer must never break panel display or the confirm path.
+    private static void NotifyShown(Action onShown)
+    {
+        if (onShown == null) return;
+        try { onShown(); }
+        catch (Exception e) { Debug.LogError("[UIManager] Panel-shown callback threw: " + e); }
+    }
+
+    private IEnumerator PlaceWhenSettled(Transform panel, Action onShown = null)
     {
         // Hide (not deactivate) the root canvases: the panel stays "open" for HasOpenFullPanel but cannot be seen or hit.
         Canvas[] canvases = panel.GetComponentsInChildren<Canvas>(true);
@@ -597,6 +619,8 @@ public class UIManager : MonoBehaviour
 
         for (int i = 0; i < canvases.Length; i++)
             if (canvases[i] != null) canvases[i].enabled = wasEnabled[i];
+
+        NotifyShown(onShown);   // the Canvases are visible again: this is the display moment
     }
 
     /// <summary>

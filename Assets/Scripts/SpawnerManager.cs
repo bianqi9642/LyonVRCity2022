@@ -40,15 +40,18 @@
 //
 // NPC SIMULATION LIFECYCLE (independent of the participant)
 //   The NPC simulation is open from the Part's NPC lifecycle (ExperimentManager.RunNpcWarmup -> BeginNpcSimulation) until the
-//   session ends (ExperimentManager.OnSessionEnded, i.e. the participant confirmed the End panel). It does NOT depend on the
-//   Start panel, on OnTrialStart/OnTrialEnd, or on the End panel being visible. With 'simulationIndependentOfTrial' = false the
-//   previous trial-window behaviour (pause at trial end, hard stop at the End panel) is kept.
+//   End panel becomes VISIBLE (ExperimentManager.OnEndPanelShown): at that moment spawning stops for good and every live agent
+//   is frozen permanently (ShutDownNpcSimulation) - not when the participant confirms the panel. OnSessionEnded (confirm) then
+//   finds the shutdown already done. It does NOT depend on the Start panel or on OnTrialStart/OnTrialEnd. With
+//   'simulationIndependentOfTrial' = false the previous pre-End-panel trial-window behaviour (pause at trial end) is kept.
 //
 // HISTORY OF NOTE (kept short; see the methods for details)
 //   - Trial-state gating and the NPC warm-up window are two independent flags (trialActive, npcWarmupActive)
 //     because they carry different experimental meaning; ExperimentManager sequences them so they never overlap.
-//   - The End-Panel hard stop is re-asserted every frame (Update) because PedestrianAgent's dwell coroutines can
-//     otherwise un-pause an agent between frames. It is cleared only by ResetForNewPart().
+//   - The End-Panel stop used to be a per-frame re-asserted pause (Update/HardStopAllActiveAgents) because PedestrianAgent's dwell
+//     coroutines could un-pause an agent between frames. It is now the permanent freeze (FreezeAgentPermanently stops those
+//     coroutines and disables the components), so that legacy path is no longer entered; ExperimentManager refuses to start a
+//     new Part once the End panel is visible.
 //   - All Debug logging is gated by 'enableDebugLogs' (inline `if`, so no strings are built when disabled).
 //
 // All comments in English.
@@ -538,13 +541,11 @@ public class SpawnerManager : MonoBehaviour
     /// </summary>
     private void HandleEndPanelShown()
     {
-        // Independent simulation: the End panel only locks the participant (ExperimentManager); NPCs keep running until End is
-        // confirmed (HandleSessionEnded).
-        if (simulationIndependentOfTrial) return;
-
-        endPanelActive = true;
-        HardStopAllActiveAgents();
-        if (enableDebugLogs) Debug.Log("[SpawnerManager] End Panel shown -> NPC spawning and movement hard-stopped.");
+        // The End panel becoming visible is the terminal boundary of the NPC simulation in BOTH modes: spawning stops and every
+        // live agent is frozen right here, not when the participant confirms the panel. (Before, the independent-simulation
+        // mode returned early and NPCs kept walking until HandleSessionEnded.) Confirming the panel later finds the shutdown
+        // already done and is a no-op for the NPC system.
+        ShutDownNpcSimulation("End panel shown");
     }
 
     /// <summary>
@@ -576,9 +577,19 @@ public class SpawnerManager : MonoBehaviour
     /// </summary>
     private void HandleSessionEnded()
     {
+        // Normally a no-op: the End panel appearing (HandleEndPanelShown) already shut the simulation down. Kept as the
+        // fallback for a session that ends without the End-panel event having reached this component.
+        ShutDownNpcSimulation("Session ended");
+    }
+
+    // The one NPC shutdown, shared by HandleEndPanelShown (first caller in the normal flow) and HandleSessionEnded.
+    // Idempotent via 'sessionEnded': repeated notifications cannot restart spawning, unfreeze anything or log twice.
+    private void ShutDownNpcSimulation(string trigger)
+    {
         if (sessionEnded) return;
-        sessionEnded = true;
+        sessionEnded = true;      // closes ShouldSpawnNow() and BeginNpcSimulation() for good
         simulationActive = false;
+        endPanelActive = false;   // the per-frame legacy hard stop (Update) is superseded by the permanent freeze below
         StopAllCoroutines();   // SpawnLoop / prewarm: no scheduled spawn can run after this point
 
         int frozen = 0;
@@ -589,7 +600,7 @@ public class SpawnerManager : MonoBehaviour
             FreezeAgentPermanently(go);
             frozen++;
         }
-        if (enableDebugLogs) Debug.Log($"[SpawnerManager] Session ended -> spawning stopped, {frozen} live agent(s) frozen.");
+        if (enableDebugLogs) Debug.Log($"[SpawnerManager] {trigger} -> spawning stopped, {frozen} live agent(s) frozen.");
     }
 
     private void FreezeAgentPermanently(GameObject go)

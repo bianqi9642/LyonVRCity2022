@@ -1,0 +1,51 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: b89eef04977c4ed2aa727cb6d5ed91b8, type: 3}
+  m_Name: Dusk Environment Profile
+  m_EditorClassIdentifier: 
+  targetSceneName: LyonVRVity35
+  dusk:
+    sunColor: {r: 1, g: 0.62, b: 0.38, a: 1}
+    sunIntensity: 1.3
+    skyboxMaterial: {fileID: 2100000, guid: 46c16ba3cde042cc91d6e758c61a44b0, type: 2}
+    ambientMode: 1
+    ambientSky: {r: 0.42, g: 0.5, b: 0.7, a: 1}
+    ambientEquator: {r: 0.3, g: 0.33, b: 0.43, a: 1}
+    ambientGround: {r: 0.14, g: 0.13, b: 0.14, a: 1}
+    ambientIntensity: 1
+    fogEnabled: 1
+    fogColor: {r: 0.5, g: 0.55, b: 0.68, a: 1}
+    fogMode: 3
+    fogDensity: 0.0003
+    fogStart: 0
+    fogEnd: 300
+    reflectionIntensity: 0.6
+    sunEuler: {x: 12, y: 10.322, z: 41.066}
+  daylight:
+    sunColor: {r: 1, g: 1, b: 1, a: 1}
+    sunIntensity: 1
+    skyboxMaterial: {fileID: 10304, guid: 0000000000000000f000000000000000, type: 0}
+    ambientMode: 0
+    ambientSky: {r: 0.212, g: 0.227, b: 0.259, a: 1}
+    ambientEquator: {r: 0.114, g: 0.125, b: 0.133, a: 1}
+    ambientGround: {r: 0.047, g: 0.043, b: 0.035, a: 1}
+    ambientIntensity: 1
+    fogEnabled: 0
+    fogColor: {r: 0.5, g: 0.5, b: 0.5, a: 1}
+    fogMode: 3
+    fogDensity: 0.01
+    fogStart: 0
+    fogEnd: 300
+    reflectionIntensity: 1
+    captured: 1
+    sceneName: LyonVRVity35
+    sunRotation: {x: 0.33079913, y: -0.0329763, z: 0.3034621, w: 0.8929699}

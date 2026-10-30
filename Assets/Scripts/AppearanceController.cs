@@ -32,8 +32,13 @@ public class AppearanceController : MonoBehaviour
 
     [Header("Debug")]
     [Tooltip("When true, logs a warning if a gendered appearance pool (hair/top/bottom) has no " +
-             "option for the rolled gender. Enable while setting up the Agent Profile.")]
+             "option for the rolled gender, and one line per ApplyProfile with the accessory (wristband) that was applied " +
+             "(option, mesh, material). Enable while setting up the Agent Profile; never logged per frame.")]
     public bool enableDebugLogs = false;
+
+    // The prefab's own accessory material slots, cached before the first accessory reset. Only used as a fallback when a bracelet option
+    // supplies a mesh but an empty material list (a profile configuration error), so the renderer never shows null (pink) materials.
+    private Material[] authoredAccessoryMaterials;
 
     /// <summary>
     /// Gender assigned to this NPC by the most recent ApplyProfile call. Constant for the
@@ -77,17 +82,31 @@ public class AppearanceController : MonoBehaviour
         applied.top         = ApplyPart(profile, profile.topOptions,         topRenderer,         CurrentGender);
         applied.bottom      = ApplyPart(profile, profile.bottomOptions,      bottomRenderer,      CurrentGender);
         applied.shoes       = ApplyPart(profile, profile.shoesOptions,       shoesRenderer,       CurrentGender);
-        applied.accessories = ApplyPart(profile, profile.accessoriesOptions, accessoriesRenderer, CurrentGender);
+        applied.accessories = ApplyPart(profile, profile.accessoriesOptions, accessoriesRenderer, CurrentGender, isAccessory: true);
         LastApplied = applied;
+
+        if (enableDebugLogs && accessoriesRenderer != null)
+        {
+            AppliedPartRecord a = applied.accessories;
+            Debug.Log($"[AppearanceController] '{gameObject.name}' (id {gameObject.GetInstanceID()}) accessories: option {a.optionIndex}, " +
+                      (accessoriesRenderer.sharedMesh != null
+                          ? $"bracelet mesh '{a.MeshName}', material '{a.MaterialNames}' (index {(a.materialIndices != null && a.materialIndices.Length > 0 ? a.materialIndices[0] : -1)})"
+                          : "no bracelet (renderer cleared)"), this);
+        }
     }
 
     /// <summary>
     /// Apply one part's chosen option to the provided renderer.
     /// Uses the profile's gender-filtered chooser to pick a PartOption by weight.
     /// Unisex options are always eligible, so shoes/accessories/body are unaffected.
+    ///
+    /// isAccessory (the wristband renderer only): the renderer is explicitly CLEARED (mesh null, material slots null, same slot count) before the
+    /// option is applied, so a pooled NPC can never keep the previous spawn's bracelet; an option with no mesh and no materials ("no bracelet")
+    /// therefore leaves it empty. One material is drawn uniformly from the option's Materials list per application (the list is the set of
+    /// colour ALTERNATIVES) and assigned to every slot as a shared asset, so the bracelet is a single colour and no per-NPC material instance is made.
     /// </summary>
     private AppliedPartRecord ApplyPart(AgentProfile profile, AgentProfile.PartOption[] options,
-                           SkinnedMeshRenderer renderer, AgentGender gender)
+                           SkinnedMeshRenderer renderer, AgentGender gender, bool isAccessory = false)
     {
         var record = new AppliedPartRecord();   // observation only: nothing below depends on it
         if (renderer == null) return record;
@@ -95,6 +114,14 @@ public class AppearanceController : MonoBehaviour
         record.mesh = renderer.sharedMesh;
         record.materials = renderer.sharedMaterials;
         if (options == null || options.Length == 0) return record;   // optionIndex stays -2: the profile offers nothing for this part
+
+        if (isAccessory)
+        {
+            if (authoredAccessoryMaterials == null) authoredAccessoryMaterials = renderer.sharedMaterials;
+            ClearAccessoryRenderer(renderer);
+            record.mesh = null;
+            record.materials = renderer.sharedMaterials;
+        }
 
         var chosen = profile.ChooseWeightedOption(options, gender);
         record.optionIndex = chosen == null ? -1 : System.Array.IndexOf(options, chosen);
@@ -133,18 +160,18 @@ public class AppearanceController : MonoBehaviour
 
             Material[] newMats = new Material[slotCount];
             record.materialIndices = new int[slotCount];
+            int accessoryDraw = isAccessory ? Random.Range(0, chosen.materials.Length) : -1;   // ONE draw for the whole bracelet
             for (int s = 0; s < slotCount; s++)
             {
-                int matIndex = Random.Range(0, chosen.materials.Length);
+                int matIndex = isAccessory ? accessoryDraw : Random.Range(0, chosen.materials.Length);
                 record.materialIndices[s] = matIndex;
                 Material baseMat = chosen.materials[matIndex];
 
                 // If the selected base material is null, fallback to existing material in that slot if possible
                 if (baseMat == null)
                 {
-                    newMats[s] = (renderer.sharedMaterials != null && renderer.sharedMaterials.Length > s)
-                        ? renderer.sharedMaterials[s]
-                        : null;
+                    Material[] fallback = isAccessory ? authoredAccessoryMaterials : renderer.sharedMaterials;
+                    newMats[s] = (fallback != null && fallback.Length > s) ? fallback[s] : null;
                 }
                 else
                 {
@@ -154,12 +181,31 @@ public class AppearanceController : MonoBehaviour
                 }
             }
 
-            // Set materials (this will create instances so each renderer can be modified independently at runtime)
-            renderer.materials = newMats;
+            // Set materials (this will create instances so each renderer can be modified independently at runtime).
+            // The accessory takes the shared assets directly: no per-NPC material instance.
+            if (isAccessory) renderer.sharedMaterials = newMats;
+            else renderer.materials = newMats;
             record.materials = newMats;   // the chosen source assets, not the runtime "(Instance)" copies
+        }
+        else if (isAccessory && chosen.mesh != null)
+        {
+            // A bracelet mesh without any material is a profile configuration error: fall back to the prefab's own slots instead of null (pink).
+            if (authoredAccessoryMaterials != null) renderer.sharedMaterials = authoredAccessoryMaterials;
+            record.materials = renderer.sharedMaterials;
+            if (enableDebugLogs)
+                Debug.LogWarning($"[AppearanceController] accessories option {record.optionIndex} on '{gameObject.name}' has a mesh but no materials; using the prefab's own material.");
         }
 
         record.mesh = renderer.sharedMesh;
         return record;
+    }
+
+    /// <summary>Empty the wristband renderer: no mesh, every material slot null (slot count kept, at least one).</summary>
+    private static void ClearAccessoryRenderer(SkinnedMeshRenderer renderer)
+    {
+        Material[] current = renderer.sharedMaterials;
+        int slots = Mathf.Max(1, current != null ? current.Length : 0);
+        renderer.sharedMesh = null;
+        renderer.sharedMaterials = new Material[slots];
     }
 }

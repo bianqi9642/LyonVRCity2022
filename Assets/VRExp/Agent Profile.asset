@@ -131,13 +131,47 @@ MonoBehaviour:
   accessoriesOptions:
   - mesh: {fileID: -8798783132424415978, guid: e1efa5985d3fb4014b18e2281bf56faa, type: 3}
     materials:
-    - {fileID: -6478536213147159724, guid: e1efa5985d3fb4014b18e2281bf56faa, type: 3}
-    weight: 0.5
+    - {fileID: 2100000, guid: 4ed7f0aca21540999c075d7ce58e5f42, type: 2}
+    weight: 0.05
+    genderRestriction: 0
+  - mesh: {fileID: -8798783132424415978, guid: e1efa5985d3fb4014b18e2281bf56faa, type: 3}
+    materials:
+    - {fileID: 2100000, guid: a61b0d48ac3845c0929c9c514b789af5, type: 2}
+    weight: 0.05
+    genderRestriction: 0
+  - mesh: {fileID: -8798783132424415978, guid: e1efa5985d3fb4014b18e2281bf56faa, type: 3}
+    materials:
+    - {fileID: 2100000, guid: 08ff2fbb93fe46ceb63b7cbfdc568aba, type: 2}
+    weight: 0.05
+    genderRestriction: 0
+  - mesh: {fileID: -8798783132424415978, guid: e1efa5985d3fb4014b18e2281bf56faa, type: 3}
+    materials:
+    - {fileID: 2100000, guid: b83d6ec44bef41ba99782b25095f5ac1, type: 2}
+    weight: 0.05
     genderRestriction: 0
   - mesh: {fileID: 493326964870366955, guid: e1efa5985d3fb4014b18e2281bf56faa, type: 3}
     materials:
-    - {fileID: -6478536213147159724, guid: e1efa5985d3fb4014b18e2281bf56faa, type: 3}
-    weight: 0.5
+    - {fileID: 2100000, guid: 4ed7f0aca21540999c075d7ce58e5f42, type: 2}
+    weight: 0.05
+    genderRestriction: 0
+  - mesh: {fileID: 493326964870366955, guid: e1efa5985d3fb4014b18e2281bf56faa, type: 3}
+    materials:
+    - {fileID: 2100000, guid: a61b0d48ac3845c0929c9c514b789af5, type: 2}
+    weight: 0.05
+    genderRestriction: 0
+  - mesh: {fileID: 493326964870366955, guid: e1efa5985d3fb4014b18e2281bf56faa, type: 3}
+    materials:
+    - {fileID: 2100000, guid: 08ff2fbb93fe46ceb63b7cbfdc568aba, type: 2}
+    weight: 0.05
+    genderRestriction: 0
+  - mesh: {fileID: 493326964870366955, guid: e1efa5985d3fb4014b18e2281bf56faa, type: 3}
+    materials:
+    - {fileID: 2100000, guid: b83d6ec44bef41ba99782b25095f5ac1, type: 2}
+    weight: 0.05
+    genderRestriction: 0
+  - mesh: {fileID: 0}
+    materials: []
+    weight: 0.6
     genderRestriction: 0
   femaleProbability: 0.5
   agentRadius: 0.3

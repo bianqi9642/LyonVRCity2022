@@ -775,7 +775,8 @@ public class SpawnerManager : MonoBehaviour
     }
 
     // Instantiates 'poolPrewarm' inactive NPCs, each placed on the NavMesh near the sample origin (or parked out of
-    // sight with its NavMeshAgent disabled if no NavMesh was found) and configured with the default profile.
+    // sight with its NavMeshAgent disabled if no NavMesh was found). No AgentProfile is applied here: appearance, speed, NavMeshAgent
+    // shape and the UncertainBehavior roll are applied once per lifetime by SpawnAgent() -> ApplyAgentProfile(), before activation.
     IEnumerator PrewarmPoolCoroutine()
     {
         Vector3 sampleOrigin = PoolSampleOrigin();
@@ -819,12 +820,6 @@ public class SpawnerManager : MonoBehaviour
                 }
                 // move slightly out of sight instead of extremely far
                 go.transform.position = sampleOrigin + Vector3.down * 5f;
-            }
-
-            // Apply profile to prewarmed instance if factory/profile available
-            if (agentFactory != null && defaultProfile != null)
-            {
-                agentFactory.ApplyProfileToInstance(go, defaultProfile);
             }
 
             // MoveToTarget is NavMeshAgent-only: just make sure it knows the runtime agent reference.

@@ -76,8 +76,36 @@ PrefabInstance:
       propertyPath: m_ConstrainProportionsScale
       value: 0
       objectReference: {fileID: 0}
+    - target: {fileID: 4368389211439169982, guid: fad94b617f0540568dbf4c9c4011248c, type: 3}
+      propertyPath: m_Materials.Array.data[0]
+      value: 
+      objectReference: {fileID: 2100000, guid: 6263e42a9a4f466a8e328964a983317f, type: 2}
     m_RemovedComponents: []
     m_RemovedGameObjects: []
     m_AddedGameObjects: []
-    m_AddedComponents: []
+    m_AddedComponents:
+    - targetCorrespondingSourceObject: {fileID: 3449784919008568370, guid: fad94b617f0540568dbf4c9c4011248c, type: 3}
+      insertIndex: -1
+      addedObject: {fileID: 4078405455193301135}
   m_SourcePrefab: {fileID: 100100000, guid: fad94b617f0540568dbf4c9c4011248c, type: 3}
+--- !u!1 &3026859794481690194 stripped
+GameObject:
+  m_CorrespondingSourceObject: {fileID: 3449784919008568370, guid: fad94b617f0540568dbf4c9c4011248c, type: 3}
+  m_PrefabInstance: {fileID: 5330174136932795766}
+  m_PrefabAsset: {fileID: 0}
+--- !u!114 &4078405455193301135
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 3026859794481690194}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 2eeba59555744746a1c5a7e84fff3c86, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  visualRenderer: {fileID: 0}
+  ordinaryMaterial: {fileID: 2100000, guid: 6263e42a9a4f466a8e328964a983317f, type: 2}
+  riverMaterial: {fileID: 2100000, guid: f35c49311ec848f9a5da067f10c7f5ae, type: 2}
+  enableDebugLogs: 0

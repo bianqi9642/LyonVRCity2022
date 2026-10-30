@@ -44,6 +44,8 @@ public partial class NpcLifecycleTests
     public void SetUp()
     {
         CallStatic(BusType, "ResetForTests");
+        T("CaptureIO").GetField("FaultInjector").SetValue(null, null);
+        T("CaptureClock").GetField("TestSource").SetValue(null, null);
         CallStatic(AoiType, "ResetDiagnostics");
         _root = Path.Combine(Path.GetTempPath(), "NpcLifecycleTests_" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_root);
@@ -60,6 +62,8 @@ public partial class NpcLifecycleTests
         yield return null;
         if (_navInstance.valid) NavMesh.RemoveNavMeshData(_navInstance);
         CallStatic(BusType, "ResetForTests");
+        T("CaptureIO").GetField("FaultInjector").SetValue(null, null);
+        T("CaptureClock").GetField("TestSource").SetValue(null, null);
         try { Directory.Delete(_root, true); } catch { }
     }
 
@@ -94,6 +98,7 @@ public partial class NpcLifecycleTests
         public bool withUncertain = false;          // UncertainBehavior on the template (all random probabilities 0: only forced transitions happen)
         public bool uncertainEnabled = true;        // its initial enabled flag (AgentFactory re-rolls it when a profile + factory are present)
         public bool withAppearance = false;         // AppearanceController with hair + top SkinnedMeshRenderers
+        public bool realPart = false;               // do NOT simulate part_start / the NPC simulation: the test starts the real ExperimentManager.RunPartN itself
         public UnityEngine.Object profile;          // AgentProfile applied through the production AgentFactory (null = none)
     }
 
@@ -183,14 +188,16 @@ public partial class NpcLifecycleTests
         Set(cfg, "npcCaptureEnabled", o.npcCaptureEnabled);
         Set(cfg, "gazeCaptureEnabled", true);
         Set(cfg, "trajectoryCaptureEnabled", true);
+        // F-14: every recording rig has a REAL (non-placeholder) participant identity, exactly like a production session.
+        var scGo = Make("TestSessionController", active: false);   // configured before Awake, as a serialized scene object is
+        rig.session = scGo.AddComponent(T("ExternalSessionController"));
+        Set(rig.session, "participantId", "ZZ-0001");
+        Set(rig.session, "selectedPart", Enum.Parse(T("ExternalSessionController").GetNestedType("ExperimentPart"), o.part2 ? "Part2" : "Part3"));
+        scGo.SetActive(true);
         if (o.selectedPartFallback)
         {
             // Before the first Part starts: the Part config lives only in the Inspector fields; the selected Part decides.
             Set(rig.em, o.part2 ? "part2Config" : "part3Config", cfg);
-            var scGo = Make("TestSessionController");
-            rig.session = scGo.AddComponent(T("ExternalSessionController"));
-            Set(rig.session, "participantId", "TEST");
-            Set(rig.session, "selectedPart", Enum.Parse(T("ExternalSessionController").GetNestedType("ExperimentPart"), o.part2 ? "Part2" : "Part3"));
         }
         else EmType.GetField("<CurrentPartConfig>k__BackingField", All).SetValue(rig.em, cfg);
         rig.cfg = cfg;
@@ -251,8 +258,8 @@ public partial class NpcLifecycleTests
 
         // The Part starts (ExperimentManager.RunPartN does exactly this): part_start, then the NPC lifecycle opens.
         string part = o.part2 ? "Part2" : "Part3";
-        Call(rig.em, "RaiseEvt", "part_start", part, "", "", 0.0, false, null, Vector3.zero, Vector3.zero);
-        if (o.openSimulation)
+        if (!o.realPart) Call(rig.em, "RaiseEvt", "part_start", part, "", "", null, false, null, Vector3.zero, Vector3.zero);
+        if (o.openSimulation && !o.realPart)
         {
             Call(rig.spawner, "ResetForNewPart");
             Call(rig.spawner, "BeginNpcSimulation");
@@ -387,10 +394,10 @@ public partial class NpcLifecycleTests
         {
             string id = Lid(pa);
             Assert.IsTrue(LifetimeIdRe.IsMatch(id), id);
-            var spawnRows = new List<List<string>>(evs.Where("npc_spawn_instance_id", id));
             int spawns = 0;
-            foreach (var r in spawnRows) if (evs.Get(r, "event_type") == "npc_spawn") spawns++;
-            Assert.AreEqual(1, spawns, "exactly one events.csv npc_spawn for " + id);
+            foreach (var r in nev.Where("npc_spawn_instance_id", id)) if (nev.Get(r, "event_type") == "npc_spawn") spawns++;
+            Assert.AreEqual(1, spawns, "exactly one npc_events.csv npc_spawn for " + id);
+            Assert.AreEqual(0, new List<List<string>>(evs.Where("npc_spawn_instance_id", id)).Count, "events.csv carries no NPC row for " + id);
             var row = new List<List<string>>(lt.Where("npc_spawn_instance_id", id));
             Assert.AreEqual(1, row.Count);
             Assert.AreEqual(F4(Get<double>(pa, "LifetimeSpawnTAbs")), lt.Get(row[0], "spawn_t_abs"), "the true spawn time, not the registration time");
@@ -423,7 +430,7 @@ public partial class NpcLifecycleTests
             Assert.AreEqual(lt.Get(r, "spawn_t_abs"), lt2.Get(again[0], "spawn_t_abs"), "spawn time unchanged by trial start");
             Assert.AreEqual("spawn", lt2.Get(again[0], "registration"));
         }
-        var ev2 = Events(rig);
+        var ev2 = NpcEvents(rig);
         var counts = new Dictionary<string, int>();
         foreach (var r in ev2.Rows)
             if (ev2.Get(r, "event_type") == "npc_spawn")
@@ -480,7 +487,7 @@ public partial class NpcLifecycleTests
         for (int i = 0; i < unrecorded.Count; i++) idsBefore[i] = Lid(unrecorded[i]);
         Call(rig.dcm, "CensusActiveNpcs");
         Call(rig.dcm, "CensusActiveNpcs");
-        var ev = Events(rig);
+        var ev = NpcEvents(rig);
         foreach (var id in idsBefore)
         {
             int n = 0;
@@ -759,7 +766,7 @@ public partial class NpcLifecycleTests
         Call(rig.em, "TerminateSession", "Part3");
         yield return null;
         string manifest = File.ReadAllText(rig.File("session_manifest.json"));
-        StringAssert.Contains("\"schema_version\": 3", manifest);
+        StringAssert.Contains("\"schema_version\": 7", manifest);
         StringAssert.Contains("agent-lifetime-v1", manifest);
         StringAssert.Contains("(session_id, npc_spawn_instance_id)", manifest);
         StringAssert.Contains("master_switch", manifest);
@@ -901,7 +908,7 @@ public partial class NpcLifecycleTests
             var ids = new HashSet<string>();
             foreach (var r in lt.Rows) ids.Add(lt.Get(r, "npc_spawn_instance_id"));
             foreach (var r in st.Rows) Assert.IsTrue(ids.Contains(st.Get(r, "npc_spawn_instance_id")), "state row without a lifetime row");
-            var evs = Events(rig);
+            var evs = NpcEvents(rig);
             foreach (var r in evs.Where("event_type", "npc_spawn")) Assert.IsTrue(ids.Contains(evs.Get(r, "npc_spawn_instance_id")));
         }
         finally { CultureInfo.CurrentCulture = saved; CultureInfo.CurrentUICulture = savedUi; }

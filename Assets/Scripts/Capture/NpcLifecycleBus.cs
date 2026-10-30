@@ -89,6 +89,13 @@ public static class NpcLifecycleBus
         }
     }
 
+    /// <summary>Drops every event queued while no recorder was attached (used when the session identity is rejected: nothing may be replayed under another identity).</summary>
+    public static void DiscardPending()
+    {
+        s_suppressed += s_pending.Count;
+        s_pending.Clear();
+    }
+
     public static void ClearGate(Func<bool> gate)
     {
         if (s_gate == gate) s_gate = null;

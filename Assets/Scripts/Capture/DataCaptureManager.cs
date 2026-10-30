@@ -122,6 +122,11 @@ public class DataCaptureManager : MonoBehaviour
     [SerializeField, Tooltip("unlimited | met | approached | exceeded | exceeded_unachievable")]
     string readoutBudgetStatus = "unlimited";
 
+    /// <summary>Test seam ONLY (null in production): supplies the 32-hex run GUID, so folder-name collisions can be provoked deterministically.</summary>
+    [NonSerialized] public Func<string> runGuidSource;
+    /// <summary>Test seam ONLY (null in production): supplies "now" for the session id.</summary>
+    [NonSerialized] public Func<DateTime> utcNowSource;
+
     [Tooltip("Test hook: when non-empty, the session folder is created under this root instead of Application.persistentDataPath.")]
     [NonSerialized] public string outputRootOverride = "";
 
@@ -163,6 +168,7 @@ public class DataCaptureManager : MonoBehaviour
     {
         get
         {
+            if (RecordingBlocked) return false;   // invalid identity/configuration: no NPC record of any kind
             EnsureConfigSources();
             ExperimentManager.PartCaptureConfig cfg = CurrentConfig ?? SelectedPartConfig();
             return cfg != null && cfg.npcCaptureEnabled;
@@ -189,6 +195,33 @@ public class DataCaptureManager : MonoBehaviour
     public GameObject AssignedBuildingD1 { get; private set; }
     public GameObject AssignedBuildingD2 { get; private set; }
 
+    /// <summary>
+    /// The building that is the ACTIVE search target right now, or null. Evaluated from live state on every call (never cached): the Part 3 phase must be
+    /// d1_search (-> D1) or d2_search (-> D2), the building must be the one assigned for that destination, and its TargetSelectable must currently be enabled
+    /// (ExperimentManager enables only the active destination and disables it again when its search ends). Panel-reading phases (d1_pending / d2_pending),
+    /// the other destination, earlier targets and unassigned buildings are never current. D1 and D2 stay assigned for the whole session; only this property
+    /// says which one is being searched.
+    /// </summary>
+    public GameObject CurrentTargetBuilding
+    {
+        get
+        {
+            GameObject g = null;
+            if (CurrentPart == CaptureConstants.Part3)
+            {
+                if (CurrentPhase == "d1_search") g = AssignedBuildingD1;
+                else if (CurrentPhase == "d2_search") g = AssignedBuildingD2;
+            }
+            if (g == null) return null;
+            TargetSelectable ts = g.GetComponent<TargetSelectable>() ?? g.GetComponentInChildren<TargetSelectable>(true);
+            return ts != null && ts.enabled ? g : null;
+        }
+    }
+
+    /// <summary>"D1" / "D2" when the building is one of the session's assigned destinations (whether or not it is the current one), else "".</summary>
+    public string AssignedDestinationRole(GameObject building)
+        => building == null ? "" : (building == AssignedBuildingD1 ? "D1" : (building == AssignedBuildingD2 ? "D2" : ""));
+
     public int TeleportEpoch => _teleportEpoch;
 
     // ---------------- NPC state sampling statistics (public, read by tests / readout) ----------------
@@ -214,6 +247,7 @@ public class DataCaptureManager : MonoBehaviour
     double _lastEpochBumpT = -10.0;
     int    _lifetimesRegistered = 0;
     int    _npcSuppressedAtSink = 0;
+    int    _eventsCsvNpcRowsRejected = 0;
     readonly NpcStateRateController _rate = new NpcStateRateController();
     bool   _rateWarnedUnachievable;
     double _rateLastWarnT = -1e9;
@@ -265,7 +299,10 @@ public class DataCaptureManager : MonoBehaviour
         public bool hasLastState;
         public Vector3 lastDest;
         public bool hasLastDest;
+        public Animator anim;           // humanoid animator for the LOS eye point (resolved once)
+        public bool animLooked;
     }
+    readonly int[] _losCounts = new int[7];   // per LosStatus, cumulative over the session
     // Registry of OPEN lifetimes (one entry per pooled object that is currently an active NPC).
     readonly Dictionary<PedestrianAgent, NpcRec> _npcByAgent = new Dictionary<PedestrianAgent, NpcRec>();
 
@@ -285,6 +322,64 @@ public class DataCaptureManager : MonoBehaviour
     readonly HashSet<string> _warned = new HashSet<string>();
 
     Manifest _manifest;
+
+    // F-18 / F-09 evidence
+    SamplingStats _trajStats;
+    int _appPauseCount, _appResumeCount, _trialsStarted, _trialsEnded, _manifestUpdates;
+    bool _manifestDirty; string _manifestDirtyReason = ""; double _lastManifestWriteT = -1e9;
+    long _seenWriteErrors;
+    bool _everConfiguredGaze, _everConfiguredTraj, _everConfiguredNpc;
+
+    // ---------------- identity / blocked recording (F-14) ----------------
+
+    /// <summary>True when the participant/session configuration was rejected: no folder, no files, no manifest, no NPC events are persisted by this manager.</summary>
+    public bool RecordingBlocked { get; private set; }
+    public string BlockReason { get; private set; } = "";
+    /// <summary>The validated participant ID in force for this session ("" when blocked). The research identity; never the session folder label.</summary>
+    public string ParticipantId { get; private set; } = "";
+    CaptureCsvWriter _captureErrors;
+    readonly List<WriterTransition> _failureRegistry = new List<WriterTransition>();
+    /// <summary>In-memory record of every stream failure/recovery transition of this session (independent of the disk).</summary>
+    public IReadOnlyList<WriterTransition> FailureRegistry => _failureRegistry;
+
+    void BlockRecording(string reason)
+    {
+        RecordingBlocked = true; BlockReason = reason; SessionId = ""; SessionFolder = "";
+        _events = _traj = _npcState = _npcEvents = _npcLifetimes = _npcProfiles = _registry = _captureErrors = CaptureCsvWriter.Disabled("blocked");
+        NpcLifecycleBus.DiscardPending();   // prewarm events queued before the identity was known must not be replayed under any later identity
+        Debug.LogError("[DataCapture] RECORDING BLOCKED - " + reason + " No session folder, CSV, manifest or NPC record is created. Fix the participant/session configuration and restart.");
+    }
+
+    CaptureCsvWriter MakeWriter(string file, string header)
+    {
+        var w = new CaptureCsvWriter(Path.Combine(SessionFolder, file), header);
+        w.Transition += OnWriterTransition;
+        return w;
+    }
+
+    // Every stream failure / recovery lands here (from this manager's writers and from the gaze recorder's): in-memory registry, capture_errors.csv (a diagnostic
+    // channel, never events.csv / npc_events.csv), and an immediate manifest checkpoint. The failed stream is not used to save its own failure marker.
+    public void OnWriterTransition(WriterTransition t)
+    {
+        if (t == null) return;
+        _failureRegistry.Add(t);
+        AppendCaptureError(t);
+        RequestManifestUpdate("write_error", immediate: !_inManifestWrite);
+    }
+
+    void AppendCaptureError(WriterTransition t)
+    {
+        if (_captureErrors == null || _captureErrors.IsDisabled) return;
+        var f = new List<string>(11)
+        {
+            S(SessionId), F(t.TAbs), t.Utc ?? "", S(t.Stream), S(t.Operation), S(t.ErrorType), S(t.ErrorMessage),
+            t.RowsWrittenBefore.ToString(CultureInfo.InvariantCulture), t.RowsDropped.ToString(CultureInfo.InvariantCulture), S(t.Status),
+            t.RecoveryAttempt.ToString(CultureInfo.InvariantCulture)
+        };
+        _captureErrors.WriteLine(_captureErrors.Join(f));   // a failure of this diagnostic writer is only logged (it has no Transition observer)
+    }
+
+    bool _inManifestWrite;
 
     // ---------------- lifecycle ----------------
 
@@ -357,27 +452,42 @@ public class DataCaptureManager : MonoBehaviour
         int gl = LayerMask.NameToLayer("Ground");
         if (gl >= 0) _losMask |= (1 << gl);
 
-        string participantId = (_sessionController != null && !string.IsNullOrEmpty(_sessionController.participantId))
-            ? _sessionController.participantId : "UNKNOWN";
-        string stamp = DateTime.UtcNow.ToString("yyyyMMdd'T'HHmmss'Z'", CultureInfo.InvariantCulture);
-        SessionId = SanitizeFileToken(participantId) + "_" + stamp;
-        string root = string.IsNullOrEmpty(outputRootOverride) ? Application.persistentDataPath : outputRootOverride;
-        // Never join an existing session folder: two sessions of the same participant started within one second would otherwise share
-        // files and session_id. A suffix keeps session_id (the cross-file key) unique.
-        string baseId = SessionId;
-        for (int n = 2; Directory.Exists(Path.Combine(root, SessionId)) && n < 1000; n++) SessionId = baseId + "-r" + n;
-        _runGuid = Guid.NewGuid().ToString("N");
-        SessionFolder = Path.Combine(root, SessionId);
-        try { Directory.CreateDirectory(SessionFolder); }
-        catch (Exception e) { Debug.LogError("[DataCapture] Could not create session folder: " + e.Message); }
+        // ---- F-14 preflight: nothing is created or persisted unless the identity/configuration is valid ----
+        SessionIdentity.Result idr = _sessionController != null
+            ? _sessionController.ValidateIdentity()
+            : new SessionIdentity.Result { status = SessionIdentity.Status.Missing, message = "No ExternalSessionController found: there is no participant identity source." };
+        if (!idr.IsValid) { BlockRecording("invalid participant/session configuration (" + idr.status + "): " + idr.message); return; }
+        ParticipantId = idr.participantId;
 
-        _events    = new CaptureCsvWriter(Path.Combine(SessionFolder, "events.csv"),            CaptureConstants.EventsHeader);
-        _traj      = new CaptureCsvWriter(Path.Combine(SessionFolder, "trajectory.csv"),         CaptureConstants.TrajectoryHeader);
-        _npcState  = new CaptureCsvWriter(Path.Combine(SessionFolder, "npc_state.csv"),          CaptureConstants.NpcStateHeader);
-        _npcEvents = new CaptureCsvWriter(Path.Combine(SessionFolder, "npc_events.csv"),         CaptureConstants.NpcEventsHeader);
-        _npcLifetimes = new CaptureCsvWriter(Path.Combine(SessionFolder, "npc_lifetimes.csv"),   CaptureConstants.NpcLifetimesHeader);
-        _npcProfiles = new CaptureCsvWriter(Path.Combine(SessionFolder, "npc_profiles.csv"),    CaptureConstants.NpcProfilesHeader);
-        _registry  = new CaptureCsvWriter(Path.Combine(SessionFolder, "building_registry.csv"), CaptureConstants.BuildingRegistryHeader);
+        // ---- unique session: the run GUID, not the participant ID, makes the folder name; an existing directory is never reused ----
+        string root = string.IsNullOrEmpty(outputRootOverride) ? Application.persistentDataPath : outputRootOverride;
+        string folder = null;
+        for (int attempt = 0; attempt < 5 && folder == null; attempt++)
+        {
+            string guid = (runGuidSource != null ? runGuidSource() : null) ?? Guid.NewGuid().ToString("N");
+            string id = SessionIdentity.BuildSessionId(utcNowSource != null ? utcNowSource() : DateTime.UtcNow, guid);
+            string cand = Path.Combine(root, id);
+            if (Directory.Exists(cand) || File.Exists(cand)) continue;       // collision: draw again
+            try
+            {
+                CaptureIO.CreateDirectory(cand);
+                if (Directory.GetFileSystemEntries(cand).Length != 0) continue;   // somebody else created and filled it between the check and now
+            }
+            catch (Exception e) { BlockRecording("could not create the session folder: " + e.Message); return; }
+            _runGuid = guid; SessionId = id; folder = cand;
+        }
+        if (folder == null) { BlockRecording("could not allocate a unique session folder after 5 attempts"); return; }
+        SessionFolder = folder;
+        TargetSelectable.ResetInteractionCounter();   // interaction ids are session-scoped
+
+        _captureErrors = new CaptureCsvWriter(Path.Combine(SessionFolder, "capture_errors.csv"), CaptureConstants.CaptureErrorsHeader, "capture_errors", diagnostic: true);
+        _events    = MakeWriter("events.csv",            CaptureConstants.EventsHeader);
+        _traj      = MakeWriter("trajectory.csv",         CaptureConstants.TrajectoryHeader);
+        _npcState  = MakeWriter("npc_state.csv",          CaptureConstants.NpcStateHeader);
+        _npcEvents = MakeWriter("npc_events.csv",         CaptureConstants.NpcEventsHeader);
+        _npcLifetimes = MakeWriter("npc_lifetimes.csv",   CaptureConstants.NpcLifetimesHeader);
+        _npcProfiles = MakeWriter("npc_profiles.csv",     CaptureConstants.NpcProfilesHeader);
+        _registry  = MakeWriter("building_registry.csv", CaptureConstants.BuildingRegistryHeader);
 
         CurrentPart = (_sessionController != null) ? _sessionController.selectedPart.ToString() : "Unknown";
         CurrentPhase = "idle";
@@ -403,9 +513,10 @@ public class DataCaptureManager : MonoBehaviour
         TargetSelectable.Clicked += OnTargetSelectableClicked;
 
         ApplyNpcSamplingSettings();
+        _trajStats = new SamplingStats(trajectoryHz);
         BuildManifestPass1();
         WriteManifest();
-        WriteEventRow(CaptureConstants.EvtSessionStart, CurrentPart, CurrentPhase, "", "", "", "", "", 0.0, "", Vector3.zero, Vector3.zero);
+        WriteEventRow(CaptureConstants.EvtSessionStart, CurrentPart, CurrentPhase, "", "", "", "", "", null, "", Vector3.zero, Vector3.zero);
 
         // The session now exists: attach as the NPC lifecycle sink. Everything raised earlier (e.g. prewarm_created, if SpawnerManager started
         // first) is replayed in order with its original timestamps.
@@ -422,6 +533,7 @@ public class DataCaptureManager : MonoBehaviour
 
     void OnDestroy()
     {
+        if (RecordingBlocked) { NpcLifecycleBus.ClearGate(_npcGate); return; }
         if (_experimentManager != null)
         {
             _experimentManager.OnTrialStart -= OnTrialStart;
@@ -442,7 +554,7 @@ public class DataCaptureManager : MonoBehaviour
 
         if (!_endWritten)
         {
-            WriteEventRow(CaptureConstants.EvtSessionEnd, CurrentPart, CurrentPhase, "", "", "", "", "", 0.0, "on_destroy", Vector3.zero, Vector3.zero);
+            WriteEventRow(CaptureConstants.EvtSessionEnd, CurrentPart, CurrentPhase, "", "", "", "", "", null, "on_destroy", Vector3.zero, Vector3.zero);
             WriteManifestEnd("on_destroy");
             _endWritten = true;
         }
@@ -455,7 +567,7 @@ public class DataCaptureManager : MonoBehaviour
     {
         EmitOpenLifetimes("session_end");
         if (_endWritten) return;
-        WriteEventRow(CaptureConstants.EvtSessionEnd, CurrentPart, CurrentPhase, "", "", "", "", "", 0.0, "end_confirmed", Vector3.zero, Vector3.zero);
+        WriteEventRow(CaptureConstants.EvtSessionEnd, CurrentPart, CurrentPhase, "", "", "", "", "", null, "end_confirmed", Vector3.zero, Vector3.zero);
         WriteManifestEnd("end_confirmed");
         _endWritten = true;
     }
@@ -464,6 +576,7 @@ public class DataCaptureManager : MonoBehaviour
     {
         WriteEventRow(CaptureConstants.EvtAppFocus, CurrentPart, CurrentPhase, "", "", "", "", "",
             hasFocus ? 1.0 : 0.0, "", Vector3.zero, Vector3.zero);
+        if (!hasFocus) _trajStats?.BreakEpoch();   // intentional gap: samples across a focus loss are not one continuous run
     }
 
     void OnApplicationPause(bool pause)
@@ -471,15 +584,26 @@ public class DataCaptureManager : MonoBehaviour
         WriteEventRow(CaptureConstants.EvtAppPause, CurrentPart, CurrentPhase, "", "", "", "", "",
             pause ? 1.0 : 0.0, "", Vector3.zero, Vector3.zero);
         FlushNpcEvents();
-        // Defensive snapshot; does NOT mark the session finalised (it may resume).
-        if (pause) WriteManifestEnd("app_pause");
+        if (pause)
+        {
+            _appPauseCount++;
+            _trajStats?.BreakEpoch();   // the wait inside the loop keeps counting real time across a pause: never count that interval as a rate
+            // Defensive snapshot; does NOT mark the session finalised (it may resume).
+            WriteManifestEnd("app_pause");
+        }
+        else
+        {
+            _appResumeCount++;
+            // Resumed: the earlier snapshot said "ended: app_pause"; correct it so the manifest does not claim the session ended.
+            if (!_endWritten) WriteManifestCheckpoint("app_resume");
+        }
     }
 
     void OnApplicationQuit()
     {
         EmitOpenLifetimes("app_quit");
         if (_endWritten) return;
-        WriteEventRow(CaptureConstants.EvtSessionEnd, CurrentPart, CurrentPhase, "", "", "", "", "", 0.0, "app_quit", Vector3.zero, Vector3.zero);
+        WriteEventRow(CaptureConstants.EvtSessionEnd, CurrentPart, CurrentPhase, "", "", "", "", "", null, "app_quit", Vector3.zero, Vector3.zero);
         WriteManifestEnd("app_quit");
         _endWritten = true;
     }
@@ -505,6 +629,7 @@ public class DataCaptureManager : MonoBehaviour
             // the very first statement in each RunPartX()), so CurrentConfig below already reflects the new
             // Part.
             _endPanelActive = false;
+            RequestManifestUpdate("part_start", immediate: false);
             _openLifetimesEmitted = false;   // a new Part freezes / ends its own lifetimes again at its End panel
 
             // Master switch: a Part with NPC capture disabled must not inherit lifetimes registered under an earlier, enabled Part.
@@ -521,16 +646,16 @@ public class DataCaptureManager : MonoBehaviour
                     "will contain zero rows for this Part (no NPCs will exist to capture).");
             }
 
-            WriteEventRow(e.type, CurrentPart, CurrentPhase, e.label, "", "", "", "", e.numValue, e.stringValue, Vector3.zero, Vector3.zero);
+            WriteEventRow(e.type, CurrentPart, CurrentPhase, e.label, "", "", "", "", Num(e), e.stringValue, Vector3.zero, Vector3.zero);
             MaybeBuildRegistry();
             if (CurrentPart != CaptureConstants.Part1)
-                WriteEventRow(CaptureConstants.EvtRecordingMarker, CurrentPart, CurrentPhase, e.label, "", "", "", "", 0.0, "", Vector3.zero, Vector3.zero);
+                WriteEventRow(CaptureConstants.EvtRecordingMarker, CurrentPart, CurrentPhase, e.label, "", "", "", "", null, "", Vector3.zero, Vector3.zero);
             return;
         }
 
         if (e.type == CaptureConstants.EvtPartEnd)
         {
-            WriteEventRow(e.type, string.IsNullOrEmpty(e.part) ? CurrentPart : e.part, CurrentPhase, e.label, "", "", "", "", e.numValue, e.stringValue, Vector3.zero, Vector3.zero);
+            WriteEventRow(e.type, string.IsNullOrEmpty(e.part) ? CurrentPart : e.part, CurrentPhase, e.label, "", "", "", "", Num(e), e.stringValue, Vector3.zero, Vector3.zero);
             CurrentPart = CaptureConstants.PartIdle;
             return;
         }
@@ -539,28 +664,26 @@ public class DataCaptureManager : MonoBehaviour
         {
             CurrentPhase = string.IsNullOrEmpty(e.label) ? CurrentPhase : e.label;
             if (CurrentPart == CaptureConstants.Part1) return;
-            WriteEventRow(e.type, CurrentPart, CurrentPhase, e.label, "", "", "", "", 0.0, "", Vector3.zero, Vector3.zero);
+            WriteEventRow(e.type, CurrentPart, CurrentPhase, e.label, "", "", "", "", null, "", Vector3.zero, Vector3.zero);
             return;
         }
 
-        // NEW (NPC warm-up): structural markers, handled the same way as part_start/part_end - always
+        // NPC warm-up window markers: EXPERIMENT WORKFLOW events (not NPC data), handled the same way as part_start/part_end - always
         // written to events.csv (even for Part 1, for audit-trail completeness, though they are never
-        // actually raised for a Part whose npcEnabled is false) and NEVER dependent on CurrentPart.
+        // actually raised for a Part whose npcEnabled is false), NEVER dependent on CurrentPart and NOT dependent on npcCaptureEnabled.
         // _npcWarmupActive is the ONLY thing these two events change; they never touch
         // CurrentPart/CurrentPhase/TrajectoryCaptureActive/GazeCaptureActive.
         if (e.type == CaptureConstants.EvtNpcWarmupStart)
         {
             _npcWarmupActive = true;
-            if (NpcRecordingEnabled)   // NPC-specific marker: not written while NPC capture is disabled
-            WriteEventRow(e.type, CurrentPart, CurrentPhase, e.label, "", "", "", "", e.numValue, "", Vector3.zero, Vector3.zero);
+            WriteEventRow(e.type, CurrentPart, CurrentPhase, e.label, "", "", "", "", Num(e), "", Vector3.zero, Vector3.zero);
             return;
         }
 
         if (e.type == CaptureConstants.EvtNpcWarmupEnd)
         {
             _npcWarmupActive = false;
-            if (NpcRecordingEnabled)
-            WriteEventRow(e.type, CurrentPart, CurrentPhase, e.label, "", "", "", "", e.numValue, "", Vector3.zero, Vector3.zero);
+            WriteEventRow(e.type, CurrentPart, CurrentPhase, e.label, "", "", "", "", Num(e), "", Vector3.zero, Vector3.zero);
             return;
         }
 
@@ -568,7 +691,7 @@ public class DataCaptureManager : MonoBehaviour
         {
             BumpTeleportEpoch();
             if (CurrentPart == CaptureConstants.Part1) return;
-            WriteEventRow(e.type, CurrentPart, CurrentPhase, e.label, "", "", "", "", 0.0, S(e.stringValue), e.fromPos, e.toPos);
+            WriteEventRow(e.type, CurrentPart, CurrentPhase, e.label, "", "", "", "", null, S(e.stringValue), e.fromPos, e.toPos);
             return;
         }
 
@@ -583,17 +706,17 @@ public class DataCaptureManager : MonoBehaviour
             case CaptureConstants.EvtPanelConfirmed:
             case CaptureConstants.EvtDestinationShown:
             case CaptureConstants.EvtDestinationConfirmed:
-                WriteEventRow(e.type, CurrentPart, CurrentPhase, e.label, "", "", "", "", 0.0, S(e.stringValue), Vector3.zero, Vector3.zero);
+                WriteEventRow(e.type, CurrentPart, CurrentPhase, e.label, "", "", "", "", null, S(e.stringValue), Vector3.zero, Vector3.zero);
                 return;
 
             case CaptureConstants.EvtCandidateInteractOn:
             case CaptureConstants.EvtCandidateInteractOff:
                 WriteEventRow(e.type, CurrentPart, CurrentPhase, e.label,
-                    e.building != null ? S(e.building.name) : "", ResolveTargetId(e.building), "", "", 0.0, "", Vector3.zero, Vector3.zero);
+                    e.building != null ? S(e.building.name) : "", ResolveTargetId(e.building), "", "", null, "", Vector3.zero, Vector3.zero);
                 return;
 
             default:
-                WriteEventRow(e.type, CurrentPart, CurrentPhase, e.label, "", "", "", "", e.numValue, S(e.stringValue), e.fromPos, e.toPos);
+                WriteEventRow(e.type, CurrentPart, CurrentPhase, e.label, "", "", "", "", Num(e), S(e.stringValue), e.fromPos, e.toPos);
                 return;
         }
     }
@@ -610,7 +733,7 @@ public class DataCaptureManager : MonoBehaviour
                 string bid = Name(e.d1Building) + "|" + Name(e.d2Building);
                 string tid = S(e.d1TargetId) + "|" + S(e.d2TargetId);
                 string vs  = $"group={e.groupNumber};start_zone={e.startZone};d1_zone={e.d1Zone};d2_zone={e.d2Zone};start_point={S(e.startPointName)}";
-                WriteEventRow(CaptureConstants.EvtTargetAssigned, CaptureConstants.Part3, CurrentPhase, "", bid, tid, "", "", 0.0, vs, Vector3.zero, Vector3.zero);
+                WriteEventRow(CaptureConstants.EvtTargetAssigned, CaptureConstants.Part3, CurrentPhase, "", bid, tid, "", "", null, vs, Vector3.zero, Vector3.zero);
                 UpdateManifestAssigned(e);
                 return;
             }
@@ -619,7 +742,9 @@ public class DataCaptureManager : MonoBehaviour
             {
                 string label = e.part3Event == "d1_click" ? "D1" : "D2";
                 string type  = e.boolValue ? CaptureConstants.EvtCorrectSelection : CaptureConstants.EvtIncorrectSelection;
-                WriteEventRow(type, CaptureConstants.Part3, CurrentPhase, label, "", S(e.stringValue), "", "", e.numValue, S(e.notes), Vector3.zero, Vector3.zero);
+                // One interaction -> at most one outcome: a second outcome for the same id (duplicate callback / retry) is refused and counted.
+                if (!string.IsNullOrEmpty(e.interactionId) && !_outcomeInteractions.Add(e.interactionId)) { _duplicateOutcomesRejected++; return; }
+                WriteEventRow(type, CaptureConstants.Part3, CurrentPhase, label, "", S(e.stringValue), "", "", Num(e), S(e.notes), Vector3.zero, Vector3.zero, double.NaN, 0, e.interactionId);
                 return;
             }
             case "d1_result":
@@ -627,7 +752,7 @@ public class DataCaptureManager : MonoBehaviour
             case "d2_skipped":
             {
                 string label = e.part3Event == "d1_result" ? "D1" : "D2";
-                WriteEventRow(CaptureConstants.EvtPhaseResult, CaptureConstants.Part3, CurrentPhase, label, "", "", "", "", e.numValue, S(e.notes), Vector3.zero, Vector3.zero);
+                WriteEventRow(CaptureConstants.EvtPhaseResult, CaptureConstants.Part3, CurrentPhase, label, "", "", "", "", Num(e), S(e.notes), Vector3.zero, Vector3.zero);
 
                 // phase_timeout comes from the STRUCTURED termination reason (Part3TerminationReason), never from the free-text notes: only
                 // a search that actually ran and hit its limit qualifies. A found target, a skipped D2 (no_budget_remaining, never started)
@@ -640,14 +765,14 @@ public class DataCaptureManager : MonoBehaviour
                     if (!already)
                     {
                         if (label == "D1") _d1TimeoutLogged = true; else _d2TimeoutLogged = true;
-                        WriteEventRow(CaptureConstants.EvtPhaseTimeout, CaptureConstants.Part3, CurrentPhase, label, "", "", "", "", e.numValue,
+                        WriteEventRow(CaptureConstants.EvtPhaseTimeout, CaptureConstants.Part3, CurrentPhase, label, "", "", "", "", Num(e),
                             S(e.notes) + ";reason=" + S(e.terminationReason), Vector3.zero, Vector3.zero);
                     }
                 }
                 return;
             }
             case "phase_end":
-                WriteEventRow(CaptureConstants.EvtPhaseEnd, CaptureConstants.Part3, CurrentPhase, "", "", "", "", "", e.numValue, S(e.notes), Vector3.zero, Vector3.zero);
+                WriteEventRow(CaptureConstants.EvtPhaseEnd, CaptureConstants.Part3, CurrentPhase, "", "", "", "", "", Num(e), S(e.notes), Vector3.zero, Vector3.zero);
                 return;
         }
     }
@@ -661,22 +786,27 @@ public class DataCaptureManager : MonoBehaviour
         // GazeCaptureActive / NpcCaptureActive also require CurrentConfig's respective *CaptureEnabled flag
         // (false by default for Part1), so this never causes Part1 rows to be written.
         _trialActive = true;
+        _trialsStarted++;
+        RequestManifestUpdate("trial_start", immediate: true);
 
         // Safety net: any already-active NPC lifetime that is somehow not registered is registered NOW, synchronously, keeping its original
         // lifetime ID and spawn time (no new lifetime, no second npc_spawn for an already registered one).
         CensusActiveNpcs();
 
         if (CurrentPart == CaptureConstants.Part1) return;
-        WriteEventRow(CaptureConstants.EvtTrialStart, CurrentPart, CurrentPhase, "", "", "", "", "", 0.0, "", Vector3.zero, Vector3.zero);
+        WriteEventRow(CaptureConstants.EvtTrialStart, CurrentPart, CurrentPhase, "", "", "", "", "", null, "", Vector3.zero, Vector3.zero);
     }
 
     void OnTrialEnd()
     {
         // NEW (participant capture scope): see OnTrialStart() above.
         _trialActive = false;
+        _trialsEnded++;
+        _trajStats?.BreakEpoch();
+        RequestManifestUpdate("trial_end", immediate: true);
 
         if (CurrentPart == CaptureConstants.Part1) return;
-        WriteEventRow(CaptureConstants.EvtTrialEnd, CurrentPart, CurrentPhase, "", "", "", "", "", 0.0, "", Vector3.zero, Vector3.zero);
+        WriteEventRow(CaptureConstants.EvtTrialEnd, CurrentPart, CurrentPhase, "", "", "", "", "", null, "", Vector3.zero, Vector3.zero);
     }
 
     /// <summary>
@@ -697,13 +827,20 @@ public class DataCaptureManager : MonoBehaviour
         EmitOpenLifetimes("end_panel_shown");
     }
 
+    // The numeric value of an experiment event, or null when the event carries none (F-07: a real 0 is a value).
+    static double? Num(ExperimentEventInfo e) => e.hasNum ? e.numValue : (double?)null;
+
+    // Outcome rows (correct/incorrect_selection) already written per interaction id: a second outcome for the same physical click is refused.
+    readonly HashSet<string> _outcomeInteractions = new HashSet<string>();
+    int _duplicateOutcomesRejected;
+
     void OnTargetSelectableClicked(TargetSelectable ts)
     {
         try
         {
             if (ts == null || CurrentPart == CaptureConstants.Part1) return;
             WriteEventRow(CaptureConstants.EvtBuildingClick, CurrentPart, CurrentPhase, "",
-                S(ts.gameObject.name), S(ts.targetId), "", "", 0.0, "", Vector3.zero, Vector3.zero);
+                S(ts.gameObject.name), S(ts.targetId), "", "", null, "", Vector3.zero, Vector3.zero, double.NaN, 0, ts.LastInteractionId);
         }
         catch (Exception ex) { WarnOnce("target_click", "building_click capture failed: " + ex.Message); }
     }
@@ -715,7 +852,7 @@ public class DataCaptureManager : MonoBehaviour
             BumpTeleportEpoch();
             if (CurrentPart == CaptureConstants.Part1) return;
             string label = (from != null ? from.name : "?") + "->" + (to != null ? to.name : "?");
-            WriteEventRow(CaptureConstants.EvtRiverCrossing, CurrentPart, CurrentPhase, S(label), "", "", "", "", 0.0, "", fromPos, toPos);
+            WriteEventRow(CaptureConstants.EvtRiverCrossing, CurrentPart, CurrentPhase, S(label), "", "", "", "", null, "", fromPos, toPos);
         }
         catch (Exception ex) { WarnOnce("river", "river_crossing capture failed: " + ex.Message); }
     }
@@ -829,9 +966,7 @@ public class DataCaptureManager : MonoBehaviour
         string value = "lifetime_index=" + rec.lifetimeIndex + ";source=" + S(pa.SpawnSource) + ";registration=" + registration +
                        ";registered_t_abs=" + F(nowAbs);
 
-        // events.csv row (immediate). t_abs is the true spawn time, not the registration time.
-        WriteEventRow(CaptureConstants.EvtNpcSpawn, CurrentPart, CurrentPhase, "", "", "", rec.agentId, rec.lifetimeId, 0.0, value,
-            Vector3.zero, Vector3.zero, spawnAbs, spawnUnix);
+        // NPC-subject event: npc_events.csv only (events.csv is the participant / experiment stream). t_abs is the true spawn time, not the registration time.
         AppendNpcEventLine(CaptureConstants.NpcEvtSpawn, spawnAbs, spawnUnix, rec.agentId, rec.lifetimeId, rec.lifetimeIndex, pos, yaw, true, dest,
             speedSetting, corners, value, pa.CurrentItineraryIndex, pa.CurrentTargetName);
         WriteLifetimeRow(rec, spawnAbs, spawnUnix, nowAbs, registration);
@@ -854,8 +989,6 @@ public class DataCaptureManager : MonoBehaviour
         string agentId = rec != null ? rec.agentId : e.agentId;
         int index = rec != null ? rec.lifetimeIndex : e.lifetimeIndex;
 
-        WriteEventRow(CaptureConstants.EvtNpcDespawn, CurrentPart, CurrentPhase, "", "", "", agentId, lifetimeId, 0.0, value,
-            Vector3.zero, Vector3.zero, e.tAbs, e.tUnixMs);
         AppendNpcEventLine(CaptureConstants.NpcEvtDespawn, e.tAbs, e.tUnixMs, agentId, lifetimeId, index, e.pos, e.yaw, false, default, "", "", value, -1, "");
         FlushNpcEvents();
 
@@ -911,7 +1044,7 @@ public class DataCaptureManager : MonoBehaviour
             // additional OnTrialStart/OnTrialEnd (see ExperimentManager.RunPart3: exactly one pair per Part),
             // so this does not fragment trajectory capture within Part 3 - it only trims the pre-trial and
             // post-trial/End-Panel edges.
-            if (!TrajectoryCaptureActive) { yield return new WaitForSecondsRealtime(interval); continue; }
+            if (!TrajectoryCaptureActive) { _trajStats?.BreakEpoch(); yield return new WaitForSecondsRealtime(interval); continue; }   // intentional gap: trial closed / capture off
             try { SampleTrajectory(); }
             catch (Exception e) { WarnOnce("traj_tick", "trajectory sample failed: " + e.Message); }
             yield return new WaitForSecondsRealtime(interval);
@@ -920,11 +1053,11 @@ public class DataCaptureManager : MonoBehaviour
 
     void SampleTrajectory()
     {
-        if (_traj.Failed) return;
         if (_playerRig == null) WarnOnce("traj_no_rig", "playerRig is null; trajectory.csv rig columns will be blank.");
 
         _rf.Clear();
-        _rf.Add(F(CaptureClock.TAbs));
+        double tNow = CaptureClock.TAbs;
+        _rf.Add(F(tNow));
         _rf.Add(CaptureClock.TUnixMs.ToString(CultureInfo.InvariantCulture));
         _rf.Add(Time.frameCount.ToString(CultureInfo.InvariantCulture));
 
@@ -949,7 +1082,12 @@ public class DataCaptureManager : MonoBehaviour
         AppendControllerFields(_ctrlL, OVRControllerTracked(OVRInput.Controller.LTouch));
         AppendControllerFields(_ctrlR, OVRControllerTracked(OVRInput.Controller.RTouch));
 
+        // appended (schema v5): Part / phase at the sample time (the authoritative values, not a post-hoc join)
+        _rf.Add(S(CurrentPart)); _rf.Add(S(CurrentPhase));
+
+        long before = _traj.RowsWritten;
         _traj.WriteLine(_traj.Join(_rf));
+        if (_traj.RowsWritten > before) _trajStats?.OnSample(tNow);   // only SUCCESSFUL rows count, at the row's own t_abs
     }
 
     void AppendControllerFields(Transform ct, int trackedFlag)
@@ -997,7 +1135,7 @@ public class DataCaptureManager : MonoBehaviour
 
     void SampleNpcs()
     {
-        if (_npcState.Failed || !NpcStateSamplingActive) return;
+        if (!NpcStateSamplingActive) return;
 
         // Cheap safety net: the registry should always hold exactly the spawner's live population.
         if (_spawner != null && _spawner.ActiveAgents != null && _spawner.ActiveAgents.Count != _npcByAgent.Count) CensusActiveNpcs();
@@ -1044,12 +1182,13 @@ public class DataCaptureManager : MonoBehaviour
             if (rec.mt != null)
                 mtTarget = rec.mt.targetTransform != null ? rec.mt.targetTransform.position : rec.mt.targetPosition;
 
-            string los = "";
-            if (_centerEye != null)
-            {
-                bool blocked = Physics.Linecast(headPos, pos + Vector3.up * 1.6f, _losMask, QueryTriggerInteraction.Ignore);
-                los = blocked ? "0" : "1";
-            }
+            // F-10: NPC eye point -> participant head, ignoring the NPC's own colliders and the participant's; blank (never 0) when it cannot be answered.
+            if (rec.anim == null && !rec.animLooked) { rec.anim = rec.pa.GetComponentInChildren<Animator>(true); rec.animLooked = true; }
+            Vector3 eye;
+            Vector3? eyeOpt = NpcLineOfSight.TryGetNpcEyePoint(rec.tr, rec.agent, rec.anim, out eye) ? eye : (Vector3?)null;
+            LosStatus losStatus = NpcLineOfSight.Query(eyeOpt, rec.tr, _centerEye, _playerRig, _losMask);
+            _losCounts[(int)losStatus]++;
+            string los = losStatus == LosStatus.Clear ? "1" : (losStatus == LosStatus.Blocked ? "0" : "");
 
             rec.sampleSeq++;
 
@@ -1085,6 +1224,7 @@ public class DataCaptureManager : MonoBehaviour
             _rf.Add(rec.pa.HasUncertainComponent ? (uActive ? "1" : "0") : "");
             _rf.Add(uActive ? rec.pa.UncertainStateLabel : "");
             _rf.Add(uActive ? rec.pa.UncertainLookPhaseLabel : "");
+            _rf.Add(NpcLineOfSight.Name(losStatus));   // schema v7: why los_clear_to_participant is 1 / 0 / blank
             _npcLines.Add(_npcState.Join(_rf));
 
             // Edge detection of NAV destination changes (arrival / dwell edges are now raised directly by PedestrianAgent at the real moment).
@@ -1106,7 +1246,7 @@ public class DataCaptureManager : MonoBehaviour
         long before = _npcState.BytesWritten;
         bool firstWrite = before == 0;
         _npcState.WriteLines(_npcLines);   // one open/write/close per tick for the whole population (always the COMPLETE population)
-        if (_npcLines.Count == 0 || _npcState.Failed) return;
+        if (_npcLines.Count == 0 || _npcState.BytesWritten == before) return;   // nothing reached the disk: no volume statistics
 
         long rowBytes = _npcState.BytesWritten - before - (firstWrite ? _npcState.HeaderBytes : 0);
         _rate.OnSnapshot(tAbs, _npcLines.Count, rowBytes, _npcByAgent.Count);
@@ -1162,7 +1302,7 @@ public class DataCaptureManager : MonoBehaviour
     void AppendNpcEventLine(string type, double tAbs, long tUnix, string agentId, string lifetimeId, int lifetimeIndex, Vector3 pos, float yaw,
         bool hasDest, Vector3 dest, string speedSetting, string cornersPacked, string valueStr, int itineraryIndex, string targetId)
     {
-        if (_npcEvents == null || _npcEvents.Failed || !NpcRecordingEnabled) return;
+        if (_npcEvents == null || !NpcRecordingEnabled) return;
         var f = new List<string>(21);
         f.Add(F(tAbs));
         f.Add(tUnix.ToString(CultureInfo.InvariantCulture));
@@ -1192,12 +1332,36 @@ public class DataCaptureManager : MonoBehaviour
         _npcEventBuf.Clear();
     }
 
-    void LateUpdate() { FlushNpcEvents(); }
+    void LateUpdate()
+    {
+        FlushNpcEvents();
+        // A write error on any stream (including gaze, which owns its own writer) triggers a manifest checkpoint, so a failure is visible without waiting for the end.
+        long errs = TotalWriteErrors();
+        if (errs != _seenWriteErrors) { _seenWriteErrors = errs; RequestManifestUpdate("write_error", immediate: false); }
+        if (_manifestDirty && CaptureClock.TAbs - _lastManifestWriteT >= 0.5) { string r = _manifestDirtyReason; WriteManifestCheckpoint(r); }
+    }
+
+    long TotalWriteErrors()
+    {
+        long n = 0;
+        foreach (var w in new[] { _events, _traj, _npcState, _npcEvents, _npcLifetimes, _npcProfiles, _registry }) if (w != null) n += w.WriteErrors;
+        if (_gazeRecorder != null) n += _gazeRecorder.WriteErrors;
+        n += _manifestFailures;
+        return n;
+    }
+
+    // Marks the manifest stale (written at the next LateUpdate, at most every 0.5 s) or writes it right away at a lifecycle boundary. Never called per sample.
+    void RequestManifestUpdate(string reason, bool immediate)
+    {
+        if (_manifest == null || _endWritten) return;
+        if (immediate) WriteManifestCheckpoint(reason);
+        else { _manifestDirty = true; _manifestDirtyReason = reason; }
+    }
 
     // One row per lifetime, written at its spawn boundary. Termination is in npc_events.csv (npc_itinerary_complete / npc_despawn).
     void WriteLifetimeRow(NpcRec rec, double spawnAbs, long spawnUnix, double registeredAbs, string registration)
     {
-        if (_npcLifetimes == null || _npcLifetimes.Failed || !NpcRecordingEnabled) return;
+        if (_npcLifetimes == null || !NpcRecordingEnabled) return;
         PedestrianAgent pa = rec.pa;
         IReadOnlyList<Transform> it = pa.ItineraryTransformsView;
         int n = it != null ? it.Count : 0;
@@ -1265,7 +1429,7 @@ public class DataCaptureManager : MonoBehaviour
     // First time a profile content hash is seen in this session: store its full description once (npc_profiles.csv).
     void WriteProfileRegistryRow(NpcLifetimeProfile lp)
     {
-        if (lp == null || lp.profileContentHash.Length == 0 || _npcProfiles == null || _npcProfiles.Failed || !NpcRecordingEnabled) return;
+        if (lp == null || lp.profileContentHash.Length == 0 || _npcProfiles == null || !NpcRecordingEnabled) return;
         if (!_profilesWritten.Add(lp.profileContentHash)) return;
         var f = new List<string>(5)
         {
@@ -1278,15 +1442,20 @@ public class DataCaptureManager : MonoBehaviour
 
     void WriteEventRow(string type, string part, string phase, string label,
         string buildingId, string targetId, string npcId, string npcSpawnInstanceId,
-        double valueNum, string valueStr, Vector3 fromPos, Vector3 toPos,
-        double tAbsOverride = double.NaN, long tUnixOverride = 0)
+        double? valueNum, string valueStr, Vector3 fromPos, Vector3 toPos,
+        double tAbsOverride = double.NaN, long tUnixOverride = 0, string interactionId = "")
     {
         try
         {
-            if (_events.Failed) return;
-            // NPC-specific rows (spawn / despawn / warm-up markers) are never written while the master switch is off, whatever the caller.
-            if ((type == CaptureConstants.EvtNpcSpawn || type == CaptureConstants.EvtNpcDespawn || type == CaptureConstants.EvtNpcWarmupStart ||
-                 type == CaptureConstants.EvtNpcWarmupEnd) && !NpcRecordingEnabled) return;
+            // ROUTING GUARD (last line of defence): events.csv is the participant / experiment stream. An NPC-subject event type, or any row that tries
+            // to carry NPC identity, belongs to npc_events.csv and is refused here whatever path produced it (generic experiment callback, bus replay,
+            // late registration ...). Counted in the manifest; it should stay 0.
+            if (CaptureConstants.IsNpcSubjectEvent(type) || !string.IsNullOrEmpty(npcId) || !string.IsNullOrEmpty(npcSpawnInstanceId))
+            {
+                _eventsCsvNpcRowsRejected++;
+                WarnOnce("evt_npc_row", "refused to write an NPC-subject event ('" + type + "') to events.csv; NPC events belong to npc_events.csv");
+                return;
+            }
             _rf.Clear();
             // Event time: the explicit time of the transition when the caller has one (e.g. an NPC spawn), otherwise now.
             _rf.Add(F(double.IsNaN(tAbsOverride) ? CaptureClock.TAbs : tAbsOverride));
@@ -1296,9 +1465,11 @@ public class DataCaptureManager : MonoBehaviour
             bool hasPos = fromPos != Vector3.zero || toPos != Vector3.zero;
             _rf.Add(hasPos ? F(fromPos.x) : ""); _rf.Add(hasPos ? F(fromPos.y) : ""); _rf.Add(hasPos ? F(fromPos.z) : "");
             _rf.Add(hasPos ? F(toPos.x)   : ""); _rf.Add(hasPos ? F(toPos.y)   : ""); _rf.Add(hasPos ? F(toPos.z)   : "");
-            _rf.Add(valueNum != 0.0 ? F(valueNum) : "");
+            // F-07: presence is explicit. A supplied 0 is a value ("0.0000"); only an absent value (null) is blank.
+            _rf.Add(valueNum.HasValue && !double.IsNaN(valueNum.Value) ? F(valueNum.Value) : "");
             _rf.Add(S(valueStr));
             _rf.Add(S(SessionId));
+            _rf.Add(S(interactionId));   // schema v6: links building_click to its correct/incorrect outcome; blank on every other event
             _events.WriteLine(_events.Join(_rf));
         }
         catch (Exception ex) { WarnOnce("evt_write", "events.csv write failed: " + ex.Message); }
@@ -1369,7 +1540,7 @@ public class DataCaptureManager : MonoBehaviour
 
     void WriteRegistryRow(GameObject go, string role, string zone, string slot, int p1ord)
     {
-        if (_registry.Failed || go == null) return;
+        if (go == null) return;
 
         Transform t = go.transform;
         Vector3 pos = t.position;
@@ -1446,6 +1617,42 @@ public class DataCaptureManager : MonoBehaviour
         }
     }
 
+    /// <summary>
+    /// Evidence about one data stream, built from the writer's own counters (never from a component's existence). status:
+    /// not_configured (no checkpoint ever saw it enabled) | disabled_by_master_switch (NPC streams, npcCaptureEnabled=false) | configured_no_rows | ok | write_error.
+    /// Numeric "none yet" values are -1 (first/last_row_t_abs). History is cumulative over the session; configured_now is the state at the last update.
+    /// </summary>
+    [Serializable]
+    public class StreamHealth
+    {
+        public string status = "not_configured";
+        public bool configured_now, ever_configured, writer_initialised;
+        public long rows_written, write_errors;
+        public double first_row_t_abs = -1, last_row_t_abs = -1;   // first / last SUCCESSFUL row write (the "success" timestamps)
+        public string last_error = "";
+        // schema v7: failure diagnostics (F-13)
+        public string writer_state = "operational";               // operational | failed | recovered
+        public long rows_attempted, rows_failed, rows_dropped_after_failure;
+        public double first_error_t_abs = -1, last_error_t_abs = -1;
+        public string last_error_operation = "", last_error_type = "";
+        public int recovery_attempts;
+        public bool partial_output_possible;
+    }
+
+    /// <summary>
+    /// Achieved sampling timing of one stream from its own monotonic timestamps (see SamplingStats). available=false means too few in-epoch intervals for an estimate:
+    /// then every numeric statistic is -1 (unknown), not 0.
+    /// </summary>
+    [Serializable]
+    public class RateSummary
+    {
+        public bool available;
+        public string status = "no_samples";
+        public double nominal_hz, observed_hz = -1, mean_interval_s = -1, median_interval_s = -1, p95_interval_s = -1, max_interval_s = -1, gap_threshold_s;
+        public long samples, intervals, epochs, intentional_breaks, unexpected_gaps, non_monotonic;
+        public double first_t_abs = -1, last_t_abs = -1;
+    }
+
     [Serializable]
     public class Manifest
     {
@@ -1491,8 +1698,36 @@ public class DataCaptureManager : MonoBehaviour
         // false = that stream hit an I/O error and stopped writing; the data set is then INCOMPLETE for that stream.
         public bool npc_state_ok = true, npc_events_ok = true, npc_lifetimes_ok = true;
 
+        // ---- schema v5: recording EVIDENCE (updated at lifecycle checkpoints and at the end) ----
+        // Legacy *_ok flags (trajectory_ok, gaze_ok, events_ok, npc_*_ok) now mean: status is ok OR nothing was expected (not_configured /
+        // disabled_by_master_switch). They are false for write_error and for a stream that was configured but never wrote a row.
+        // The authoritative detail is in health_* / rate_* below.
+        public StreamHealth health_events = new StreamHealth(), health_trajectory = new StreamHealth(), health_gaze = new StreamHealth(),
+                            health_npc_state = new StreamHealth(), health_npc_events = new StreamHealth(), health_npc_lifetimes = new StreamHealth(),
+                            health_npc_profiles = new StreamHealth();
+        public RateSummary rate_gaze = new RateSummary(), rate_trajectory = new RateSummary();
+        public bool gaze_recorder_present;
+        public long gaze_rows_valid_eye, gaze_rows_fallback, gaze_rows_left_valid, gaze_rows_right_valid;
+        public float gaze_valid_eye_fraction = -1, gaze_valid_eye_rate_hz = -1;
+        public int gaze_recording_starts, gaze_pause_count, gaze_resume_count;
+        // "true" / "false" / "unknown" (unknown = not queryable on this platform, or the SDK threw). The legacy bool fields above cannot express unknown.
+        public string eye_tracking_supported_state = "unknown", eye_tracking_enabled_state = "unknown", eye_tracking_permission_state = "unknown";
+        public double eye_tracking_queried_t_abs = -1;
+        public int trials_started, trials_ended, app_pause_count, app_resume_count, manifest_updates;
+        public string last_manifest_update_reason = "";
+        public double last_manifest_update_t_abs = -1;
+
         // ---- NPC master switch + state-sampling controls (settings are written at session start, statistics at every manifest update) ----
         public string npc_master_switch_semantics = "";
+        public string events_csv_scope = "";
+        public int duplicate_outcomes_rejected, duplicate_clicks_ignored;
+        // schema v7: persistence / identity / LOS evidence
+        public int manifest_revision, manifest_write_failures;
+        public string manifest_last_install_mode = "", manifest_last_error = "";
+        public string participant_id_status = "Valid", config_source = "", config_hash = "", config_file_name = "";
+        public long npc_los_clear, npc_los_blocked, npc_los_unavailable;
+        public long npc_los_missing_participant_target, npc_los_missing_npc_origin, npc_los_invalid_geometry, npc_los_hit_buffer_overflow, npc_los_query_error;
+        public int events_csv_npc_rows_rejected;
         public string npc_state_budget_scope = "";
         public float npc_state_base_interval_seconds, npc_state_max_interval_seconds, npc_state_data_budget_mb_per_minute;
         // true when npcCaptureEnabled is true for the Part that is running (or selected, before any Part runs) at the time of the update
@@ -1522,8 +1757,12 @@ public class DataCaptureManager : MonoBehaviour
             npc_id_scheme   = CaptureConstants.NpcIdScheme,
             npc_state_capture_mode = CaptureConstants.NpcCaptureModeText,
             npc_master_switch_semantics = CaptureConstants.NpcMasterSwitchText,
+            events_csv_scope = CaptureConstants.EventsCsvScopeText,
             npc_state_budget_scope = CaptureConstants.NpcBudgetScopeText,
-            participant_id  = _sessionController != null ? _sessionController.participantId : "UNKNOWN",
+            participant_id  = ParticipantId,                      // the validated research identity, exactly as configured (trimmed)
+            config_source   = _sessionController != null ? _sessionController.ConfigSource : "",
+            config_hash     = _sessionController != null ? _sessionController.ConfigHash : "",
+            config_file_name = (_sessionController != null && _sessionController.useExternalJson) ? _sessionController.externalFileName : "",
             started_utc     = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture),
             t_abs_at_start  = F(CaptureClock.TAbs),
             selected_part   = _sessionController != null ? _sessionController.selectedPart.ToString() : "Unknown",
@@ -1542,6 +1781,11 @@ public class DataCaptureManager : MonoBehaviour
             scene_name = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name,
             xr_device  = SafeXrDevice(),
 
+            eye_tracking_supported_state = EyeStateSupported(),
+            eye_tracking_enabled_state = EyeStateEnabled(),
+            eye_tracking_permission_state = EyeStatePermission(),
+            eye_tracking_queried_t_abs = CaptureClock.TAbs,
+            gaze_recorder_present = _gazeRecorder != null,
             eye_tracking_supported = SafeEyeSupported(),
             eye_tracking_enabled   = SafeEyeEnabled(),
             eye_tracking_permission_granted = SafeEyePermission(),
@@ -1595,11 +1839,48 @@ public class DataCaptureManager : MonoBehaviour
         WriteManifest();
     }
 
+    string ManifestPath => Path.Combine(SessionFolder, "session_manifest.json");
+    int _manifestRevision, _manifestFailures;
+    bool _manifestFailing;
+
+    // Serialises the whole manifest in memory, then replaces the file atomically (ManifestFileWriter). A failed update keeps the previous valid manifest, is
+    // counted and reported (log + registry + capture_errors.csv), and is retried at the next checkpoint. Main-thread only, so writes cannot overlap.
     void WriteManifest()
     {
-        if (_manifest == null) return;
-        try { File.WriteAllText(Path.Combine(SessionFolder, "session_manifest.json"), JsonUtility.ToJson(_manifest, true)); }
-        catch (Exception e) { Debug.LogError("[DataCapture] Failed to write session_manifest.json: " + e.Message); }
+        if (_manifest == null || RecordingBlocked || string.IsNullOrEmpty(SessionFolder)) return;
+        _inManifestWrite = true;
+        try
+        {
+            _manifest.manifest_revision = ++_manifestRevision;
+            _manifest.manifest_write_failures = _manifestFailures;
+            string json = JsonUtility.ToJson(_manifest, true);
+            ManifestFileWriter.WriteResult r = ManifestFileWriter.WriteAtomic(ManifestPath, json);
+            if (r.Ok)
+            {
+                _manifest.manifest_last_install_mode = r.InstallMode;
+                if (_manifestFailing)
+                {
+                    _manifestFailing = false;
+                    Debug.LogWarning("[DataCapture] session_manifest.json is writable again (revision " + _manifestRevision + ").");
+                    var t = new WriterTransition { Stream = "session_manifest", Operation = "manifest_write", Status = "recovered", Utc = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture), TAbs = CaptureClock.TAbs, RowsWrittenBefore = _manifestRevision - 1 };
+                    _failureRegistry.Add(t); AppendCaptureError(t);
+                }
+            }
+            else
+            {
+                _manifestFailures++;
+                _manifest.manifest_last_error = r.Stage + ": " + r.Error;
+                if (!_manifestFailing)
+                {
+                    _manifestFailing = true;
+                    Debug.LogError("[DataCapture] Failed to update session_manifest.json (" + r.Stage + ": " + r.Error + "). The previous valid manifest is kept; the update will be retried at the next checkpoint.");
+                    var t = new WriterTransition { Stream = "session_manifest", Operation = r.Stage, ErrorType = r.Error, ErrorMessage = r.Error, Status = "failed", Utc = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture), TAbs = CaptureClock.TAbs, RowsWrittenBefore = _manifestRevision - 1 };
+                    _failureRegistry.Add(t); AppendCaptureError(t);
+                }
+            }
+        }
+        catch (Exception e) { Debug.LogError("[DataCapture] session_manifest.json serialisation failed: " + e.Message); }
+        finally { _inManifestWrite = false; }
     }
 
     void WriteManifestEnd(string reason)
@@ -1616,9 +1897,7 @@ public class DataCaptureManager : MonoBehaviour
         _manifest.npc_state_ok = _npcState != null && !_npcState.Failed;
         _manifest.npc_events_ok = _npcEvents != null && !_npcEvents.Failed;
         _manifest.npc_lifetimes_ok = _npcLifetimes != null && !_npcLifetimes.Failed;
-        _manifest.trajectory_ok = _traj != null && !_traj.Failed;
-        _manifest.gaze_ok       = _gazeRecorder != null;
-        _manifest.events_ok     = _events != null && !_events.Failed;
+        UpdateManifestEvidence(reason);
 
         _fileList.Clear();
         AddIfExists("session_manifest.json");
@@ -1635,9 +1914,138 @@ public class DataCaptureManager : MonoBehaviour
         WriteManifest();
     }
 
+    // Writes the manifest at a lifecycle checkpoint (trial start/end, resume, part start, write error). Same content as the end snapshot except that the
+    // session is NOT marked ended: ended_utc / end_reason are cleared (a pause snapshot may have set them and the session resumed).
+    void WriteManifestCheckpoint(string reason)
+    {
+        if (_manifest == null || _endWritten) return;
+        _manifest.ended_utc = ""; _manifest.t_abs_at_end = ""; _manifest.end_reason = "";
+        _manifest.npc_lifetimes_registered = _lifetimesRegistered;
+        _manifest.unresolved_npc_gaze_hits = _unresolvedNpcHits;
+        _manifest.npc_lifecycle_events_dropped_before_attach = NpcLifecycleBus.DroppedPending;
+        FillNpcRateManifest();
+        UpdateManifestEvidence(reason);
+        _fileList.Clear();
+        foreach (string f in new[] { "session_manifest.json", "events.csv", "gaze.csv", "trajectory.csv", "building_registry.csv", "npc_state.csv", "npc_events.csv", "npc_lifetimes.csv", "npc_profiles.csv" }) AddIfExists(f);
+        _manifest.file_list = _fileList.ToArray();
+        WriteManifest();
+    }
+
+    // Fills health_* / rate_* / gaze counters from the actual writers and recorders. Cheap (no I/O, no allocation per sample); only called at checkpoints.
+    void UpdateManifestEvidence(string reason)
+    {
+        if (_gazeRecorder == null) _gazeRecorder = FindObjectOfType<GazeRecorder>();   // may have been created after this manager started
+        var cfg = CurrentConfig ?? SelectedPartConfig();
+        bool gazeCfg = cfg != null && cfg.gazeCaptureEnabled, trajCfg = cfg != null && cfg.trajectoryCaptureEnabled;
+        bool npcMaster = NpcRecordingEnabled, npcStateCfg = npcMaster && cfg != null && cfg.npcEnabled;
+        _everConfiguredGaze |= gazeCfg; _everConfiguredTraj |= trajCfg; _everConfiguredNpc |= npcMaster;
+
+        FillWriterHealth(_manifest.health_events, _events, true, true, false);
+        FillWriterHealth(_manifest.health_trajectory, _traj, trajCfg, _everConfiguredTraj, false);
+        FillWriterHealth(_manifest.health_npc_state, _npcState, npcStateCfg, _everConfiguredNpc, true);
+        FillWriterHealth(_manifest.health_npc_events, _npcEvents, npcMaster, _everConfiguredNpc, true);
+        FillWriterHealth(_manifest.health_npc_lifetimes, _npcLifetimes, npcMaster, _everConfiguredNpc, true);
+        FillWriterHealth(_manifest.health_npc_profiles, _npcProfiles, npcMaster, _everConfiguredNpc, true);
+
+        // gaze: counters come from GazeRecorder itself (rows it actually wrote), not from the component's presence
+        StreamHealth gh = _manifest.health_gaze;
+        gh.configured_now = gazeCfg; gh.ever_configured = _everConfiguredGaze;
+        _manifest.gaze_recorder_present = _gazeRecorder != null;
+        if (_gazeRecorder != null)
+        {
+            GazeRecorder g = _gazeRecorder;
+            gh.writer_initialised = g.HeaderWriteOk && g.Writer != null && !g.Writer.Failed;
+            if (g.Writer != null) CopyWriterEvidence(gh, g.Writer);
+            _manifest.gaze_rows_valid_eye = g.RowsValidEye; _manifest.gaze_rows_fallback = g.RowsFallback;
+            _manifest.gaze_rows_left_valid = g.RowsLeftValid; _manifest.gaze_rows_right_valid = g.RowsRightValid;
+            _manifest.gaze_recording_starts = g.RecordingStarts; _manifest.gaze_pause_count = g.PauseCount; _manifest.gaze_resume_count = g.ResumeCount;
+            _manifest.gaze_valid_eye_fraction = g.RowsWritten > 0 ? (float)g.RowsValidEye / g.RowsWritten : -1f;
+            FillRate(_manifest.rate_gaze, g.Sampling);
+            _manifest.gaze_valid_eye_rate_hz = _manifest.rate_gaze.available && _manifest.gaze_valid_eye_fraction >= 0 ? (float)(_manifest.rate_gaze.observed_hz * _manifest.gaze_valid_eye_fraction) : -1f;
+        }
+        gh.status = StatusOf(gh, false);
+        FillRate(_manifest.rate_trajectory, _trajStats);
+
+        _manifest.trials_started = _trialsStarted; _manifest.trials_ended = _trialsEnded;
+        _manifest.app_pause_count = _appPauseCount; _manifest.app_resume_count = _appResumeCount;
+        _manifest.manifest_updates = ++_manifestUpdates;
+        _manifest.last_manifest_update_reason = reason ?? ""; _manifest.last_manifest_update_t_abs = CaptureClock.TAbs;
+        _lastManifestWriteT = CaptureClock.TAbs; _manifestDirty = false;
+
+        // eye tracking state is re-queried at every checkpoint (capability can change: headset removed, permission granted late)
+        _manifest.eye_tracking_supported_state = EyeStateSupported(); _manifest.eye_tracking_enabled_state = EyeStateEnabled();
+        _manifest.eye_tracking_permission_state = EyeStatePermission(); _manifest.eye_tracking_queried_t_abs = CaptureClock.TAbs;
+
+        // legacy flags (see the Manifest comment): ok, or nothing was expected
+        _manifest.trajectory_ok = OkOrNotExpected(_manifest.health_trajectory);
+        _manifest.gaze_ok = OkOrNotExpected(_manifest.health_gaze);
+        _manifest.events_ok = OkOrNotExpected(_manifest.health_events);
+        _manifest.npc_state_ok = OkOrNotExpected(_manifest.health_npc_state);
+        _manifest.npc_events_ok = OkOrNotExpected(_manifest.health_npc_events);
+        _manifest.npc_lifetimes_ok = OkOrNotExpected(_manifest.health_npc_lifetimes);
+    }
+
+    static bool OkOrNotExpected(StreamHealth h) => h.status == "ok" || h.status == "not_configured" || h.status == "disabled_by_master_switch";
+
+    void FillWriterHealth(StreamHealth h, CaptureCsvWriter w, bool configuredNow, bool everConfigured, bool npcStream)
+    {
+        h.configured_now = configuredNow; h.ever_configured = everConfigured || configuredNow;
+        h.writer_initialised = w != null && !w.IsDisabled && !w.Failed;
+        if (w != null) CopyWriterEvidence(h, w);
+        h.status = StatusOf(h, npcStream);
+    }
+
+    // Copies a writer's own counters into a health block. Used for every CSV stream including gaze (the gaze recorder owns a CaptureCsvWriter).
+    static void CopyWriterEvidence(StreamHealth h, CaptureCsvWriter w)
+    {
+        h.rows_attempted = w.RowsAttempted; h.rows_written = w.RowsWritten; h.rows_failed = w.RowsFailed; h.rows_dropped_after_failure = w.RowsDroppedAfterFailure;
+        h.write_errors = w.WriteErrors;
+        h.first_row_t_abs = double.IsNaN(w.FirstRowT) ? -1 : w.FirstRowT; h.last_row_t_abs = double.IsNaN(w.LastRowT) ? -1 : w.LastRowT;
+        h.first_error_t_abs = double.IsNaN(w.FirstErrorT) ? -1 : w.FirstErrorT; h.last_error_t_abs = double.IsNaN(w.LastErrorT) ? -1 : w.LastErrorT;
+        h.last_error = w.LastError ?? ""; h.last_error_operation = w.LastErrorOperation ?? ""; h.last_error_type = w.LastErrorType ?? "";
+        h.recovery_attempts = w.RecoveryAttempts; h.partial_output_possible = w.PartialOutputPossible;
+        h.writer_state = w.State == WriterState.Failed ? (w.PermanentlyFailed ? "permanently_failed" : "failed") : (w.State == WriterState.Recovered ? "recovered" : "operational");
+    }
+
+    // not_configured / disabled_by_master_switch: nothing was ever expected; configured_no_rows: expected but nothing written; ok;
+    // write_error: the stream is failed NOW; recovered: it failed and is writing again (rows were lost in the gap); history is always kept
+    string StatusOf(StreamHealth h, bool npcStream)
+    {
+        if (h.write_errors > 0) return h.writer_state == "recovered" ? "recovered" : "write_error";
+        if (!h.ever_configured) return npcStream ? "disabled_by_master_switch" : "not_configured";
+        return h.rows_written > 0 ? "ok" : "configured_no_rows";
+    }
+
+    static void FillRate(RateSummary r, SamplingStats st)
+    {
+        if (st == null) return;
+        r.nominal_hz = st.NominalHz; r.gap_threshold_s = st.GapThreshold;
+        r.samples = st.Samples; r.intervals = st.Intervals; r.epochs = st.Epochs; r.intentional_breaks = st.IntentionalBreaks;
+        r.unexpected_gaps = st.UnexpectedGaps; r.non_monotonic = st.NonMonotonic;
+        r.first_t_abs = double.IsNaN(st.FirstT) ? -1 : st.FirstT; r.last_t_abs = double.IsNaN(st.LastT) ? -1 : st.LastT;
+        r.available = st.EstimateAvailable;
+        r.status = st.Samples == 0 ? "no_samples" : (st.EstimateAvailable ? "estimated" : "insufficient_samples");
+        r.observed_hz = st.EstimateAvailable ? st.ObservedHz : -1;
+        r.mean_interval_s = st.EstimateAvailable ? st.MeanInterval : -1;
+        r.median_interval_s = st.EstimateAvailable ? st.MedianInterval : -1;
+        r.p95_interval_s = st.EstimateAvailable ? st.P95Interval : -1;
+        r.max_interval_s = double.IsNaN(st.MaxInterval) ? -1 : st.MaxInterval;
+    }
+
     void FillNpcRateManifest()
     {
         _manifest.npc_capture_effective_enabled = NpcRecordingEnabled;
+        _manifest.events_csv_npc_rows_rejected = _eventsCsvNpcRowsRejected;
+        _manifest.duplicate_outcomes_rejected = _duplicateOutcomesRejected;
+        _manifest.npc_los_clear = _losCounts[(int)LosStatus.Clear]; _manifest.npc_los_blocked = _losCounts[(int)LosStatus.Blocked];
+        _manifest.npc_los_missing_participant_target = _losCounts[(int)LosStatus.MissingParticipantTarget];
+        _manifest.npc_los_missing_npc_origin = _losCounts[(int)LosStatus.MissingNpcOrigin];
+        _manifest.npc_los_invalid_geometry = _losCounts[(int)LosStatus.InvalidGeometry];
+        _manifest.npc_los_hit_buffer_overflow = _losCounts[(int)LosStatus.HitBufferOverflow];
+        _manifest.npc_los_query_error = _losCounts[(int)LosStatus.QueryError];
+        _manifest.npc_los_unavailable = _manifest.npc_los_missing_participant_target + _manifest.npc_los_missing_npc_origin + _manifest.npc_los_invalid_geometry +
+                                        _manifest.npc_los_hit_buffer_overflow + _manifest.npc_los_query_error;
+        _manifest.duplicate_clicks_ignored = TargetSelectable.DuplicateClicksIgnored;
         _manifest.npc_events_suppressed_by_master_switch = NpcEventsSuppressedByMasterSwitch;
         _manifest.npc_state_base_interval_seconds = _rate.BaseInterval;
         _manifest.npc_state_max_interval_seconds = _rate.MaxInterval;
@@ -1753,6 +2161,20 @@ public class DataCaptureManager : MonoBehaviour
     static string SafeXrDevice()
     {
         try { return UnityEngine.XR.XRSettings.loadedDeviceName; } catch { return ""; }
+    }
+
+    // Tri-state capability reporting: "true"/"false" only when the platform can really answer; otherwise "unknown" (never a disguised false).
+    // In the Editor OVRPlugin cannot distinguish "no eye tracking" from "no runtime", so a false there is unknown; a true is real evidence.
+    static string EyeStateSupported() { try { bool v = OVRPlugin.eyeTrackingSupported; return v ? "true" : (Application.isEditor ? "unknown" : "false"); } catch { return "unknown"; } }
+    static string EyeStateEnabled()   { try { bool v = OVRPlugin.eyeTrackingEnabled;   return v ? "true" : (Application.isEditor ? "unknown" : "false"); } catch { return "unknown"; } }
+    static string EyeStatePermission()
+    {
+#if UNITY_ANDROID && !UNITY_EDITOR
+        try { return UnityEngine.Android.Permission.HasUserAuthorizedPermission("com.oculus.permission.EYE_TRACKING") ? "true" : "false"; }
+        catch { return "unknown"; }
+#else
+        return "unknown";   // the Android runtime permission is not queryable on this platform
+#endif
     }
 
     static bool SafeEyeSupported() { try { return OVRPlugin.eyeTrackingSupported; } catch { return false; } }

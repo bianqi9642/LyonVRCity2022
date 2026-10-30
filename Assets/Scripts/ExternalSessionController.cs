@@ -72,12 +72,57 @@ public class ExternalSessionController : MonoBehaviour
         public bool autoStart;
     }
 
+    // ---- identity / configuration validation (F-14) ----
+    [Header("Identity status (read-only, set at runtime)")]
+    [SerializeField, Tooltip("Valid | Missing | Invalid | Placeholder | UnresolvedConfig. Research recording and auto-start are blocked unless this is Valid.")]
+    private string identityStatus = "NotChecked";
+    [SerializeField, Tooltip("Why the identity/configuration was rejected (empty when valid).")]
+    private string identityMessage = "";
+
+    /// <summary>"inspector" or "external_json": where the values in use came from.</summary>
+    public string ConfigSource => useExternalJson ? "external_json" : "inspector";
+    /// <summary>FNV-1a hash of the external JSON text that was applied ("" for the Inspector source or when none was applied).</summary>
+    public string ConfigHash { get; private set; } = "";
+    /// <summary>Non-empty when the configured external JSON could not be loaded/validated. There is NO fallback to Inspector values in that case.</summary>
+    public string ConfigError { get; private set; } = "";
+
+    /// <summary>Validates the configuration actually in force: participant ID, source resolution, part and group indices.</summary>
+    public SessionIdentity.Result ValidateIdentity()
+    {
+        SessionIdentity.Result r;
+        if (!string.IsNullOrEmpty(ConfigError))
+            r = new SessionIdentity.Result { status = SessionIdentity.Status.UnresolvedConfig, message = ConfigError };
+        else
+        {
+            r = SessionIdentity.ValidateParticipantId(participantId);
+            if (r.IsValid)
+            {
+                string bad = ValidateIndices(selectedPart, part2GroupIndex, part3GroupIndex);
+                if (bad != null) r = new SessionIdentity.Result { status = SessionIdentity.Status.Invalid, message = bad };
+            }
+        }
+        identityStatus = r.status.ToString(); identityMessage = r.message ?? "";
+        return r;
+    }
+
+    private static string ValidateIndices(ExperimentPart part, int g2, int g3)
+    {
+        if (g2 < 0) return "part2GroupIndex must be >= 0.";
+        if (g3 < 0 || g3 > 11) return "part3GroupIndex must be 0..11.";
+        return null;
+    }
+
     private void Awake()
     {
         if (useExternalJson)
         {
+            // Strict: when the external file is the configured source it must exist, parse and validate. A failure is a hard configuration error (no
+            // silent fall-back to Inspector values, and the unrelated Assets/Scripts/session_config.json is never read).
             TryLoadFromExternalJson();
         }
+        SessionIdentity.Result r = ValidateIdentity();
+        if (!r.IsValid)
+            Debug.LogError("[ExternalSessionController] Session configuration rejected (" + r.status + "): " + r.message + " Research recording and auto-start stay blocked until this is fixed.");
     }
 
     /// <summary>
@@ -87,44 +132,51 @@ public class ExternalSessionController : MonoBehaviour
     {
         try
         {
-            if (!File.Exists(ExternalFilePath))
-            {
-                Debug.LogWarning($"ExternalSessionController: config file not found at {ExternalFilePath}");
-                return false;
-            }
+            if (!File.Exists(ExternalFilePath)) return Fail("External session configuration not found (expected '" + externalFileName + "' in the application data folder).");
 
             string json = File.ReadAllText(ExternalFilePath);
-            SessionConfigData data = JsonUtility.FromJson<SessionConfigData>(json);
-            if (data == null)
-            {
-                Debug.LogWarning("ExternalSessionController: Failed to parse JSON into SessionConfigData.");
-                return false;
-            }
+            // required keys must really be present: JsonUtility cannot tell a missing int from 0
+            foreach (string key in new[] { "participantId", "selectedPart", "part2GroupIndex", "part3GroupIndex" })
+                if (json.IndexOf("\"" + key + "\"", StringComparison.Ordinal) < 0) return Fail("External session configuration is missing required field '" + key + "'.");
 
-            // Apply values
-            if (!string.IsNullOrEmpty(data.participantId)) participantId = data.participantId;
+            SessionConfigData data;
+            try { data = JsonUtility.FromJson<SessionConfigData>(json); }
+            catch (Exception) { return Fail("External session configuration is not valid JSON."); }
+            if (data == null) return Fail("External session configuration could not be parsed.");
 
-            // parse selected part string
-            if (!string.IsNullOrEmpty(data.selectedPart))
-            {
-                if (data.selectedPart.Equals("Part1", StringComparison.OrdinalIgnoreCase)) selectedPart = ExperimentPart.Part1;
-                else if (data.selectedPart.Equals("Part2", StringComparison.OrdinalIgnoreCase)) selectedPart = ExperimentPart.Part2;
-                else if (data.selectedPart.Equals("Part3", StringComparison.OrdinalIgnoreCase)) selectedPart = ExperimentPart.Part3;
-                else Debug.LogWarning("ExternalSessionController: Unknown selectedPart in JSON: " + data.selectedPart);
-            }
+            ExperimentPart part;
+            if (data.selectedPart != null && data.selectedPart.Equals("Part1", StringComparison.OrdinalIgnoreCase)) part = ExperimentPart.Part1;
+            else if (data.selectedPart != null && data.selectedPart.Equals("Part2", StringComparison.OrdinalIgnoreCase)) part = ExperimentPart.Part2;
+            else if (data.selectedPart != null && data.selectedPart.Equals("Part3", StringComparison.OrdinalIgnoreCase)) part = ExperimentPart.Part3;
+            else return Fail("External session configuration has an unknown 'selectedPart' (expected Part1, Part2 or Part3).");
 
-            part2GroupIndex = Mathf.Max(0, data.part2GroupIndex);
-            part3GroupIndex = Mathf.Max(0, data.part3GroupIndex);
+            SessionIdentity.Result idr = SessionIdentity.ValidateParticipantId(data.participantId);
+            if (!idr.IsValid) return Fail("External session configuration: " + idr.message);
+            string bad = ValidateIndices(part, data.part2GroupIndex, data.part3GroupIndex);
+            if (bad != null) return Fail("External session configuration: " + bad);
+
+            // all fields validated: apply atomically
+            participantId = idr.participantId;
+            selectedPart = part;
+            part2GroupIndex = data.part2GroupIndex;
+            part3GroupIndex = data.part3GroupIndex;
             autoStart = data.autoStart;
-
-            Debug.Log($"ExternalSessionController: Loaded config from {ExternalFilePath} (participantId={participantId}, selectedPart={selectedPart}, part2GroupIndex={part2GroupIndex}, part3GroupIndex={part3GroupIndex}, autoStart={autoStart})");
+            ConfigHash = AgentProfileSnapshot.Fnv1a64Hex(json);
+            ConfigError = "";
+            Debug.Log($"ExternalSessionController: Loaded config '{externalFileName}' (selectedPart={selectedPart}, part2GroupIndex={part2GroupIndex}, part3GroupIndex={part3GroupIndex}, autoStart={autoStart}, hash={ConfigHash})");
             return true;
         }
         catch (Exception ex)
         {
-            Debug.LogError("ExternalSessionController: Exception while loading JSON: " + ex);
-            return false;
+            return Fail("External session configuration could not be read: " + ex.GetType().Name);
         }
+    }
+
+    private bool Fail(string message)
+    {
+        ConfigError = message;
+        ConfigHash = "";
+        return false;
     }
 
     /// <summary>

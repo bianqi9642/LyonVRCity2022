@@ -13,7 +13,13 @@ using UnityEngine;
 public static class CaptureClock
 {
     /// <summary>Primary synchronisation clock. Monotonic seconds since process start, timeScale-independent.</summary>
-    public static double TAbs => Time.realtimeSinceStartupAsDouble;
+    public static double TAbs => TestSource != null ? TestSource() : Time.realtimeSinceStartupAsDouble;
+
+    /// <summary>
+    /// Test seam ONLY (null in production): replaces the monotonic clock for every recorder AND every experiment timer, so timing can be driven
+    /// deterministically (for example a simulated multi-second hitch or suspension inside one frame).
+    /// </summary>
+    [NonSerialized] public static Func<double> TestSource;
 
     /// <summary>Secondary wall-clock timestamp (Unix epoch milliseconds, UTC). For video / cross-device sync only.</summary>
     public static long TUnixMs => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();

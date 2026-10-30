@@ -131730,7 +131730,7 @@ MonoBehaviour:
   autoStartIfNoExperimentManager: 0
   subjectId: 
   trialId: 
-  sampleRate: 30
+  sampleRate: 20
   enableROIRaycast: 1
   roiLayerMask:
     serializedVersion: 2
@@ -249127,13 +249127,15 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: c441700c106a04ed2a25d48fca0137f8, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  participantId: 0
+  participantId: 1
   selectedPart: 3
   part2GroupIndex: 0
   part3GroupIndex: 1
   autoStart: 1
   useExternalJson: 0
   externalFileName: session_config.json
+  identityStatus: NotChecked
+  identityMessage: 
 --- !u!1001 &2140646880
 PrefabInstance:
   m_ObjectHideFlags: 0

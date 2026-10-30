@@ -19,10 +19,10 @@ public partial class NpcLifecycleTests
 {
     static readonly Type RateType = T("NpcStateRateController");
 
-    static readonly HashSet<string> NpcEventTypesInEventsCsv = new HashSet<string> { "npc_spawn", "npc_despawn", "npc_warmup_start", "npc_warmup_end" };
+    static readonly HashSet<string> NpcEventTypesInEventsCsv = new HashSet<string> { "npc_spawn", "npc_despawn" };
 
     void RaiseExperimentEvent(Rig rig, string type, string part)
-        => Call(rig.em, "RaiseEvt", type, part, "", "", 0.0, false, null, Vector3.zero, Vector3.zero);
+        => Call(rig.em, "RaiseEvt", type, part, "", "", null, false, null, Vector3.zero, Vector3.zero);
 
     static string[] NpcFiles = { "npc_state.csv", "npc_events.csv", "npc_lifetimes.csv", "npc_profiles.csv" };
 
@@ -126,6 +126,7 @@ public partial class NpcLifecycleTests
             if (type == "part_start") sawPartStart = true;
         }
         Assert.IsTrue(sawPartStart, "non-NPC events are still recorded");
+        Assert.AreEqual(1, new List<List<string>>(evs.Where("event_type", "npc_warmup_start")).Count, "warm-up window markers are workflow events: they do not depend on the NPC switch");
 
         // Nothing retained for a later replay.
         Assert.AreEqual(0, GetStatic<int>(BusType, "PendingCount"));
@@ -318,7 +319,7 @@ public partial class NpcLifecycleTests
         for (int i = 1; i < snaps.Count; i++)   // the very first snapshot may predate the last spawn
             Assert.AreEqual(N, snaps[i].Value, "every snapshot after the population is complete contains ALL " + N + " NPCs");
         Assert.AreEqual(N, Lifetimes(rig).Rows.Count, "per-lifetime attribute records are never throttled");
-        Assert.AreEqual(N, new List<List<string>>(Events(rig).Where("event_type", "npc_spawn")).Count, "spawn events are never throttled");
+        Assert.AreEqual(0, new List<List<string>>(Events(rig).Where("event_type", "npc_spawn")).Count, "events.csv carries no NPC rows");
         Assert.AreEqual(N, new List<List<string>>(NpcEvents(rig).Where("event_type", "npc_spawn")).Count);
         double mean = MeanGap(snaps, 1, out double min);
         Assert.Greater(mean, 0.4, "recorded snapshot spacing reflects the stretched interval");

@@ -183,7 +183,7 @@ public class GazeRecorderTests
     static readonly string[] FractionalColumns =
     {
         "head_pos_x", "head_pos_y", "head_pos_z", "head_rot_x", "head_rot_y", "head_rot_z", "head_rot_w",
-        "combined_origin_x", "combined_origin_y", "combined_origin_z", "combined_dir_x", "combined_dir_y", "combined_dir_z",
+        "ray_origin_x", "ray_origin_y", "ray_origin_z", "ray_dir_x", "ray_dir_y", "ray_dir_z",
         "hit_point_x", "hit_point_y", "hit_point_z"
     };
     static readonly Regex Fixed4 = new Regex(@"^-?\d+\.\d{4}$");
@@ -218,7 +218,9 @@ public class GazeRecorderTests
         {
             Assert.GreaterOrEqual(rows.Count, 3, "expected a header plus several rows");
             int width = rows[0].Count;
-            Assert.AreEqual(55, width, "header width changed (55 columns at HEAD; the schema must stay unchanged)");
+            Assert.AreEqual(66, width, "header width: 55 columns at HEAD + 11 appended in schema v5 (existing columns must never move)");
+            Assert.AreEqual("hit_is_interactable", rows[0][54], "the first 55 columns are unchanged");
+            Assert.AreEqual("part", rows[0][55]);
             for (int i = 1; i < rows.Count; i++)
                 Assert.AreEqual(width, rows[i].Count, "row " + i + " width differs from header");
         }
@@ -244,6 +246,10 @@ public class GazeRecorderTests
         Assert.AreEqual("1", fr[1][hdr.IndexOf("ray_did_hit")]);
         Assert.AreEqual("", fr[1][hdr.IndexOf("roi_hit_distance")], "legacy missing-value convention: blank when eye gaze invalid");
         Assert.AreEqual("0", fr[1][hdr.IndexOf("combined_valid")]);
+        foreach (var col in new[] { "combined_origin_x", "combined_origin_y", "combined_origin_z", "combined_dir_x", "combined_dir_y", "combined_dir_z",
+                                    "left_origin_x", "left_dir_z", "right_origin_y", "right_dir_x" })
+            Assert.AreEqual("", fr[1][hdr.IndexOf(col)], col + ": an invalid eye / combined vector is blank (schema v5)");
+        Assert.AreEqual("0", fr[1][hdr.IndexOf("ray_is_eye_gaze")], "the fallback ray is marked as not eye gaze");
         Assert.AreEqual("head_fallback", fr[1][hdr.IndexOf("gaze_ray_source")]);
         Assert.AreEqual("0.000", fr[1][hdr.IndexOf("left_confidence")]);
         foreach (var col in new[] { "left_confidence", "right_confidence", "combined_confidence" })

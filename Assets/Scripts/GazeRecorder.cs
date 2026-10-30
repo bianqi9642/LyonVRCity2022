@@ -108,11 +108,40 @@ public class GazeRecorder : MonoBehaviour
     // terminated       : the component was destroyed or the application is quitting; never restart.
     bool isRecording = false;
     string fullPath = "";
-    bool headerWritten = false;
     Coroutine samplingCoroutine = null;
     double recordingStartRealtime = 0.0;
     bool suspendedByPause = false;
     bool terminated = false;
+
+    // ---- recording evidence (F-09 / F-18): counted from the code paths that really write rows, read by DataCaptureManager at manifest checkpoints ----
+    /// <summary>Rows successfully appended to gaze.csv.</summary>
+    public long RowsWritten { get; private set; }
+    /// <summary>Rows whose combined ray came from at least one valid eye (combined_valid = 1).</summary>
+    public long RowsValidEye { get; private set; }
+    /// <summary>Rows with NO valid eye: the ray is the head-forward fallback (combined_valid = 0, gaze_ray_source = head_fallback).</summary>
+    public long RowsFallback { get; private set; }
+    public long RowsLeftValid { get; private set; }
+    public long RowsRightValid { get; private set; }
+    /// <summary>The CSV writer (shared failure/recovery policy and counters); null until the first StartRecording.</summary>
+    public CaptureCsvWriter Writer => gazeWriter;
+    CaptureCsvWriter gazeWriter;
+    public long WriteErrors => gazeWriter != null ? gazeWriter.WriteErrors : 0;
+    public string LastWriteError => gazeWriter != null ? gazeWriter.LastError : "";
+    public double FirstRowT { get; private set; } = double.NaN;
+    public double LastRowT { get; private set; } = double.NaN;
+    /// <summary>True once the CSV header was written successfully (the file is usable).</summary>
+    public bool HeaderWriteOk => gazeWriter != null && gazeWriter.HeaderWritten;
+    public int RecordingStarts { get; private set; }
+    public int PauseCount { get; private set; }
+    public int ResumeCount { get; private set; }
+    /// <summary>Achieved timing of the SUCCESSFULLY written rows (see SamplingStats); epochs break at pauses and while the capture gate is closed.</summary>
+    public SamplingStats Sampling { get; private set; }
+
+    /// <summary>Test seam: replaces the OVREyeGaze reading of one eye with a fixed sample (null/inactive = real reading). Never set in production.</summary>
+    [Serializable]
+    public class EyeInjection { public bool active = true; public float confidence; public Vector3 origin; public Vector3 direction = Vector3.forward; }
+    [NonSerialized] public EyeInjection testLeftEye;
+    [NonSerialized] public EyeInjection testRightEye;
 
     /// <summary>True while the sampling loop is running (false while suspended by a pause or stopped).</summary>
     public bool IsSampling => samplingCoroutine != null;
@@ -128,6 +157,7 @@ public class GazeRecorder : MonoBehaviour
 
     void Awake()
     {
+        Sampling = new SamplingStats(sampleRate);
         if (headTransform == null && Camera.main != null)
         {
             headTransform = Camera.main.transform;
@@ -217,6 +247,8 @@ public class GazeRecorder : MonoBehaviour
 
         StopSamplingLoop();
         suspendedByPause = true;
+        PauseCount++;
+        Sampling?.BreakEpoch();   // intentional gap: the wait across a pause must never be read as a low sensor rate
 
         if (enableDebugLogs)
             Debug.LogWarning("[GazeRecorder] Application paused while recording - sampling suspended; it resumes with the application " +
@@ -249,6 +281,7 @@ public class GazeRecorder : MonoBehaviour
         }
 
         suspendedByPause = false;
+        ResumeCount++;
         // The per-sample GazeCaptureActive gate in SamplingLoop still applies. Header, file and recordingStartRealtime are untouched.
         samplingCoroutine = StartCoroutine(SamplingLoop());
 
@@ -280,6 +313,14 @@ public class GazeRecorder : MonoBehaviour
             return;
         }
 
+        // Identity/configuration rejected (F-14): the capture manager blocks research recording, so does the gaze recorder (no legacy fall-back file either).
+        if (dataCapture == null) dataCapture = FindObjectOfType<DataCaptureManager>();
+        if (dataCapture != null && dataCapture.RecordingBlocked)
+        {
+            Debug.LogError("[GazeRecorder] StartRecording refused: recording is blocked (" + dataCapture.BlockReason + ")");
+            return;
+        }
+
         // A destroyed / quitting recorder or an ended session can never start a new recording.
         if (terminated || (experimentManager != null && experimentManager.SessionEnded))
         {
@@ -287,6 +328,7 @@ public class GazeRecorder : MonoBehaviour
             return;
         }
 
+        if (string.IsNullOrEmpty(subjectId) && dataCapture != null && !string.IsNullOrEmpty(dataCapture.ParticipantId)) subjectId = dataCapture.ParticipantId;
         if (string.IsNullOrEmpty(subjectId) && sessionController != null) subjectId = sessionController.participantId;
         if (string.IsNullOrEmpty(subjectId)) subjectId = "UNKNOWN_SUBJECT";
 
@@ -294,9 +336,16 @@ public class GazeRecorder : MonoBehaviour
         if (string.IsNullOrEmpty(trialId)) trialId = "UNKNOWN_TRIAL";
 
         fullPath = BuildFullPath();
-        headerWritten = false;
+        if (gazeWriter == null || gazeWriter.Path != fullPath)
+        {
+            gazeWriter = new CaptureCsvWriter(fullPath, GetCsvHeader(), "gaze");
+            if (dataCapture != null) gazeWriter.Transition += dataCapture.OnWriterTransition;
+        }
         recordingStartRealtime = CaptureClock.TAbs;
         isRecording = true;
+        RecordingStarts++;
+        if (Sampling == null) Sampling = new SamplingStats(sampleRate);
+        Sampling.SetNominalHz(sampleRate);
 
         if (enableDebugLogs)
             Debug.Log($"[GazeRecorder] Recording started. subject={subjectId} trial={trialId} path={fullPath}");
@@ -310,6 +359,7 @@ public class GazeRecorder : MonoBehaviour
         if (!isRecording && samplingCoroutine == null) return;
 
         StopSamplingLoop();
+        Sampling?.BreakEpoch();
         suspendedByPause = false;   // a stopped session can no longer be resumed by a later pause(false) / focus callback
 
         if (isRecording && enableDebugLogs)
@@ -382,7 +432,15 @@ public class GazeRecorder : MonoBehaviour
             "hit_building_id",
             "hit_npc_id",
             "hit_npc_spawn_instance_id",
-            "hit_is_interactable"
+            "hit_is_interactable",
+            // ----- schema v5 appended columns -----
+            "part",
+            "phase",
+            "ray_is_eye_gaze",
+            "ray_origin_x", "ray_origin_y", "ray_origin_z",
+            "ray_dir_x", "ray_dir_y", "ray_dir_z",
+            "hit_is_current_target",
+            "hit_assigned_destination"
         });
     }
 
@@ -394,7 +452,7 @@ public class GazeRecorder : MonoBehaviour
         public Vector3 direction;
     }
 
-    EyeSample ReadEye(OVREyeGaze eyeGaze)
+    EyeSample ReadEye(OVREyeGaze eyeGaze, EyeInjection injected)
     {
         EyeSample sample = new EyeSample
         {
@@ -403,6 +461,15 @@ public class GazeRecorder : MonoBehaviour
             origin = Vector3.zero,
             direction = Vector3.forward
         };
+
+        if (injected != null && injected.active)
+        {
+            sample.confidence = injected.confidence;
+            sample.origin = injected.origin;
+            sample.direction = injected.direction;
+            sample.valid = sample.confidence >= minConfidenceForValid;
+            return sample;
+        }
 
         if (eyeGaze == null || !eyeGaze.isActiveAndEnabled) return sample;
 
@@ -424,14 +491,13 @@ public class GazeRecorder : MonoBehaviour
             // file, no rows for that Part (matches the shipped Part1Config default).
             if (dataCapture != null && !dataCapture.GazeCaptureActive)
             {
+                Sampling?.BreakEpoch();   // intentional gap: capture window closed (trial not open / End panel / Part has gaze capture off)
                 yield return new WaitForSecondsRealtime(interval);
                 continue;
             }
 
-            if (!headerWritten) WriteHeaderIfNeeded();
-
-            EyeSample left = ReadEye(leftEyeGaze);
-            EyeSample right = ReadEye(rightEyeGaze);
+            EyeSample left = ReadEye(leftEyeGaze, testLeftEye);
+            EyeSample right = ReadEye(rightEyeGaze, testRightEye);
 
             bool combinedValid;
             float combinedConfidence;
@@ -474,7 +540,9 @@ public class GazeRecorder : MonoBehaviour
             }
 
             // ROI raycast: ALWAYS performed (subject to enableROIRaycast). Uses the head-forward fallback
-            // ray when eye tracking is invalid. combined_valid is NOT affected by this.
+            // ray when eye tracking is invalid. combined_valid is NOT affected by this. The ray that was actually cast is recorded in the
+            // ray_* columns together with ray_is_eye_gaze, so a hit produced by the fallback can never be mistaken for an eye-gaze fixation.
+            bool rayIsEye = combinedValid;
             bool didHit = false;
             RaycastHit hit = default;
             if (enableROIRaycast)
@@ -514,16 +582,15 @@ public class GazeRecorder : MonoBehaviour
                 SafeCsvField(trialId),
                 F3(left.confidence),
                 left.valid ? "1" : "0",
-                F4(left.origin.x), F4(left.origin.y), F4(left.origin.z),
-                F4(left.direction.x), F4(left.direction.y), F4(left.direction.z),
+                V3(left.valid, left.origin), V3(left.valid, left.direction),
                 F3(right.confidence),
                 right.valid ? "1" : "0",
-                F4(right.origin.x), F4(right.origin.y), F4(right.origin.z),
-                F4(right.direction.x), F4(right.direction.y), F4(right.direction.z),
+                V3(right.valid, right.origin), V3(right.valid, right.direction),
                 combinedValid ? "1" : "0",
                 F3(combinedConfidence),
-                F4(combinedOrigin.x), F4(combinedOrigin.y), F4(combinedOrigin.z),
-                F4(combinedDirection.x), F4(combinedDirection.y), F4(combinedDirection.z),
+                // schema v5 (F-16): an invalid / unavailable vector is BLANK, never a fabricated default. Validity is decided ONLY by the *_valid flags
+                // (a valid vector may legitimately contain zeros). The head-forward fallback ray is not written here; see ray_* below.
+                V3(combinedValid, combinedOrigin), V3(combinedValid, combinedDirection),
                 F4(headPos.x), F4(headPos.y), F4(headPos.z),
                 F4(headRot.x), F4(headRot.y), F4(headRot.z), F4(headRot.w),
                 roiName,
@@ -544,48 +611,42 @@ public class GazeRecorder : MonoBehaviour
                 SafeCsvField(aoi.buildingId),
                 SafeCsvField(aoi.npcId),
                 SafeCsvField(aoi.npcSpawnInstanceId),
-                aoi.isInteractable
+                aoi.isInteractable,
+                // ----- schema v5 appended columns -----
+                dataCapture != null ? SafeCsvField(dataCapture.CurrentPart) : "",
+                dataCapture != null ? SafeCsvField(dataCapture.CurrentPhase) : "",
+                rayIsEye ? "1" : "0",
+                F4(combinedOrigin.x), F4(combinedOrigin.y), F4(combinedOrigin.z),
+                F4(combinedDirection.x), F4(combinedDirection.y), F4(combinedDirection.z),
+                aoi.isCurrentTarget,
+                SafeCsvField(aoi.assignedDestination)
             });
 
-            WriteRow(row);
+            if (WriteRow(row))
+            {
+                RowsWritten++;
+                if (double.IsNaN(FirstRowT)) FirstRowT = tAbs;
+                LastRowT = tAbs;
+                if (combinedValid) RowsValidEye++; else RowsFallback++;
+                if (left.valid) RowsLeftValid++;
+                if (right.valid) RowsRightValid++;
+                Sampling?.OnSample(tAbs);   // only a SUCCESSFULLY written row is a sample
+            }
 
             yield return new WaitForSecondsRealtime(interval);
         }
     }
 
-    void WriteHeaderIfNeeded()
-    {
-        try
-        {
-            string dir = Path.GetDirectoryName(fullPath);
-            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+    // Blank when the vector is invalid / unavailable; otherwise three fixed-4 components (zeros are valid values).
+    static string V3(bool valid, Vector3 v) => valid ? F4(v.x) + "," + F4(v.y) + "," + F4(v.z) : ",,";
 
-            if (!File.Exists(fullPath))
-            {
-                using (StreamWriter writer = new StreamWriter(fullPath, append: false))
-                    writer.WriteLine(GetCsvHeader());
-            }
-            headerWritten = true;
-        }
-        catch (Exception e)
-        {
-            if (enableDebugLogs)
-                Debug.LogError($"[GazeRecorder] Failed to write CSV header to {fullPath}: {e.Message}");
-        }
-    }
-
-    void WriteRow(string row)
+    // Rows go through the shared CaptureCsvWriter: lazy header, failure state + counters + bounded recovery (F-13). Returns true only if the row reached the file.
+    bool WriteRow(string row)
     {
-        try
-        {
-            using (StreamWriter writer = new StreamWriter(fullPath, append: true))
-                writer.WriteLine(row);
-        }
-        catch (Exception e)
-        {
-            if (enableDebugLogs)
-                Debug.LogError($"[GazeRecorder] Failed to write gaze sample to {fullPath}: {e.Message}");
-        }
+        if (gazeWriter == null) return false;
+        long before = gazeWriter.RowsWritten;
+        gazeWriter.WriteLine(row);
+        return gazeWriter.RowsWritten > before;
     }
 
     // F-02: every number in gaze.csv is formatted with the invariant culture. The row is comma-joined without quoting, so a

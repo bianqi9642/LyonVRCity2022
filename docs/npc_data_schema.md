@@ -1,15 +1,49 @@
-# NPC identity and recording schema (schema_version 3)
+# Capture schema reference (schema_version 7): NPC streams, events, gaze, trajectory, phases, timing, reliability, manifest
 
 Reference for `npc_state.csv`, `npc_events.csv`, `npc_lifetimes.csv` and `npc_profiles.csv`, derived from the write paths in
 `Assets/Scripts/Capture/DataCaptureManager.cs` (`SampleNpcs`, `AppendNpcEventLine`, `WriteLifetimeRow`, `WriteProfileRegistryRow`) and the headers in
 `CaptureConstants.cs`. Column order below is the file order. **Compatibility:** schema v2 -> v3 only *appended* columns (state +3, lifetimes +25) and added
 `npc_profiles.csv`; no column was renamed or reordered. Historical files were not rewritten; use `schema_version` in `session_manifest.json` to tell them apart
 (v2 files have fewer columns, still end with the same prefix, and contain `npc_leg_start` rows).
+**v3 -> v4 is a semantic change only (no column added or removed):** `events.csv` no longer contains NPC-subject rows (§1a). Recordings made with `schema_version` <= 3 may contain
+`npc_spawn` / `npc_despawn` rows (with `npc_id` / `npc_spawn_instance_id` filled) in `events.csv`; those rows are duplicated, with the same `t_abs`, in `npc_events.csv` of the same session.
+**v4 -> v5** (gaze / trajectory / manifest; see §11-§16): `gaze.csv` +11 appended columns and invalid vectors now blank; `trajectory.csv` +2 appended columns (`part`, `phase`);
+`TARGET_BUILDING` now means the CURRENT target; Part 2 gained phase labels; the manifest gained stream-health and achieved-rate evidence and its legacy `*_ok` flags changed meaning.
+**v5 -> v6** (`events.csv` / timing; see §17-§19): `events.csv` + trailing `interaction_id`; `value_num` now distinguishes a real 0 from "no value"; Parts 1 and 2 timers use the same monotonic clock as Part 3.
+**v6 -> v7** (reliability; see §20-§23): `npc_state.csv` + trailing `los_status` and a corrected `los_clear_to_participant`; `session_id` / folder name no longer contain the participant ID (`<UTC>_<12 hex of run_guid>`); new diagnostic file `capture_errors.csv`;
+`StreamHealth` blocks gain failure diagnostics; the manifest gains `manifest_revision`, identity/config fields and LOS counts and is written atomically.
+`schema_version` < 7 files: `los_clear_to_participant` was 0 for most rows because the query ran from the participant to a point inside the NPC's own colliders (treat it as uninformative); folders are `<participant>_<UTC>[-rN]`; no `capture_errors.csv`; a failed stream stayed silently disabled.
+`schema_version` < 6 files: no `interaction_id` column (match a click to its outcome by order/target/time only, with the ambiguity that implies), and a numeric 0 in `value_num` was written as blank (zero and missing are indistinguishable - `app_pause`/`app_focus`
+resume/loss rows, zero elapsed times; treat a blank `value_num` on those event types as 0).
+`schema_version` < 5 files: `gaze.csv` has 55 columns and writes fabricated default vectors for invalid eyes; `TARGET_BUILDING` meant "D1 or D2"; Part 2 rows have phase `idle`; `gaze_ok` only meant "recorder exists".
+Historical files were not rewritten: when analysing mixed data, drop NPC rows from `events.csv` by `event_type` (the list in §1a) and take NPC events from `npc_events.csv`.
+
+## 1a. `events.csv`: participant and experiment events only
+
+`events.csv` is the **participant / experiment-workflow** stream. NPC lifecycle, movement and behaviour events are written **only** to `npc_events.csv` (and the other NPC streams); nothing is mirrored.
+The rule is by subject, not by name or payload: an event whose subject is an NPC is NPC data; a participant action stays in `events.csv` even if NPC activity happens in the same frame.
+The classification is the explicit set `CaptureConstants.IsNpcSubjectEvent` (no name-prefix rule); `DataCaptureManager.WriteEventRow` refuses any NPC-subject type or any row that carries an NPC identity,
+whichever path produced it (generic experiment callback, bus replay, late registration, buffered events), and counts refusals in `events_csv_npc_rows_rejected` (manifest; expected 0).
+
+| Category | `event_type` values (as written) | Notes |
+|---|---|---|
+| Session | `session_start`, `session_end` (`value_str` = end reason), `app_pause`, `app_focus` (`value_num` 1/0) | recorder lifecycle; pause/focus describe gaps in the participant's data |
+| Part / trial / phase | `part_start`, `part_end`, `recording_marker`, `trial_start`, `trial_end`, `phase_start`, `end_panel_visible`, Part 3: `phase_result`, `phase_timeout`, `phase_end` | workflow transitions |
+| Panels | `panel_shown`, `panel_confirmed`, `destination_shown`, `destination_confirmed` | participant-facing UI |
+| Selection | `target_assigned`, `candidate_interactable_on/off`, `building_click`, `correct_selection`, `incorrect_selection` | participant actions and outcomes (`value_num` = response time where the existing event defines it) |
+| Locomotion | `teleport`, `river_crossing` (+ `teleport_rejected` where raised) | `from_pos_*` / `to_pos_*` filled |
+| NPC warm-up window | `npc_warmup_start`, `npc_warmup_end` | **Workflow markers**: they delimit the pre-trial window in which the participant waits while NPCs already walk. They carry no NPC identity, are raised by `ExperimentManager`, and are written regardless of `npcCaptureEnabled`. The NPC files label the same window with `capture_period = warmup`. |
+
+Columns: `t_abs, t_unix_ms, event_type, part, phase, label, building_id, target_id, npc_id, npc_spawn_instance_id, from_pos_x..to_pos_z, value_num, value_str, session_id, interaction_id` (v6 appended `interaction_id`; nothing moved).
+`t_abs` = `Time.realtimeSinceStartupAsDouble` at the event (same clock as every stream), `t_unix_ms` = UTC ms. Blank = not applicable (`value_num` blank rather than 0, positions blank when the event has none).
+**`npc_id` and `npc_spawn_instance_id` are kept for compatibility and are always blank from `schema_version` 4.** NPC capture can be off while all of the above is recorded normally; the participant stream never depends on `npcCaptureEnabled`.
+Join a participant event to NPC data by time (`t_abs`) and `session_id`, or by `gaze.csv` `hit_npc_spawn_instance_id`; there is no NPC key in `events.csv`.
 
 ## 1. What each file is
 
 | File | Grain | Purpose | Written when |
 |---|---|---|---|
+| `events.csv` | one row per participant / workflow event | see §1a. **Not** an NPC file. | at each event |
 | `npc_lifetimes.csv` | one row per NPC **lifetime** | Attributes that are constant for a lifetime: identity, provenance times, itinerary, configured speeds, profile and *realised* appearance, uncertain parameters. Immutable dimension table. | once, at the spawn boundary (`Initialize`) |
 | `npc_events.csv` | one row per **event** | Lifecycle transitions and observed changes, stamped with the time they happened. | at each transition (buffered, flushed every frame and at lifecycle boundaries) |
 | `npc_state.csv` | one row per **active NPC per snapshot** | Position / motion time series. All active NPCs share one `t_abs` per snapshot. | every `npcStateSamplingIntervalSeconds` (budget-adjusted) while the NPC master switch is on |
@@ -51,7 +85,7 @@ State rows are ordered by `(npc_spawn_instance_id, sample_seq)` or `(t_abs)`; th
 | 20-22 | `mt_target_x,y,z` | float | m | The mover's current target (transform position if a target transform is set, else the target point) | `MoveToTarget.targetTransform` / `targetPosition` | sample (current state) | equals `pos` if there is no mover | `target_id`, `npc_events.dest_*` |
 | 23 | `nav_has_path` | 0/1 | - | Agent currently holds a path | `NavMeshAgent.hasPath` | sample | `0` off mesh | - |
 | 24 | `nav_path_pending` | 0/1 | - | Path computation not finished | `NavMeshAgent.pathPending` | sample | `0` off mesh | - |
-| 25 | `los_clear_to_participant` | 0/1 | - | `1` = no Default/Ground collider on the line HMD -> NPC head (pos + 1.6 m); `0` = blocked | `Physics.Linecast` from `CenterEyeAnchor` | sample | **blank** when no HMD transform exists | - |
+| 25 | `los_clear_to_participant` | 0/1 | - | `1` = confirmed clear line of sight NPC eye -> participant head; `0` = a genuine obstacle blocks it; **blank** = could not be answered (see `los_status`). Definition in §20 | `NpcLineOfSight.Query` | sample | **blank** whenever `los_status` is not `clear`/`blocked` (never 0) | - |
 | 26 | `session_id` | string | - | see §2 | `DataCaptureManager.SessionId` | each row | never | all files |
 | 27 | `part` | string | - | Part running when the snapshot was taken (`Part1/2/3`) | `DataCaptureManager.CurrentPart` | sample | never | `events.csv` |
 | 28 | `phase` | string | - | Part sub-phase (`idle`, Part 3: `d1_pending`, `d1_search`, `d2_pending`, `d2_search`, `ended`) | `CurrentPhase` | sample | never | `events.csv` |
@@ -67,11 +101,15 @@ State rows are ordered by `(npc_spawn_instance_id, sample_seq)` or `(t_abs)`; th
 | 41 | `uncertain_enabled` | 0/1 | - | **Configured**: the `UncertainBehavior` component is enabled for this lifetime (the profile roll `forceUncertain` or `uncertainProbability`, applied by `AgentFactory`). Constant within a lifetime | `UncertainBehavior.isActiveAndEnabled` | sample | **blank** when the prefab has no `UncertainBehavior` component (not applicable) | `npc_lifetimes.uncertain_behavior_enabled` |
 | 42 | `uncertain_state` | enum | - | **Runtime** state of the UncertainBehavior state machine at the sample: `walking` / `pause` / `hesitate` / `slow` / `detour` / `suspended_arrived` (see §7) | `UncertainBehavior.StateLabel` | sample (current state) | **blank iff `uncertain_enabled` is `0` or blank** (not applicable); never blank for an uncertain NPC | `npc_events` `npc_uncertain_state` |
 | 43 | `uncertain_look_phase` | enum | - | Look-around sub-phase of `hesitate`: `idle` / `turning` / `holding` / `returning` | `UncertainBehavior.LookPhaseLabel` | sample | blank unless `uncertain_state=hesitate` with look-around on | - |
+| 44 | `los_status` | enum | - | Why `los_clear_to_participant` has its value: `clear`, `blocked`, `missing_participant_target`, `missing_npc_origin`, `invalid_geometry`, `hit_buffer_overflow`, `query_error` (only conditions the code can really produce) | `NpcLineOfSight.Name` | sample | never blank | - |
 
 Snapshot semantics: every NPC with an open lifetime is in every snapshot (no sub-sampling). The interval between snapshots is `npcStateSamplingIntervalSeconds`, stretched only by the
 data budget (see §9); derive the true frequency from `t_abs`. Inactive pooled objects never appear. Rows stop at the End-panel freeze.
 
 ## 4. `npc_events.csv`
+
+This is the **authoritative stream for every NPC-subject event** (the table below is the complete list, and the exact set in `CaptureConstants.IsNpcSubjectEvent`). Each row links to `npc_lifetimes.csv`
+and `npc_state.csv` by `(session_id, npc_spawn_instance_id)` (blank for pool events that precede a lifetime), and to the participant timeline by `t_abs`.
 
 Columns: `t_abs, t_unix_ms, npc_id, npc_spawn_instance_id, event_type, pos_x, pos_y, pos_z, yaw, dest_x, dest_y, dest_z, speed_setting, path_corners, value_str, session_id, part, phase, lifetime_index, itinerary_index, target_id`
 
@@ -193,7 +231,7 @@ prewarm happens then) - the config of the Part selected in `ExternalSessionContr
 
 | `npcCaptureEnabled` | Behaviour |
 |---|---|
-| **false** | No rows in `npc_state.csv`, `npc_events.csv`, `npc_lifetimes.csv`, `npc_profiles.csv` (the files are not even created). No `npc_spawn` / `npc_despawn` / `npc_warmup_start` / `npc_warmup_end` rows in `events.csv`. `hit_npc_id` and `hit_npc_spawn_instance_id` are blank in `gaze.csv`. Lifecycle events are **discarded at raise time** - never queued, never replayed (the manifest only counts them: `npc_events_suppressed_by_master_switch`). The NPC simulation, gaze rows and trajectory rows are unaffected. |
+| **false** | No rows in `npc_state.csv`, `npc_events.csv`, `npc_lifetimes.csv`, `npc_profiles.csv` (the files are not even created). `events.csv` is unaffected (it never holds NPC rows; participant events and the warm-up window markers are still written). `hit_npc_id` and `hit_npc_spawn_instance_id` are blank in `gaze.csv`. Lifecycle events are **discarded at raise time** - never queued, never replayed (the manifest only counts them: `npc_events_suppressed_by_master_switch`). The NPC simulation, gaze rows and trajectory rows are unaffected. |
 | **true** | Prewarm / pool events, every lifetime's spawn, attribute row, events and position snapshots are recorded from the moment they happen (warm-up, Start-panel wait, pre-trial included). Trial state is **not** a gate; the only stop is the End-panel freeze. |
 
 **Gaze vs. NPC recording.** `gaze.csv` keeps being written under the Part's `gazeCaptureEnabled`. `hit_semantic_class` stays `NPC` when a ray hits an NPC collider, but the NPC identity columns are blank when NPC capture is off - "identity unavailable by configuration", **not** "not looking at an NPC".
@@ -209,7 +247,7 @@ Switching the flag while NPCs of the previous Part are alive is not supported (t
 
 Rule (`NpcStateRateController`): measured bytes per row (EMA) x active NPCs predicts the next snapshot; required interval `T = bytes x 60 / (budget x 1e6)`. Rising demand -> `1.05 x T` at once; falling demand decays x0.7 per snapshot only when `1.05 x T` is >20 % below the current interval; clamped to
 `[base, max]`. If `1.05 x T` exceeds the maximum the budget is *unachievable*: the interval stays at the maximum, one warning is logged (then at most once a minute) and the manifest records `exceeded_unachievable` with the real observed rate. No NPC is ever left out of a snapshot. The budget covers `npc_state.csv` only; lifecycle events, `npc_events.csv`,
-`npc_lifetimes.csv`, `npc_profiles.csv`, `events.csv`, headers and the manifest are never throttled. Manifest keys: `npc_state_base_interval_seconds`, `npc_state_max_interval_seconds`, `npc_state_data_budget_mb_per_minute`, `npc_state_budget_scope`, `npc_master_switch_semantics`, `npc_capture_effective_enabled`,
+`npc_lifetimes.csv`, `npc_profiles.csv`, `events.csv`, headers and the manifest are never throttled. Manifest keys: `events_csv_scope`, `events_csv_npc_rows_rejected` (routing guard, expected 0), `npc_state_base_interval_seconds`, `npc_state_max_interval_seconds`, `npc_state_data_budget_mb_per_minute`, `npc_state_budget_scope`, `npc_master_switch_semantics`, `npc_capture_effective_enabled`,
 `npc_events_suppressed_by_master_switch`, `npc_state_snapshots`, `npc_state_rows`, `npc_state_bytes_written`, `npc_state_max_active_npcs`, `npc_state_effective_interval_{last,min,max}_seconds`, `npc_state_actual_hz_mean`, `npc_state_observed_mb_per_minute_{last,peak,session_mean}`, `npc_state_budget_status`, `npc_state_throttled_snapshots`, `npc_state_budget_exceeded_snapshots`.
 
 ## 10. Storage layout decision: one long-format `npc_state.csv` per session
@@ -227,3 +265,154 @@ Evaluated against the implementation (`CaptureCsvWriter` = lazy file, open/appen
 
 **Decision: keep Option A.** The composite lifetime ID already separates trajectories, the budget controller bounds the volume, and per-lifetime files would be ~85x more expensive per tick on this measurement and far worse for analysis. If a single file ever becomes unwieldy (the controller reports ~50 MB/min at 300 NPCs and 10 Hz),
 prefer lowering the rate / using the budget, then Option C (rotate by Part or by size, e.g. `npc_state.001.csv`, with an index in the manifest and unchanged schema and keys) - not per-lifetime files. Not implemented: no concrete limitation was demonstrated. Quest storage / write throughput is unmeasured.
+
+
+## 11. `gaze.csv` (schema v5)
+
+Columns 1-55 are unchanged in order and name (`time_since_start_s` ... `hit_is_interactable`). Appended in v5, in this order:
+`part, phase, ray_is_eye_gaze, ray_origin_x, ray_origin_y, ray_origin_z, ray_dir_x, ray_dir_y, ray_dir_z, hit_is_current_target, hit_assigned_destination`.
+
+**Validity (F-16).** `left_valid` / `right_valid` = `OVREyeGaze.Confidence >= minConfidenceForValid`; `combined_valid` = at least one eye valid. These flags are the ONLY validity authority.
+| Field group | Valid | Invalid / unavailable |
+|---|---|---|
+| `left_origin_*`, `left_dir_*` | the eye's world origin / forward (zeros are legitimate values and are written as `0.0000`) | **blank** (all 6 cells) |
+| `right_origin_*`, `right_dir_*` | same | blank |
+| `combined_origin_*`, `combined_dir_*` | mean of valid eyes / the single valid eye (`gaze_ray_source` = `both`/`left`/`right`) | **blank** (source `head_fallback`) |
+| `left_confidence`, `right_confidence`, `combined_confidence` | measured value, `F3` | still written (`0.000` when the component is absent) - a confidence is a measurement, not a vector |
+
+Earlier versions wrote the eye transform (or the head pose) into these columns even when invalid, so a plausible-looking vector next to `*_valid = 0` could be mistaken for gaze. Blank cells now mean "no eye-gaze vector", never zero.
+**Fallback ray.** When no eye is valid the recorder still raycasts along the head-forward ray (unchanged behaviour). That ray is recorded in `ray_origin_*` / `ray_dir_*` (always filled; the ray actually cast) and marked by `ray_is_eye_gaze = 0` (and `gaze_ray_source = head_fallback`).
+`ray_is_eye_gaze = 1` iff `combined_valid = 1`. All `hit_*` columns describe the raycast target regardless of the ray type, so **restrict fixation analyses to `ray_is_eye_gaze = 1`**; the legacy `roi_hit_name` / `roi_hit_distance` stay blank for invalid gaze (unchanged).
+A row with `gaze_ray_source = head_fallback` is not a valid eye-gaze sample and is counted as `fallback` (never `valid`) in the manifest.
+
+**`part` / `phase`** - `DataCaptureManager.CurrentPart` / `CurrentPhase` at the sample time (blank when no capture manager exists). See §13.
+**`hit_is_current_target`** - `1`: the hit is (inside) the building that is the ACTIVE search target at this sample; `0`: anything else that was hit (other destination, earlier target, unassigned building, NPC, terrain ...); **blank**: nothing hit, or not determinable (no capture manager).
+**`hit_assigned_destination`** - `D1` / `D2` when the hit building is one of the session's assigned destinations (whether or not it is current), else blank.
+
+## 12. AOI classes and the current target (F-05)
+
+`hit_semantic_class` taxonomy is unchanged: `NPC, TARGET_BUILDING, CANDIDATE_BUILDING, BUILDING, TERRAIN, WATER, UI, OTHER, NONE`. Only the meaning of `TARGET_BUILDING` changed: it is **the currently active target**,
+`DataCaptureManager.CurrentTargetBuilding` = (Part 3 phase `d1_search` -> assigned D1, `d2_search` -> assigned D2) AND that building's `TargetSelectable` is enabled right now. It is derived from live state on every sample by object reference (never from a name, never cached);
+the collider cache holds only target-independent facts. D1 and D2 stay assigned for the whole session, so: during `d1_search`, D1 is `TARGET_BUILDING` / `hit_is_current_target = 1`, D2 is `CANDIDATE_BUILDING` (or `BUILDING`) with `hit_is_current_target = 0` and `hit_assigned_destination = D2`;
+during `d1_pending` / `d2_pending` (panel reading) and after a search ended neither is current. `hit_building_id` is still the GameObject name; `hit_semantic_class`, `hit_building_id`, `hit_is_current_target` and `hit_assigned_destination` are evaluated together for the same sample.
+
+## 13. Phase labels (F-06)
+
+`phase` is the experiment sub-phase in force at the row's own timestamp (set by `ExperimentManager.SetPhase`, relayed as the `phase_start` event, kept in `DataCaptureManager.CurrentPhase`). The phase is set BEFORE `BeginTrial()` so the first sample of a trial is already labelled correctly.
+Where it appears: `events.csv` (`phase` column, plus a `phase_start` row at every boundary with `label` = new phase), `npc_state.csv`, `npc_events.csv`, and (v5) `gaze.csv` and `trajectory.csv`. A phase label can be reconstructed from the `phase_start` events by timestamp (that is how the tests validate it).
+
+| Part | Phase | Starts | Ends | Meaning / what is recorded |
+|---|---|---|---|---|
+| any | `idle` | `part_start` | first `phase_start` | before the first labelled phase (Part 3: warm-up and Start panel; no trial is open, so no gaze/trajectory rows) |
+| 2 | `p2_start_pending` | Start panel requested | participant confirms Start | **instruction / panel reading**; no trial open -> no gaze/trajectory rows (intentional gap) |
+| 2 | `p2_task1` | before `trial_start` | Continue panel shown | **active task**, first timed period (`part2FirstDuration`) |
+| 2 | `p2_continue_pending` | Continue panel shown | participant confirms Continue (teleport) | **panel reading, trial still open and recorded** - labelled so it is never mixed into task time |
+| 2 | `p2_task2` | confirm / teleport | timer ends | **active task**, second period (`part2SecondDuration`) |
+| 2, 3 | `ended` | trial ended | `part_end` | End panel / post-task |
+| 3 | `d1_pending` | before `trial_start` | D1 Continue click | D1 destination panel reading (trial open, recorded, **not search time**) |
+| 3 | `d1_search` | D1 Continue | D1 found or limit | D1 search (D1 current target) |
+| 3 | `d2_pending` / `d2_search` | D2 panel / D2 Continue | ... | same for D2 |
+
+**Task duration** = sum of the active-task phases' spans taken from `phase_start` timestamps (Part 2: `p2_task1` + `p2_task2`; Part 3: the existing D1/D2 search intervals, unchanged). The trial window `trial_start` -> `trial_end` still contains the reading time (the experiment timing is unchanged); subtracting the `*_pending` spans gives task time.
+`npc_warmup_*` markers keep their meaning. Samples are intentionally absent while no trial is open: the recorders treat that as an intentional gap (§15), not a sensor failure.
+
+## 14. `trajectory.csv` (schema v5)
+
+Columns unchanged; appended `part, phase` (same meaning as §13).
+
+## 15. Achieved sampling rates (F-18) - `rate_gaze`, `rate_trajectory` in the manifest
+
+Nominal rates (`gaze sampleRate` = 30 Hz, `trajectoryHz` = 20 Hz) are targets only; they are written as `nominal_hz` next to the achieved values. The achieved values come from `SamplingStats`, fed only by SUCCESSFULLY written rows with their own monotonic `t_abs`
+(`Time.realtimeSinceStartupAsDouble`; the Unix clock is auxiliary and not used).
+* **Epoch**: a run of consecutive samples without an intentional gap. An epoch ends (`BreakEpoch`) at an application pause / focus loss, when the capture gate closes (trial not open, End panel, capture disabled for the Part) and when the recorder stops. `epochs`, `intentional_breaks` count them. The interval across a break is never counted.
+* **Interval**: difference of consecutive `t_abs` inside one epoch. `observed_hz = intervals / sum(intervals)` (= 1 / mean interval); `mean_interval_s`, `max_interval_s` are exact; `median_interval_s`, `p95_interval_s` come from a ring buffer of the most recent 4096 in-epoch intervals (linear interpolation).
+* **Unexpected gap**: an in-epoch interval > `gap_threshold_s = max(3 x nominal interval, 0.1 s)` (a stall, hitch or missed ticks). It stays in the statistics and is counted in `unexpected_gaps`. Non-positive intervals (duplicate / out-of-order stamps) are counted in `non_monotonic` and excluded. No per-frame warnings are printed.
+* **Unknown**: with fewer than 10 in-epoch intervals `available = false`, `status = insufficient_samples` (or `no_samples`) and every numeric statistic is **-1** (unknown, never 0).
+* **Gaze row rate vs valid-eye rate**: `rate_gaze` is the rate of rows written (valid + fallback). `gaze_valid_eye_fraction = gaze_rows_valid_eye / health_gaze.rows_written` and `gaze_valid_eye_rate_hz = observed_hz x fraction` (both -1 when unknown); `gaze_rows_fallback` are head-fallback rows.
+Because trajectory / gaze rows are not written while no trial is open, a whole-session mean would be meaningless; these statistics are per epoch by construction.
+
+## 16. Manifest evidence (F-09)
+
+`session_manifest.json` is rewritten at checkpoints (session start, part start, trial start/end, application pause, resume, a write error, session end) and never per sample. Configuration, capability and evidence are separate:
+* **Configuration**: `part1_config..part3_config` (static), `StreamHealth.configured_now` / `ever_configured` (the Part's flag at the last checkpoint / at any checkpoint).
+* **Capability**: `eye_tracking_supported_state`, `eye_tracking_enabled_state`, `eye_tracking_permission_state` = `"true"` / `"false"` / `"unknown"` (unknown: not queryable on this platform - the Android runtime permission is only queryable in an Android player; in the Editor a `false` from the SDK is reported as `unknown`; or the SDK threw), re-queried at every checkpoint (`eye_tracking_queried_t_abs`). The legacy bools (`eye_tracking_supported/enabled/permission_granted`) are startup snapshots and cannot express unknown.
+* **Evidence** (`health_events`, `health_trajectory`, `health_gaze`, `health_npc_state`, `health_npc_events`, `health_npc_lifetimes`, `health_npc_profiles`), each a `StreamHealth`: `status`, `writer_initialised`, `rows_written`, `write_errors`, `first_row_t_abs`, `last_row_t_abs` (-1 = none), `last_error` (exception type + message, no paths).
+  Counters come from the writers (`CaptureCsvWriter.RowsWritten`, `GazeRecorder.RowsWritten`) and are cumulative: a later failure does not erase earlier history.
+  `status`: `not_configured` (never enabled at any checkpoint) | `disabled_by_master_switch` (NPC streams while `npcCaptureEnabled` was never true - expected absence, not a failure) | `configured_no_rows` | `ok` (rows written, no error) | `write_error` (errors > 0; `rows_written` keeps the earlier rows).
+* **Gaze counters**: `gaze_recorder_present`, `health_gaze.*`, `gaze_rows_valid_eye`, `gaze_rows_fallback`, `gaze_rows_left_valid`, `gaze_rows_right_valid`, `gaze_recording_starts`, `gaze_pause_count`, `gaze_resume_count`. Existence of the recorder, a header on disk, or `npcCaptureEnabled = true` is never treated as success.
+* **Lifecycle**: `trials_started/ended`, `app_pause_count`, `app_resume_count`, `manifest_updates`, `last_manifest_update_reason`, `last_manifest_update_t_abs`. A resume checkpoint clears `ended_utc` / `end_reason` that the pause snapshot had set.
+* **Legacy flags**: `gaze_ok`, `trajectory_ok`, `events_ok`, `npc_state_ok`, `npc_events_ok`, `npc_lifetimes_ok` are now `status in {ok, not_configured, disabled_by_master_switch}`: true = "nothing expected is missing and nothing failed"; false = a configured stream never wrote a row, or a write failed. Read `health_*` for the detail.
+
+
+## 17. `events.csv`: `value_num` (F-07) and `interaction_id` (F-11)
+
+**`value_num`** is a number only when the event has one. The writer takes `double?` (presence is explicit; the value is never used to guess presence): a supplied value, **including 0**, is written fixed 4 decimals, invariant culture (`0.0000`, `12.5000`, `-3.2500`);
+an absent value is an **empty field**. Examples: `app_pause` / `app_focus` carry 1 or **0** (0 = resumed / focus lost); `phase_result` / `correct_selection` / `incorrect_selection` / `phase_end` carry an elapsed time that may be a real 0
+(`d2_skipped` records 0 s); `panel_shown`, `session_start`, `part_start`, `phase_start`, `trial_start/end`, `building_click`, `teleport`, `river_crossing`, `target_assigned` carry none and stay blank. `NaN` is never written (blank = unknown).
+
+**Click -> outcome linkage.** One accepted physical click -> one `building_click` row -> **zero or one** outcome row (`correct_selection` or `incorrect_selection`). They stay two records with different meanings:
+* `building_click`: the raw interaction (`t_abs` = the click). `building_id`/`target_id` = the clicked building.
+* `correct_selection` / `incorrect_selection`: the experiment's assessment (`t_abs` = when the scoring loop committed it, the same frame or a later one; `value_num` = seconds since that destination's search started, measured from the CLICK's own stamp; `label` D1/D2).
+* `interaction_id` (`C000001`, `C000002`, ...) is allocated once in `TargetSelectable.Select()` (session-scoped counter, reset when a capture session starts), recorded on the click and carried through `ExperimentManager.RegisterTargetSelection` into the outcome. It is blank on every other event type.
+  The id - not the timestamp - is the link. Different clicks (even on the same building) always get different ids.
+* A second callback for the same physical click (OnPointerClick + OnMouseDown, two interactors; same building, same frame, or re-entrant) is ignored: no second click, no second outcome (`duplicate_clicks_ignored` in the manifest). A second outcome for an id that already has one is refused (`duplicate_outcomes_rejected`).
+* A click may legitimately have **no** outcome: it happened while no scoring window was open (Part 1, Part 2, Part 3 panel-reading phases, after a search ended), it came after the correct answer in the same frame (the rest of that frame's queue is discarded), or it came after the search limit. Clicks while the participant is locked (before Start, End panel) are not recorded at all.
+
+**Counting rules**: clicks = distinct `interaction_id` among `building_click`; evaluated selections = distinct ids among `correct_selection` + `incorrect_selection`; correct / incorrect = distinct ids of that type; unresolved clicks = click ids without an outcome. Do not de-duplicate by time, building or participant.
+(Event-row count > click count is expected: each evaluated click is two rows.)
+
+## 18. Experiment timing (F-08)
+
+* **One clock.** Every experiment timer and stamp uses `CaptureClock.TAbs` = `Time.realtimeSinceStartupAsDouble`: monotonic, independent of `Time.timeScale`, not clamped by `Time.maximumDeltaTime`; the same basis as every `t_abs` in every stream. `t_unix_ms` is wall-clock metadata (alignment only), never used for durations.
+* **Timers on it** (`ExperimentManager.WaitExperimentSeconds` and the Part 3 `Part3ValidTiming` calls): NPC warm-up wait, Part 1 duration, Part 2 first and second durations, Part 3 D1 limit, total budget, D2 budget, click stamps, `trial_start`/`trial_end`, `phase_*`. Before v6 Parts 1, 2 and the warm-up accumulated `Time.deltaTime`, which Unity clamps (0.333 s here): a 2 s hitch advanced the accumulator by 0.333 s, so those tasks ran longer than configured.
+  Movement, animation and physics keep using `Time.deltaTime`; configured durations and thresholds are unchanged.
+* **Pause policy (all Parts).** Application suspension **counts** as elapsed experiment time (wall-clock deadlines, as Part 3 always did). It is not hidden: `app_pause` (`value_num` 1) / `app_pause` (0) and `app_focus` rows carry their own `t_abs`, `app_pause_count` / `gaze_pause_count` are in the manifest, so
+  *participant-active duration = measured span - sum of suspended intervals* can be reconstructed. (Before v6 Parts 1/2 effectively excluded a long suspension because the first frame after it is clamped; that implicit behaviour is gone.)
+* **Quantities (do not call them all "response time")**: monotonic elapsed time (`t_abs` differences); wall-clock time (`t_unix_ms`); *phase/task duration* (differences of `phase_start` rows, e.g. `p2_continue_pending - p2_task1`); *trial duration* (`trial_end - trial_start`, includes panel reading); *configured maximum* (Inspector); *actual timeout / completion* (`phase_timeout` / outcome rows with their `value_num` elapsed);
+  *response time* proper = `value_num` of `correct_selection` / `incorrect_selection` (seconds from the destination's Continue click to the click). Event stamps are taken when the event is raised; a timer overshoots its deadline by at most one frame.
+* Phase is set before `BeginTrial()`, so `trial_start` is never preceded by an unlabelled sample.
+
+## 19. Data-integrity checks that the tests make
+
+`value_num`: zero vs missing parse differently; `interaction_id`: every click has one, every outcome points at a click, no id has two outcomes; timing: a 5.2 s injected clock jump ends a 5 s Part 2 task, a 5.3 s jump a 5 s Part 1 trial and a 6 s jump a 5 s Part 3 D1 limit within one frame; suspension counts and is reconstructable.
+
+
+## 20. NPC line of sight (F-10) - `los_clear_to_participant`, `los_status`
+
+* **Query** (`NpcLineOfSight.Query`, once per NPC per snapshot): segment from the NPC's **eye point** to the participant's **head target** (the `CenterEyeAnchor`, i.e. the HMD). Eye point = the humanoid Animator's head bone when present, otherwise 90 % of the NavMeshAgent height (or of the top of its non-trigger colliders) above the NPC root.
+  No fixed 1.6 m guess is used. The shipped `Npc.prefab` carries 9 capsule, 1 sphere and 2 box colliders, all non-trigger on layer Default under a humanoid skeleton.
+* **Obstacles**: every non-trigger collider in the LOS mask (Default | Ground) that is not (a) any collider under the querying NPC's own transform, nor (b) any collider under the participant rig or the head target. Other NPCs, buildings, terrain and props **do** occlude; trigger colliders are ignored.
+  All hits within the segment are examined (hits are not assumed sorted), so an NPC's own colliders in front of a wall never mask the wall. A reusable 32-entry hit buffer is used (retried once with 256); no per-query allocation.
+* **Values**: `1` / `clear`: no obstacle among the hits. `0` / `blocked`: at least one obstacle (conclusive even if the buffer filled). **Blank**: `missing_participant_target` (no HMD transform), `missing_npc_origin`, `invalid_geometry` (NaN or target at the origin), `hit_buffer_overflow` (256 hits and no obstacle among them: not decidable), `query_error`. Unknown is never reported as blocked.
+* **Cause of the pre-v7 defect**: the linecast ran from the participant to `NPC position + 1.6 m`, a point inside the NPC's own capsule, so it hit the NPC's own Default-layer colliders on almost every sample (`los = 0`). Old files: ignore `los_clear_to_participant`.
+* **Limits**: line of sight is geometric (collider based), not visual: it ignores field of view, lighting, transparent materials without colliders and colliders on other layers. The participant's endpoint is the HMD position, not an eye-tracked gaze point. The manifest carries cumulative counts
+  (`npc_los_clear`, `npc_los_blocked`, `npc_los_unavailable` + one counter per unavailable reason) as a quick distribution check; there is no target distribution.
+
+## 21. Recording failures (F-13) - `capture_errors.csv` and `StreamHealth`
+
+* **Policy** (`CaptureCsvWriter`, used by every CSV stream including gaze): the first I/O error puts the stream in state **Failed**; the failing step is classified `open | header | append | flush`. An unconditional `Debug.LogError` (independent of `enableDebugLogs`) is issued once per failure and once on permanent failure; recoveries and failed retries are warnings; dropped rows are never logged individually.
+  A failed batch is never retried (a partial write could duplicate rows) and `partial_output_possible` is set for append/flush failures (the last line of the file may be incomplete). After a 2 s cool-down the writer makes up to 3 **recovery attempts** on the next offered row (re-create the file header if the file is empty/missing, terminate a possibly partial last line, probe-append);
+  success => state **Recovered** (never silently `ok`), `MaxRecoveryAttempts` failures => **permanently failed** (state stays Failed; no more attempts). Streams are independent: a failure never touches another stream.
+* **Counters** (per stream; each changes only at the point it becomes true): `rows_attempted` = `rows_written` + `rows_failed` (the batch that raised the error) + `rows_dropped_after_failure` (offered while Failed); `write_errors`; `first_row_t_abs` / `last_row_t_abs` (first/last SUCCESSFUL write); `first_error_t_abs` / `last_error_t_abs`;
+  `last_error_operation`, `last_error_type`, `last_error` (type + sanitised message, no paths); `recovery_attempts`; `writer_state` (`operational | failed | permanently_failed | recovered`); `partial_output_possible`.
+* **Manifest status**: `ok`, `write_error` (currently failed), `recovered` (failed earlier, writing again - rows were lost in the gap), `configured_no_rows`, `not_configured`, `disabled_by_master_switch`. Intentional disabling is never `write_error`. A transition triggers an immediate manifest checkpoint written by the manager, not by the failed stream.
+* **`capture_errors.csv`** (diagnostic channel; not a participant or NPC event stream): `session_id, t_abs, t_utc, stream_name, operation, error_type, error_message, rows_written_before_failure, rows_dropped, status, recovery_attempt`, one row per transition (`failed`, `recovery_failed`, `permanently_failed`, `recovered`; also `session_manifest` transitions).
+  It is a plain writer with no transition observer, so its own failure never reports itself. The in-memory `DataCaptureManager.FailureRegistry` and the Error log hold the same facts. **No disk-based channel can record a failure of the disk itself**: if the whole storage is gone, only the log and the in-memory registry exist.
+
+## 22. Participant identity and sessions (F-14)
+
+* **Participant ID** (`SessionIdentity.ValidateParticipantId`): kept exactly (trimmed). Valid: any non-empty text up to 64 characters without control characters or `/ \ : * ? " < > |`. `P012`, `12`, `A-07` are all valid; there is no required prefix or digit count. **Rejected**: empty/whitespace; known placeholders (`0`, `P000`, `UNKNOWN`, `UNKNOWN_SUBJECT`, `DEFAULT`, `NONE`, `NULL`, `TBD`, `PARTICIPANT`, `SUBJECT`, case-insensitive) and any all-zero ID (`00`, `p0000`). The list lives in one place (`SessionIdentity.PlaceholderIds`).
+* **Configuration source** (`ExternalSessionController`): `useExternalJson = true` => the file `<persistentDataPath>/<externalFileName>` is the ONLY source. It must exist, be valid JSON, contain `participantId`, `selectedPart` (Part1-3), `part2GroupIndex`, `part3GroupIndex` (0..11) and a valid ID; values are applied only if all validate. Any failure => `UnresolvedConfig`, **no fallback to Inspector values**.
+  `useExternalJson = false` => the Inspector values are validated on their own; no JSON file is read (the file `Assets/Scripts/session_config.json` in the repository is not read by any code). The source (`config_source`), the file name and an FNV-1a hash of the applied JSON text (`config_hash`) are in the manifest.
+* **Fail closed**: if the identity/configuration is invalid (or there is no `ExternalSessionController`), `DataCaptureManager` creates **no** folder, CSV, manifest or `capture_errors.csv`, discards queued NPC lifecycle events (they are never replayed under a later identity), drops later ones at the gate, refuses to start the gaze recorder (also no legacy fall-back file), and logs `RECORDING BLOCKED`;
+  `ExperimentManager` refuses `StartSelectedPart` / `StartPart1-3` (so auto-start does not run). NPC simulation and the scene otherwise keep working. The controller shows `identityStatus` / `identityMessage` in the Inspector. **The scene as shipped at the time of this change has `participantId: 0` with `autoStart: 1`: it is blocked until a real ID is set.**
+* **Session identity**: `run_guid` (32 hex, once per session, in the manifest) -> `session_id` = `<UTC yyyyMMddTHHmmssZ>_<first 12 hex of run_guid>` = the folder name = the `session_id` column of every stream. The participant ID is **not** part of it and is never sanitised; it is stored exactly in the manifest (`participant_id`) and in `gaze.csv` (`subject_id`).
+  The folder must not exist; up to 5 GUID draws; an existing directory is never reused (after 5 collisions the session is refused). Several sessions (Parts) of one participant are linked by the identical `participant_id` in their manifests; there is no shared "study run" id because the experiment has no such concept.
+
+## 23. Manifest persistence (F-19)
+
+`session_manifest.json` is built in memory and installed by `ManifestFileWriter.WriteAtomic`: unique temp file in the same folder (UTF-8, no BOM) -> `Flush(true)` -> read back and strictly validated (complete JSON object with an integer `manifest_revision`) -> a valid current file is copied to `session_manifest.json.bak`, an invalid one is renamed `*.corrupt-<time>` ->
+install with `File.Move` (no final yet) or `File.Replace(tmp, final, null)` (a single rename on POSIX, `ReplaceFile` on NTFS). Only if the runtime reports the replace as unsupported, the **non-atomic fallback** `File.Copy(tmp, final, true)` is used (`manifest_last_install_mode = copy_fallback`); the validated temp file and the `.bak` remain for recovery.
+The final file is never deleted before its replacement exists, and a failure at any step leaves the previous valid manifest untouched. Writes are serialised (main thread only); `manifest_revision` increases per attempt; failures are counted (`manifest_write_failures`, `manifest_last_error`), logged once per failure episode, listed in `capture_errors.csv` (`session_manifest`) and retried at the next checkpoint.
+**Recovery** (`ManifestFileWriter.Recover`): among the final, the `.bak` and any `*.tmp`, the valid file with the highest `manifest_revision` wins (ties: final > backup > tmp); an invalid final is preserved as `.corrupt-*`; a newer valid generation is never replaced by an older one; an incomplete temp file is never a candidate.
+**Durability**: the replace makes the swap atomic with respect to process termination on POSIX/NTFS, and `Flush(true)` asks the OS to write through; neither is a guarantee against sudden power loss, and the Android IL2CPP behaviour of `File.Replace` was not tested (hence the explicit fallback).

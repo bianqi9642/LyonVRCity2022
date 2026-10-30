@@ -5,8 +5,7 @@
 //
 // First-match priority:
 //   1. PedestrianAgent in parents                                   -> NPC
-//   2. TargetSelectable in parents, owner is the assigned building  -> TARGET_BUILDING
-//   3. TargetSelectable in parents, owner is a Part3 candidate /
+//   2. TargetSelectable in parents, owner is a Part3 candidate /
 //      Part1 target                                                 -> CANDIDATE_BUILDING
 //      (any other TargetSelectable)                                 -> BUILDING
 //   4. MeshCollider + Default layer + name in the registry /
@@ -15,8 +14,13 @@
 //   7. layer == UI or a Canvas in parents -> UI
 //   8. anything else that was hit -> OTHER      9. nothing hit -> NONE
 //
+// TARGET_BUILDING (schema v5) means "the building that is the ACTIVE search target at this very sample": DataCaptureManager.CurrentTargetBuilding
+// (Part 3 phase d1_search -> D1, d2_search -> D2, and its TargetSelectable currently enabled). It is derived from live state on EVERY call by reference
+// comparison; it is never cached and never inferred from a GameObject name. D1 and D2 stay assigned all session, so the other destination, earlier targets and
+// panel-reading phases are NOT current: they keep the candidate / building class and hit_is_current_target = 0 (hit_assigned_destination still names D1/D2).
+//
 // building_id is always GameObject.name (frozen decision). targetId is never used as identity.
-// A one-entry collider cache skips hierarchy re-resolution during a fixation.
+// A one-entry collider cache skips hierarchy re-resolution during a fixation; it holds only target-INDEPENDENT facts (base class, owner object).
 // All comments in English per project convention.
 
 using System.Text.RegularExpressions;
@@ -31,6 +35,8 @@ public static class AoiClassifier
         public string npcId;
         public string npcSpawnInstanceId;
         public string isInteractable;   // "1" / "0" / ""
+        public string isCurrentTarget;  // "1" = the hit is (inside) the currently ACTIVE target building; "0" = anything else that was hit; "" = no hit / not determinable (no DataCaptureManager)
+        public string assignedDestination; // "D1" / "D2" when the hit building is an assigned destination of this session (current or not), else ""
         public string colliderName;
         public string objectName;
         public int    instanceId;
@@ -41,7 +47,7 @@ public static class AoiClassifier
     public static readonly HitInfo None = new HitInfo
     {
         semanticClass = "NONE", buildingId = "", npcId = "", npcSpawnInstanceId = "",
-        isInteractable = "", colliderName = "", objectName = "", instanceId = 0, layer = -1, tag = ""
+        isInteractable = "", isCurrentTarget = "", assignedDestination = "", colliderName = "", objectName = "", instanceId = 0, layer = -1, tag = ""
     };
 
     // one-entry cache (per fixation)
@@ -49,6 +55,7 @@ public static class AoiClassifier
     static string s_class, s_buildingId, s_colliderName, s_objectName, s_tag;
     static int s_instanceId, s_layer;
     static TargetSelectable s_ts;   // may be null
+    static GameObject s_owner;      // resolved building owner (TargetSelectable path), may be null
     static PedestrianAgent  s_pa;   // may be null
 
     /// <summary>Number of gaze hits on an NPC that had no open lifetime (blank npc_spawn_instance_id). Diagnostic; see DataCaptureManager.NoteUnresolvedNpcHit.</summary>
@@ -80,7 +87,22 @@ public static class AoiClassifier
         }
 
         HitInfo info;
-        info.semanticClass      = s_class;
+        // Target-dependent part, recomputed every call from live state (a cached collider must never keep obsolete target status).
+        string cls = s_class;
+        bool buildingLike = cls == "BUILDING" || cls == "CANDIDATE_BUILDING";
+        GameObject current = dcm != null ? dcm.CurrentTargetBuilding : null;
+        bool isCurrent = current != null && buildingLike && ((s_owner != null && s_owner == current) || hit.transform.IsChildOf(current.transform));
+        if (isCurrent) cls = "TARGET_BUILDING";
+        info.isCurrentTarget = dcm == null ? "" : (isCurrent ? "1" : "0");
+        GameObject roleOwner = s_owner;
+        if (dcm != null && roleOwner == null && buildingLike)
+        {
+            if (dcm.AssignedBuildingD1 != null && hit.transform.IsChildOf(dcm.AssignedBuildingD1.transform)) roleOwner = dcm.AssignedBuildingD1;
+            else if (dcm.AssignedBuildingD2 != null && hit.transform.IsChildOf(dcm.AssignedBuildingD2.transform)) roleOwner = dcm.AssignedBuildingD2;
+        }
+        info.assignedDestination = dcm != null && buildingLike ? dcm.AssignedDestinationRole(roleOwner) : "";
+
+        info.semanticClass      = cls;
         info.buildingId         = s_buildingId;
         info.colliderName       = s_colliderName;
         info.objectName         = s_objectName;
@@ -119,6 +141,7 @@ public static class AoiClassifier
         s_tag          = SafeStr(go.tag);
         s_ts           = null;
         s_pa           = null;
+        s_owner        = null;
         s_buildingId   = "";
         s_objectName   = SafeStr(go.name);
 
@@ -138,14 +161,10 @@ public static class AoiClassifier
         {
             s_ts = ts;
             GameObject owner = ResolveCandidateOwner(ts.transform, em) ?? ts.gameObject;
+            s_owner = owner;
             s_buildingId = SafeStr(owner.name);
             s_objectName = SafeStr(owner.name);
 
-            if (dcm != null && (owner == dcm.AssignedBuildingD1 || owner == dcm.AssignedBuildingD2))
-            {
-                s_class = "TARGET_BUILDING";
-                return;
-            }
             if (em != null && IsExperimentCandidate(owner, em))
             {
                 s_class = "CANDIDATE_BUILDING";

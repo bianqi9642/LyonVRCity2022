@@ -375,7 +375,9 @@ public class ExperimentManager : MonoBehaviour
     // stale or unrelated clicks can never be scored later.
     // Each entry carries the click's own realtime stamp (taken in RegisterTargetSelection, i.e. in the click callback): when the
     // target is found, that stamp - not the later frame in which the loop notices it - is the search endpoint.
-    private struct PendingSelection { public string id; public double realtime; }
+    private struct PendingSelection { public string id; public double realtime; public string interactionId; }
+    // interaction ids already queued for scoring: one physical click is scored at most once even if its callback runs again
+    private readonly HashSet<string> queuedInteractions = new HashSet<string>();
     private readonly Queue<PendingSelection> pendingSelections = new Queue<PendingSelection>();
     private bool selectionWindowOpen;
 
@@ -390,7 +392,7 @@ public class ExperimentManager : MonoBehaviour
     private double endPanelVisibleRealtime = double.NaN;   // NaN = the display moment was not observed
 
     // Part 3 valid-exposure timing (see Part3ValidTiming): drives the D1 / D2 search limits AND the interval results from the same
-    // recorded endpoints. Created at the top of RunPart3 from the two Inspector maxima. Clock: Time.realtimeSinceStartupAsDouble,
+    // recorded endpoints. Created at the top of RunPart3 from the two Inspector maxima. Clock: CaptureClock.TAbs,
     // the same as events.csv t_abs.
     private Part3ValidTiming p3Timing;
     private bool p3D2Ran;
@@ -447,8 +449,21 @@ public class ExperimentManager : MonoBehaviour
         }
     }
 
+    // F-14: no participant Part (and therefore no auto-start) begins while the session identity/configuration is invalid. NPC simulation of a scene without a
+    // running Part is unaffected; only the participant trial is held back. A manager without a session controller has no identity source and is not gated here
+    // (the recorder is: DataCaptureManager refuses to persist anything without a valid identity).
+    private bool IdentityAllowsStart(string what)
+    {
+        if (sessionController == null) return true;
+        SessionIdentity.Result r = sessionController.ValidateIdentity();
+        if (r.IsValid) return true;
+        Debug.LogError($"ExperimentManager: {what} refused - invalid session identity/configuration ({r.status}): {r.message}");
+        return false;
+    }
+
     public void StartSelectedPart()
     {
+        if (!IdentityAllowsStart("StartSelectedPart")) return;
         if (sessionController == null)
         {
             Debug.LogError("ExperimentManager: Cannot StartSelectedPart because sessionController is null.");
@@ -463,14 +478,18 @@ public class ExperimentManager : MonoBehaviour
         }
     }
 
-    public void RegisterTargetSelection(object targetData = null)
+    public void RegisterTargetSelection(object targetData = null, string interactionId = "")
     {
         targetWasSelected = true;
         lastSelectedTargetData = targetData;
         Debug.Log("Target selected: " + (targetData ?? "unknown"));
 
         if (selectionWindowOpen)
-            pendingSelections.Enqueue(new PendingSelection { id = targetData != null ? targetData.ToString() : "", realtime = Time.realtimeSinceStartupAsDouble });
+        {
+            // One interaction id is scored at most once (a repeated callback for the same physical click is ignored here).
+            if (!string.IsNullOrEmpty(interactionId) && !queuedInteractions.Add(interactionId)) return;
+            pendingSelections.Enqueue(new PendingSelection { id = targetData != null ? targetData.ToString() : "", realtime = CaptureClock.TAbs, interactionId = interactionId ?? "" });
+        }
 
         if (currentRunningPart == RunningPart.Part1 && !part1ContinuePanelOpen && uiManager != null)
         {
@@ -558,7 +577,7 @@ public class ExperimentManager : MonoBehaviour
         if (endPanelDisplayHandled) return;
         endPanelDisplayHandled = true;
 
-        double nowRt = Time.realtimeSinceStartupAsDouble;   // first statement: nothing below may shift the recorded endpoint
+        double nowRt = CaptureClock.TAbs;   // first statement: nothing below may shift the recorded endpoint
         if (displayObserved)
         {
             endPanelVisibleRealtime = nowRt;
@@ -687,6 +706,7 @@ public class ExperimentManager : MonoBehaviour
     public void StartPart1()
     {
         if (RefuseStartAfterEnd("StartPart1")) return;
+        if (!IdentityAllowsStart("StartPart1")) return;
         if (runningCoroutine != null) StopCoroutine(runningCoroutine);
         runningCoroutine = StartCoroutine(RunPart1());
     }
@@ -694,6 +714,7 @@ public class ExperimentManager : MonoBehaviour
     public void StartPart2()
     {
         if (RefuseStartAfterEnd("StartPart2")) return;
+        if (!IdentityAllowsStart("StartPart2")) return;
         if (runningCoroutine != null) StopCoroutine(runningCoroutine);
         runningCoroutine = StartCoroutine(RunPart2());
     }
@@ -701,6 +722,7 @@ public class ExperimentManager : MonoBehaviour
     public void StartPart3()
     {
         if (RefuseStartAfterEnd("StartPart3")) return;
+        if (!IdentityAllowsStart("StartPart3")) return;
         if (runningCoroutine != null) StopCoroutine(runningCoroutine);
         runningCoroutine = StartCoroutine(RunPart3());
     }
@@ -723,8 +745,7 @@ public class ExperimentManager : MonoBehaviour
     /// BeginNpcWarmup(), no npc_warmup_start/end events, no wait. This Part is NPC-free.
     ///
     /// Otherwise: assigns spawner.defaultProfile, then (if npcWarmupDuration > 0) opens SpawnerManager's
-    /// warm-up spawning gate (BeginNpcWarmup), waits 'npcWarmupDuration' seconds of scaled time (consistent
-    /// with the existing Part-duration timers below, which also use Time.deltaTime rather than realtime),
+    /// warm-up spawning gate (BeginNpcWarmup), waits 'npcWarmupDuration' seconds on the shared experiment clock (see WaitExperimentSeconds),
     /// then closes the gate (EndNpcWarmup) immediately before returning. Never shows a panel, never fires
     /// OnTrialStart/OnTrialEnd, and never touches NPC movement/NavMeshAgent/Animator state directly - it only
     /// toggles SpawnerManager's existing spawning gates via its public API and raises two observer events for
@@ -757,17 +778,32 @@ public class ExperimentManager : MonoBehaviour
 
         RaiseEvt("npc_warmup_start", partLabel, numValue: npcWarmupDuration);
 
-        float wt = 0f;
-        while (wt < npcWarmupDuration)
-        {
-            wt += Time.deltaTime;
-            yield return null;
-        }
+        double warmupStart = CaptureClock.TAbs;
+        yield return WaitExperimentSeconds(npcWarmupDuration);
+        double wt = CaptureClock.TAbs - warmupStart;   // measured on the shared monotonic clock
 
         RaiseEvt("npc_warmup_end", partLabel, numValue: wt);
 
         if (spawner != null)
             spawner.EndNpcWarmup();
+    }
+
+    #endregion
+
+    #region Experiment clock
+
+    /// <summary>
+    /// THE experiment timer for every Part (F-08). Waits until 'seconds' of CaptureClock time (Time.realtimeSinceStartupAsDouble: monotonic, independent
+    /// of Time.timeScale, not clamped by Time.maximumDeltaTime) have elapsed since the call, checked once per frame. Parts 1 and 2 used to accumulate
+    /// Time.deltaTime, which Unity clamps to maximumDeltaTime, so a severe frame hitch shortened the measured duration; Part 3 already used realtime.
+    /// POLICY: application suspension COUNTS as elapsed experiment time (wall clock, same as Part 3's D1/D2 limits, which this method matches). The
+    /// suspension is not hidden: app_pause / app_focus rows with their own t_abs are in events.csv, so the participant-active duration can be reconstructed
+    /// as (elapsed - sum of suspended intervals). Durations and thresholds themselves are unchanged. Movement, animation and physics keep using Time.deltaTime.
+    /// </summary>
+    private static IEnumerator WaitExperimentSeconds(double seconds)
+    {
+        double start = CaptureClock.TAbs;
+        while (CaptureClock.TAbs - start < seconds) yield return null;
     }
 
     #endregion
@@ -799,12 +835,7 @@ public class ExperimentManager : MonoBehaviour
         BeginTrial();
 
         targetWasSelected = false;
-        float t = 0f;
-        while (t < part1Duration)
-        {
-            t += Time.deltaTime;
-            yield return null;
-        }
+        yield return WaitExperimentSeconds(part1Duration);
 
         EndTrial();
 
@@ -848,40 +879,38 @@ public class ExperimentManager : MonoBehaviour
 
         yield return RunNpcWarmup(part2Config, "Part2");
 
+        // Phase labels for Part 2 (metadata only - no timing or flow depends on them): the Start panel is being read until the participant confirms.
+        SetPhase("p2_start_pending", "Part2");
         bool started = false;
         RaiseEvt("panel_shown", "Part2", label: "part2_start");
         uiManager.ShowPart2StartPanel(() => { started = true; RaiseEvt("panel_confirmed", "Part2", label: "part2_start"); });
         yield return new WaitUntil(() => started);
 
+        // The phase is set BEFORE the trial opens: recorders start sampling inside BeginTrial() (the first gaze row is written synchronously), so the very first
+        // sample of the trial already carries the correct phase instead of the previous one.
+        SetPhase("p2_task1", "Part2");   // active task, first timed period (part2FirstDuration)
         BeginTrial();
 
         targetWasSelected = false;
-        float t = 0f;
-        while (t < part2FirstDuration)
-        {
-            t += Time.deltaTime;
-            yield return null;
-        }
+        yield return WaitExperimentSeconds(part2FirstDuration);
 
         bool teleported = false;
+        SetPhase("p2_continue_pending", "Part2");   // Continue panel being read: the trial is open and recorded, but this is NOT task time
         RaiseEvt("panel_shown", "Part2", label: "part2_continue");
         uiManager.ShowPart2ContinuePanel(() =>
         {
             RaiseEvt("panel_confirmed", "Part2", label: "part2_continue");
             TeleportPlayerTo(chosenTeleport ?? (group.teleportPositions != null && group.teleportPositions.Length > 0 ? group.teleportPositions[0] : null));
             teleported = true;
+            SetPhase("p2_task2", "Part2");   // active task, second timed period (part2SecondDuration), from the confirm click / teleport
         });
 
         yield return new WaitUntil(() => teleported);
 
-        t = 0f;
-        while (t < part2SecondDuration)
-        {
-            t += Time.deltaTime;
-            yield return null;
-        }
+        yield return WaitExperimentSeconds(part2SecondDuration);
 
         EndTrial();
+        SetPhase("ended", "Part2");
 
         // End Panel hard stop at the moment the panel becomes visible (see RunPart1() for the full explanation).
         bool confirmed = false;
@@ -987,12 +1016,13 @@ public class ExperimentManager : MonoBehaviour
         uiManager.ShowPart3StartPanel(() => { started = true; RaiseEvt("panel_confirmed", "Part3", label: "part3_start"); });
         yield return new WaitUntil(() => started);
 
-        BeginTrial();
+        // Phase first, then the trial: the first sample written inside BeginTrial() must already be labelled d1_pending (panel reading), not 'idle'.
         SetPhase("d1_pending");
+        BeginTrial();
 
         // Diagnostic only (phase_end elapsed time, a wall-clock trial window that INCLUDES panel reading). It no longer limits any
         // search: the D1 / D2 limits come from p3Timing, started by the D1 / D2 Continue callbacks.
-        double trialStartRealtime = Time.realtimeSinceStartupAsDouble;
+        double trialStartRealtime = CaptureClock.TAbs;
 
         // ============================ DESTINATION 1 ============================
         bool dest1Confirmed = false;
@@ -1001,7 +1031,7 @@ public class ExperimentManager : MonoBehaviour
         uiManager.ShowPart3Destination1Panel(() =>
         {
             // Valid interval 1 starts at the actual Continue click: stamped before anything else in this callback.
-            bool firstD1Confirm = p3Timing.RecordD1Continue(Time.realtimeSinceStartupAsDouble);
+            bool firstD1Confirm = p3Timing.RecordD1Continue(CaptureClock.TAbs);
             dest1Confirmed = true;
             if (firstD1Confirm) RaiseEvt("part3_d1_continue_confirmed", "Part3", label: "D1");
             RaiseEvt("panel_confirmed", "Part3", label: "part3_dest1");
@@ -1032,13 +1062,13 @@ public class ExperimentManager : MonoBehaviour
         bool d1Found = false;
         // The D1 search clock is the D1 Continue click recorded by the callback (this coroutine only resumes a frame later).
         // Safety net: if the click was somehow not recorded, start the clock now so the search is still bounded.
-        p3Timing.RecordD1Continue(Time.realtimeSinceStartupAsDouble);
+        p3Timing.RecordD1Continue(CaptureClock.TAbs);
         double d1StartRealtime = p3Timing.D1ContinueRealtime;
 
         // Limit: min(part3Destination1MaxSeconds, part3TotalMaxSeconds) from the D1 Continue click (Part3ValidTiming.D1SearchOpen).
         // Queued selections are swept BEFORE the deadline test, so a click made inside the window but only noticed on the frame that
         // closes it still counts. Endpoint: the click's own stamp when found; otherwise d1Now, the frame time that failed the test.
-        double d1Now = Time.realtimeSinceStartupAsDouble;
+        double d1Now = CaptureClock.TAbs;
         double d1EndRealtime = double.NaN;
         while (true)
         {
@@ -1055,14 +1085,14 @@ public class ExperimentManager : MonoBehaviour
                 AppendPart3Log("d1_click", groupNumber, def, startPoint, destination1Building, destination2Building,
                     selectedId: clickedId, found: correct,
                     elapsedSeconds: sel.realtime - d1StartRealtime,
-                    notes: correct ? "correct" : "wrong_building");
+                    notes: correct ? "correct" : "wrong_building", interactionId: sel.interactionId);
 
                 if (correct) { d1Found = true; d1EndRealtime = sel.realtime; }
                 // A wrong-building selection does NOT end the sub-phase and shows no feedback.
             }
             if (d1Found || !p3Timing.D1SearchOpen(d1Now)) break;
             yield return null;
-            d1Now = Time.realtimeSinceStartupAsDouble;
+            d1Now = CaptureClock.TAbs;
         }
         if (!d1Found) d1EndRealtime = d1Now;   // timeout branch: the moment it was taken
 
@@ -1116,7 +1146,7 @@ public class ExperimentManager : MonoBehaviour
             uiManager.ShowPart3Destination2Panel(() =>
             {
                 // Valid interval 2 starts at the actual Continue click: stamped before anything else in this callback.
-                bool firstD2Confirm = p3Timing.RecordD2Continue(Time.realtimeSinceStartupAsDouble);
+                bool firstD2Confirm = p3Timing.RecordD2Continue(CaptureClock.TAbs);
                 dest2Confirmed = true;
                 if (firstD2Confirm) RaiseEvt("part3_d2_continue_confirmed", "Part3", label: "D2");
                 RaiseEvt("panel_confirmed", "Part3", label: "part3_dest2");
@@ -1126,10 +1156,10 @@ public class ExperimentManager : MonoBehaviour
             {
                 // UI event only: the D2 panel is visible. It is NOT an interval endpoint (interval 1 already ended with the D1
                 // search) and it changes no budget; the gap since the D1 search end is logged for transition analysis.
-                if (p3Timing.RecordD2PanelVisible(Time.realtimeSinceStartupAsDouble))
+                if (p3Timing.RecordD2PanelVisible(CaptureClock.TAbs))
                 {
                     double gap = p3Timing.D1EndToD2PanelVisibleSeconds;
-                    RaiseEvt("part3_d2_panel_visible", "Part3", label: "D2", numValue: double.IsNaN(gap) ? 0.0 : gap,
+                    RaiseEvt("part3_d2_panel_visible", "Part3", label: "D2", numValue: double.IsNaN(gap) ? (double?)null : gap,
                         stringValue: $"d1_search_end_to_panel_visible_s={Fs(gap)};panel_visible_t_abs={Fs(p3Timing.D2PanelVisibleRealtime)}");
                 }
             });
@@ -1158,11 +1188,11 @@ public class ExperimentManager : MonoBehaviour
             // The D2 search clock is the D2 Continue click recorded by the callback; its budget is the REMAINING total budget
             // (max(0, total - interval 1), fixed when the D1 search ended), not a fresh full one, and panel placement / reading
             // time before the click is not part of it.
-            p3Timing.RecordD2Continue(Time.realtimeSinceStartupAsDouble);   // safety net only; the callback already recorded it
+            p3Timing.RecordD2Continue(CaptureClock.TAbs);   // safety net only; the callback already recorded it
             double d2StartRealtime = p3Timing.D2ContinueRealtime;
 
             // Same loop shape and endpoint rule as Destination 1.
-            double d2Now = Time.realtimeSinceStartupAsDouble;
+            double d2Now = CaptureClock.TAbs;
             double d2EndRealtime = double.NaN;
             while (true)
             {
@@ -1178,13 +1208,13 @@ public class ExperimentManager : MonoBehaviour
                     AppendPart3Log("d2_click", groupNumber, def, startPoint, destination1Building, destination2Building,
                         selectedId: clickedId, found: correct,
                         elapsedSeconds: sel.realtime - d2StartRealtime,
-                        notes: correct ? "correct" : "wrong_building");
+                        notes: correct ? "correct" : "wrong_building", interactionId: sel.interactionId);
 
                     if (correct) { d2Found = true; d2EndRealtime = sel.realtime; }
                 }
                 if (d2Found || !p3Timing.D2SearchOpen(d2Now)) break;
                 yield return null;
-                d2Now = Time.realtimeSinceStartupAsDouble;
+                d2Now = CaptureClock.TAbs;
             }
             if (!d2Found) d2EndRealtime = d2Now;   // budget expired: the moment the timeout branch was taken
 
@@ -1218,7 +1248,7 @@ public class ExperimentManager : MonoBehaviour
         }
 
         // ============================ END ============================
-        double phaseTotalElapsed = Time.realtimeSinceStartupAsDouble - trialStartRealtime;   // wall clock incl. panel reading; diagnostic
+        double phaseTotalElapsed = CaptureClock.TAbs - trialStartRealtime;   // wall clock incl. panel reading; diagnostic
         // A search that ends without its target can only have ended because the total valid-exposure budget ran out (D2 is skipped
         // or limited by it); the label text is kept for downstream compatibility.
         bool totalBudgetReached = !d2Ran || !d2Found;
@@ -1453,7 +1483,7 @@ public class ExperimentManager : MonoBehaviour
     /// </summary>
     private void AppendPart3Log(string eventName, int groupNumber, Part3GroupDef def,
         Transform startPoint, GameObject d1Building, GameObject d2Building,
-        string selectedId, bool found, double elapsedSeconds, string notes, string terminationReason = "")
+        string selectedId, bool found, double elapsedSeconds, string notes, string terminationReason = "", string interactionId = "")
     {
         ExperimentEventInfo info = new ExperimentEventInfo
         {
@@ -1464,6 +1494,8 @@ public class ExperimentManager : MonoBehaviour
             label = "",
             stringValue = selectedId ?? "",
             numValue = elapsedSeconds,
+            hasNum = eventName != "assigned",   // click / result / skipped / phase_end carry an elapsed time (0 is a real value); 'assigned' carries none
+            interactionId = interactionId ?? "",
             boolValue = found,
             notes = notes ?? "",
             groupNumber = groupNumber,
@@ -1485,7 +1517,7 @@ public class ExperimentManager : MonoBehaviour
     // ---- Data-capture event helpers -------------------------------------------------------------
 
     private void RaiseEvt(string type, string part = null, string label = "", string stringValue = "",
-        double numValue = 0.0, bool boolValue = false, GameObject building = null,
+        double? numValue = null, bool boolValue = false, GameObject building = null,
         Vector3 fromPos = default, Vector3 toPos = default)
     {
         ExperimentEventInfo info = new ExperimentEventInfo
@@ -1496,7 +1528,8 @@ public class ExperimentManager : MonoBehaviour
             phase = CurrentPhase,
             label = label,
             stringValue = stringValue,
-            numValue = numValue,
+            numValue = numValue ?? 0.0,
+            hasNum = numValue.HasValue,       // F-07: a numeric value is present only when the caller supplied one (a real 0 is a value)
             boolValue = boolValue,
             notes = "",
             building = building,
@@ -1508,10 +1541,10 @@ public class ExperimentManager : MonoBehaviour
         catch (Exception ex) { Debug.LogWarning("[ExperimentManager] OnExperimentEvent (" + type + ") handler threw: " + ex.Message); }
     }
 
-    private void SetPhase(string phase)
+    private void SetPhase(string phase, string part = "Part3")
     {
         CurrentPhase = phase;
-        RaiseEvt("phase_start", "Part3", label: phase);
+        RaiseEvt("phase_start", part, label: phase);
     }
 
     private string CurrentRunningPartString()
@@ -1542,7 +1575,9 @@ public struct ExperimentEventInfo
     public string phase;        // ExperimentManager.CurrentPhase at raise time
     public string label;        // "D1" / "D2" / a panel key / a phase name / ""
     public string stringValue;  // clicked targetId / teleport destination name / free string
-    public double numValue;     // elapsed seconds / phase total elapsed / 0
+    public double numValue;     // elapsed seconds / phase total elapsed (meaningful only when hasNum)
+    public bool hasNum;         // true when numValue is a real value (including a real 0); false = no numeric value -> blank value_num
+    public string interactionId; // building_click / selection outcome link ("C000123"); "" when not applicable
     public bool boolValue;      // correct / found
     public string notes;        // legacy Part 3 "notes" / endReason string
 
@@ -1597,7 +1632,7 @@ public static class Part3TerminationReason
 /// <summary>
 /// Part 3 valid-exposure timing: the SINGLE source of truth for both the search limits (what ends a search) and the interval
 /// results (what is logged). A plain class with no Unity dependencies - every method takes a monotonic time
-/// (ExperimentManager passes Time.realtimeSinceStartupAsDouble values), so the rules can be driven by a simulated clock.
+/// (ExperimentManager passes CaptureClock.TAbs values), so the rules can be driven by a simulated clock.
 ///
 /// Intervals measure ACTIVE SEARCH time only, like the Part 1 / Part 2 duration timers (BeginTrial -> loop exit -> EndTrial, which
 /// never include a panel's display or reading time):

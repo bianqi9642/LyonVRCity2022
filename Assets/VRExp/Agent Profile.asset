@@ -68,7 +68,7 @@ MonoBehaviour:
     weight: 0.1
     genderRestriction: 1
   topOptions:
-  - mesh: {fileID: 277583767506725033, guid: e1efa5985d3fb4014b18e2281bf56faa, type: 3}
+  - mesh: {fileID: 4300000, guid: 75ec1eba2628e4b968284839eb1f291c, type: 2}
     materials:
     - {fileID: 2100000, guid: 8a0da5f37e0168d438b9e53bf2612654, type: 2}
     - {fileID: 2100000, guid: 95f8357e406b378418e468e68ee78049, type: 2}
@@ -76,7 +76,7 @@ MonoBehaviour:
     - {fileID: 2100000, guid: 580e9a0ee1b098545957c52f7c526b6d, type: 2}
     weight: 0.5
     genderRestriction: 2
-  - mesh: {fileID: 7505099667046769780, guid: e1efa5985d3fb4014b18e2281bf56faa, type: 3}
+  - mesh: {fileID: 4300000, guid: caf2b4bcec6744479827ed18060bc262, type: 2}
     materials:
     - {fileID: 2100000, guid: f52faf7dac13a214499890a22b18b423, type: 2}
     - {fileID: 2100000, guid: 864e1ce497fa37f4baf7e012536950e0, type: 2}
@@ -84,7 +84,7 @@ MonoBehaviour:
     - {fileID: 2100000, guid: 40f01e7f83c123f4db9c5f0243a209d5, type: 2}
     weight: 0.5
     genderRestriction: 1
-  - mesh: {fileID: -8248950485995687186, guid: e1efa5985d3fb4014b18e2281bf56faa, type: 3}
+  - mesh: {fileID: 4300000, guid: 3d31e2738af3e402c9ba17c4029934e7, type: 2}
     materials:
     - {fileID: 2100000, guid: 338f849a892e558408c933739e3cac00, type: 2}
     - {fileID: 2100000, guid: 4cc5e598d4aa6864f830741f513753ce, type: 2}
@@ -93,7 +93,7 @@ MonoBehaviour:
     - {fileID: 2100000, guid: 2863d45f7bb13a643b7f1dc4f3cb5a95, type: 2}
     weight: 0.5
     genderRestriction: 2
-  - mesh: {fileID: 3861199732771392054, guid: e1efa5985d3fb4014b18e2281bf56faa, type: 3}
+  - mesh: {fileID: 4300000, guid: 09879f5fbcd7a4032ae0540034adfe61, type: 2}
     materials:
     - {fileID: 2100000, guid: ded10ab2c599f364686032caff8b08e2, type: 2}
     - {fileID: 2100000, guid: 42e1c4e568819f94295a93832ab4233f, type: 2}
@@ -103,7 +103,7 @@ MonoBehaviour:
     weight: 0.5
     genderRestriction: 1
   bottomOptions:
-  - mesh: {fileID: -5646737540765549233, guid: e1efa5985d3fb4014b18e2281bf56faa, type: 3}
+  - mesh: {fileID: 4300000, guid: acd0cb49a5781484aa7b74c0a2d6fa9c, type: 2}
     materials:
     - {fileID: 2100000, guid: 799b16d1094eaed4bac02c11c52dc744, type: 2}
     - {fileID: 2100000, guid: 511f5b8ada1244648a2ee2362f795017, type: 2}
@@ -111,7 +111,7 @@ MonoBehaviour:
     - {fileID: 2100000, guid: 50df0fd5575741b4a99c825dac1c4d40, type: 2}
     weight: 1
     genderRestriction: 2
-  - mesh: {fileID: -8708293070754873807, guid: e1efa5985d3fb4014b18e2281bf56faa, type: 3}
+  - mesh: {fileID: 4300000, guid: 9b6d85fa3d3d444cba26bf571774d866, type: 2}
     materials:
     - {fileID: 2100000, guid: 98c54b9350e15544c9d651f145214e44, type: 2}
     - {fileID: 2100000, guid: 9f71e12841d72c244a9cc4e285196bba, type: 2}

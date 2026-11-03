@@ -82,7 +82,7 @@ public partial class NpcLifecycleTests
 
         var csv = Csv.Load(path);
         AssertWidths(csv, "gaze.csv");
-        Assert.AreEqual(69, csv.Header.Count);
+        Assert.AreEqual(73, csv.Header.Count);
         string[] lv = { "left_origin_x", "left_origin_y", "left_origin_z", "left_dir_x", "left_dir_y", "left_dir_z" };
         string[] rv = { "right_origin_x", "right_origin_y", "right_origin_z", "right_dir_x", "right_dir_y", "right_dir_z" };
         string[] cv = { "combined_origin_x", "combined_origin_y", "combined_origin_z", "combined_dir_x", "combined_dir_y", "combined_dir_z" };
@@ -354,7 +354,7 @@ public partial class NpcLifecycleTests
         var evs = Events(rig);
         AssertEventsCsvIsParticipantOnly(evs);
         var ph = new List<(double t, string phase)>(); foreach (var r in Rows(evs, "event_type", "phase_start")) ph.Add((D(evs.Get(r, "t_abs")), evs.Get(r, "label")));
-        CollectionAssert.AreEqual(new[] { "p2_start_pending", "p2_task1", "p2_continue_pending", "p2_task2", "ended" }, ph.ConvertAll(x => x.phase));
+        CollectionAssert.AreEqual(new[] { "p2_start_pending", "p2_task1", "p2_continue_pending", "p2_task2", "ended" }, ph.ConvertAll(x => x.phase), "actual phase_start rows: " + string.Join(", ", ph.ConvertAll(x => x.phase + "@" + x.t.ToString("F2"))));
         double PhT(string phase) => ph.Find(x => x.phase == phase).t;
         double tTrialStart = D(evs.Get(Rows(evs, "event_type", "trial_start")[0], "t_abs")), tTrialEnd = D(evs.Get(Rows(evs, "event_type", "trial_end")[0], "t_abs"));
 
@@ -378,10 +378,10 @@ public partial class NpcLifecycleTests
         var counts = new Dictionary<string, int>();
         foreach (var r in gaze.Rows)
         {
-            string p = gaze.Get(r, "phase"); Assert.AreEqual(PhaseAt(D(gaze.Get(r, "t_abs"))), p); Assert.AreEqual("Part2", gaze.Get(r, "part")); Assert.AreNotEqual("idle", p);
+            string p = gaze.Get(r, "phase"); Assert.AreEqual(PhaseAt(D(gaze.Get(r, "t_abs"))), p, "GAZE row t_abs=" + gaze.Get(r, "t_abs") + " phases: " + string.Join(", ", ph.ConvertAll(x => x.phase + "@" + x.t.ToString("F4")))); Assert.AreEqual("Part2", gaze.Get(r, "part")); Assert.AreNotEqual("idle", p);
             counts[p] = counts.ContainsKey(p) ? counts[p] + 1 : 1;
         }
-        foreach (var r in traj.Rows) { Assert.AreEqual(PhaseAt(D(traj.Get(r, "t_abs"))), traj.Get(r, "phase")); Assert.AreEqual("Part2", traj.Get(r, "part")); }
+        foreach (var r in traj.Rows) { Assert.AreEqual(PhaseAt(D(traj.Get(r, "t_abs"))), traj.Get(r, "phase"), "TRAJ row t_abs=" + traj.Get(r, "t_abs") + " phases: " + string.Join(", ", ph.ConvertAll(x => x.phase + "@" + x.t.ToString("F4")))); Assert.AreEqual("Part2", traj.Get(r, "part")); }
         Assert.Greater(counts["p2_task1"], 0); Assert.Greater(counts["p2_continue_pending"], 5, "panel-reading samples exist and are labelled separately"); Assert.Greater(counts["p2_task2"], 0);
         Assert.IsFalse(counts.ContainsKey("p2_start_pending"), "no trial is open while the Start panel is read: intentionally no gaze rows (an intentional gap, not a sensor failure)");
 

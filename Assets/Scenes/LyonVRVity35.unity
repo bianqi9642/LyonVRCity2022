@@ -171575,6 +171575,10 @@ MonoBehaviour:
   lifecycleController: {fileID: 0}
   requireProviderValidity: 1
   blockEyeSamplesOnHostConflict: 1
+  leftEyeAnchor: {fileID: 0}
+  rightEyeAnchor: {fileID: 0}
+  validateProviderOrigin: 1
+  maxProviderOriginDeviationMeters: 0.12
   headTransform: {fileID: 922815402}
   experimentManager: {fileID: 0}
   sessionController: {fileID: 0}
@@ -244735,7 +244739,9 @@ MonoBehaviour:
     gazeCaptureEnabled: 1
     trajectoryCaptureEnabled: 1
   enableLifecycleLogs: 1
-  npcWarmupDuration: 10
+  npcWarmupDuration: 20
+  holdNpcsUntilStart: 1
+  waitForHeadsetBeforeStartPanel: 1
   part1StartPosition: {fileID: 1571442372}
   part1TargetBuildings:
   - {fileID: 1707754393}
@@ -288752,6 +288758,7 @@ MonoBehaviour:
   usePooling: 1
   poolPrewarm: 5000
   navmeshWaitTimeout: 5
+  prewarmFrameBudgetMs: 8
   agentFactory: {fileID: 2139592827}
   defaultProfile: {fileID: 11400000, guid: 8ec1ac8d266554c54874ed3d7f9ce83e, type: 2}
   experimentManager: {fileID: 0}

@@ -33,6 +33,16 @@ public sealed class SamplingStats
     public long UnexpectedGaps { get; private set; }
     /// <summary>Subset of UnexpectedGaps whose interval is mostly explained by ONE long frame (the frame in which the sample was taken lasted at least half of the interval): the sampler could not run any sooner.</summary>
     public long GapsFrameLimited { get; private set; }
+    /// <summary>Unexpected gaps attributed (RateDiagnosis.AttributeGap) to slow writes, to late dispatch with healthy frames, to both frame time and writes, or to nothing establishable.</summary>
+    public long GapsIoLimited { get; private set; }
+    public long GapsSchedulerLimited { get; private set; }
+    public long GapsMixed { get; private set; }
+    public long GapsUnknown { get; private set; }
+    /// <summary>Duration of the stream's own synchronous row writes (what the sampler spent in the writer).</summary>
+    public long Writes { get; private set; }
+    public double WriteSecondsSum { get; private set; }
+    public double WriteSecondsMax { get; private set; }
+    double _prevWriteSeconds;
     public long IntentionalBreaks { get; private set; }
     public int Epochs { get; private set; }
     public double FirstT { get; private set; } = double.NaN;
@@ -52,6 +62,21 @@ public sealed class SamplingStats
     public void OnSample(double tAbs) => OnSampleWithFrame(tAbs, double.NaN);
 
     /// <summary>As OnSample (a distinct name: the tests reach OnSample by reflection), with the duration of the frame the sample was taken in (unscaled delta time) so a gap can be attributed to frame time.</summary>
+    /// <summary>
+    /// As OnSampleWithFrame, with the evidence that separates the causes of a gap: the longest frame and the frame count seen since the previous sample (FrameTimingStats.TakeWindow) and
+    /// how long THIS row's write took (the next gap is judged against it). NaN / 0 frames = no frame evidence.
+    /// </summary>
+    public void OnSampleWithEvidence(double tAbs, double frameWindowMax, int framesInWindow, double writeSeconds)
+    {
+        double prevWrite = _prevWriteSeconds;
+        if (!double.IsNaN(writeSeconds) && writeSeconds >= 0.0) { Writes++; WriteSecondsSum += writeSeconds; if (writeSeconds > WriteSecondsMax) WriteSecondsMax = writeSeconds; _prevWriteSeconds = writeSeconds; }
+        else _prevWriteSeconds = 0.0;
+        _evidenceFrameMax = frameWindowMax; _evidenceFrames = framesInWindow; _evidencePrevWrite = prevWrite; _haveEvidence = true;
+        OnSampleWithFrame(tAbs, frameWindowMax);
+        _haveEvidence = false;
+    }
+    bool _haveEvidence; double _evidenceFrameMax, _evidencePrevWrite; int _evidenceFrames;
+
     public void OnSampleWithFrame(double tAbs, double frameDt)
     {
         Samples++;
@@ -65,7 +90,23 @@ public sealed class SamplingStats
             {
                 Intervals++; SumInterval += dt;
                 if (double.IsNaN(MaxInterval) || dt > MaxInterval) MaxInterval = dt;
-                if (dt > GapThreshold) { UnexpectedGaps++; if (!double.IsNaN(frameDt) && frameDt >= 0.5 * dt) GapsFrameLimited++; }
+                if (dt > GapThreshold)
+                {
+                    UnexpectedGaps++;
+                    if (_haveEvidence)
+                    {
+                        switch (RateDiagnosis.AttributeGap(dt, _evidenceFrameMax, _evidenceFrames, _evidencePrevWrite))
+                        {
+                            case GapCause.Frame: GapsFrameLimited++; break;
+                            case GapCause.Io: GapsIoLimited++; break;
+                            case GapCause.Scheduler: GapsSchedulerLimited++; break;
+                            case GapCause.Mixed: GapsMixed++; break;
+                            default: GapsUnknown++; break;
+                        }
+                    }
+                    else if (!double.IsNaN(frameDt) && frameDt >= 0.5 * dt) GapsFrameLimited++;   // legacy entry point (frame duration only)
+                    else GapsUnknown++;
+                }
                 _ring[_ringHead] = dt; _ringHead = (_ringHead + 1) % BufferSize; if (_ringCount < BufferSize) _ringCount++;
             }
         }

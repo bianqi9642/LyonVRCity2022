@@ -87,6 +87,15 @@ public class MoveToTarget : MonoBehaviour
     [Tooltip("If true, MoveToTarget treats this as a behavior-driven pause and will not mark 'arrived'.")]
     public bool externallyPaused = true; // logical paused state (affects arrival checks)
 
+    // NPC simulation hold (SpawnerManager.PauseNpcBehaviour): an additional, independent freeze. It does NOT touch externallyPaused / externallyHaltMovement /
+    // externallyFreezeAnimator, so whatever pause an NPC already had (attractor dwell, UncertainBehavior pause) is exactly what it has again after the hold is released.
+    // While held: the NavMeshAgent stays stopped with its path and destination intact, no arrival / resample / animator update runs, and MoveTo / ResumeExternal issued by
+    // other components record their destination but cannot un-stop the agent. The GameObject, renderers, colliders and NavMeshAgent stay enabled.
+    bool simulationHold = false;
+
+    /// <summary>True while the NPC simulation hold is active for this agent.</summary>
+    public bool IsSimulationHeld => simulationHold;
+
     // Internal flags controlling pause behavior:
     bool externallyHaltMovement = false;
     bool externallyFreezeAnimator = false;
@@ -438,6 +447,13 @@ public class MoveToTarget : MonoBehaviour
             return;
         }
 
+        // NPC simulation hold: stay stopped (re-asserted every frame, because other components may issue MoveTo), measure and animate nothing.
+        if (simulationHold)
+        {
+            SafeSetIsStopped(true);
+            return;
+        }
+
         // Velocity / speed measurement:
         // - Use the NavMeshAgent velocity as the authoritative instantaneous velocity.
         float instantSpeed = agent.velocity.magnitude;
@@ -673,6 +689,38 @@ public class MoveToTarget : MonoBehaviour
         }
     }
 
+    /// <summary>
+    /// NPC simulation hold (see the field comment). Idempotent: holding an already-held agent, or releasing a free one, changes nothing. Holding stops the NavMeshAgent
+    /// (path and destination preserved), zeroes its velocity and shows the idle pose; releasing lets it continue toward the SAME destination, unless it was already stopped by
+    /// an independent pause or by Stop() / arrival, in which case it stays exactly as it was.
+    /// </summary>
+    public void SetSimulationHold(bool hold)
+    {
+        if (hold == simulationHold) return;
+        simulationHold = hold;
+
+        if (hold)
+        {
+            if (AgentCanControl())
+            {
+                SafeSetIsStopped(true);
+                agent.velocity = Vector3.zero;
+            }
+            smoothedSpeed = 0f;
+            walkAnimActive = false;
+            ResetStallDetector();
+            if (animator != null)
+            {
+                animator.SetBool(animatorIsWalkingParam, false);
+                animator.SetFloat(animatorMoveSpeedParam, 0f);
+            }
+        }
+        else if (AgentCanControl() && moving && !arrived && !(externallyPaused && externallyHaltMovement))
+        {
+            SafeSetIsStopped(false);
+        }
+    }
+
     // Public API to resume movement after an external pause.
     public void ResumeExternal()
     {
@@ -681,7 +729,7 @@ public class MoveToTarget : MonoBehaviour
         externallyFreezeAnimator = false;
 
         if (AgentCanControl())
-            SafeSetIsStopped(false);
+            SafeSetIsStopped(simulationHold);
 
         moving = true;
         arrived = false;
@@ -964,7 +1012,7 @@ public class MoveToTarget : MonoBehaviour
 
         if (AgentCanControl())
         {
-            SafeSetIsStopped(false);
+            SafeSetIsStopped(simulationHold);
             agent.SetDestination(newTarget);
             lastTargetUpdateTime = Time.time;
             resampleAttempts = 0;
@@ -996,7 +1044,7 @@ public class MoveToTarget : MonoBehaviour
 
         if (AgentCanControl() && targetTransform != null)
         {
-            SafeSetIsStopped(false);
+            SafeSetIsStopped(simulationHold);
             agent.SetDestination(targetTransform.position);
             lastTargetUpdateTime = Time.time;
             resampleAttempts = 0;
@@ -1068,6 +1116,7 @@ public class MoveToTarget : MonoBehaviour
         // externallyPaused is intentionally left alone (it only gates arrival detection).
         externallyHaltMovement = false;
         externallyFreezeAnimator = false;
+        simulationHold = false;   // a pooled agent never inherits the NPC simulation hold of its previous life
 
         moving = false;
         SafeSetIsStopped(true);

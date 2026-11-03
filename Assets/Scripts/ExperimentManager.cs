@@ -270,17 +270,29 @@ public class ExperimentManager : MonoBehaviour
     public bool enableLifecycleLogs = true;
 
     [Header("NPC Warm-up")]
-    [Tooltip("Seconds of NPC-only warm-up run at the start of a Part that has 'Npc Enabled' = true in its " +
-             "Part Configuration above, after the participant is teleported to the Part's start position but " +
-             "BEFORE the participant-facing Start panel is shown and BEFORE OnTrialStart fires. During " +
-             "warm-up, SpawnerManager spawns and moves NPCs using its completely normal runtime behaviour " +
-             "(same spawnInterval, maxAgents, itinerary generation, pooling) so the " +
-             "NPC population has time to spawn and spread out through the environment before the participant " +
-             "can begin the actual trial. This single duration applies to every NPC-enabled Part - there is " +
-             "no separate per-Part duration field. Set to 0 to skip only the WAIT (the Start panel is then " +
-             "shown immediately); NPC presence itself is still controlled exclusively by 'Npc Enabled' above, " +
-             "never by this duration.")]
+    [Tooltip("NPC GENERATION DURATION (the experimental control variable; time-based, NOT a population target). Seconds of ELAPSED time, counted from the moment the NPC pool is ready, during which " +
+             "SpawnerManager spawns NPCs at 'spawnInterval' and they behave normally (application suspension is not counted). When it expires spawning stops and every active NPC is paused " +
+             "(see 'Hold Npcs Until Start') until the participant presses Start. The number of NPCs that exist then results from this duration and the spawn interval only. Applies to every " +
+             "NPC-enabled Part (no per-Part duration). 0 = no generation period (NPCs run from pool readiness; nothing is held). Pool creation time is never part of it. " +
+             "Presence of NPCs is still controlled by 'Npc Enabled' in the Part configuration.")]
     public float npcWarmupDuration = 30f;
+
+    [Header("NPC preparation (pool -> behaviour warm-up -> Start-gated pause)")]
+    [Tooltip("If true (default), spawning STOPS and the NPC simulation is PAUSED when the NPC generation duration ('Npc Warmup Duration') ends: every NPC stays visible and raycastable but stationary while the participant " +
+             "reads the Start panel, and the Start click resumes them in the same transition that opens the trial. If false, NPCs keep walking while the Start panel is read (previous behaviour). " +
+             "Ignored when 'Npc Warmup Duration' is 0. Applies to every Part with NPCs enabled.")]
+    public bool holdNpcsUntilStart = true;
+
+    [Tooltip("If true (default), the Start panel is withheld until the headset is WORN (OVRPlugin.userPresent) so that it is placed in front of the participant's head, not wherever an unworn headset " +
+             "lies (panels are positioned once, at show time). Only the panel is delayed: pool preparation, NPC generation and the NPC pause run automatically whether or not the headset is worn. " +
+             "When presence is unknown (no runtime, Editor) the panel is shown immediately.")]
+    public bool waitForHeadsetBeforeStartPanel = true;
+
+    /// <summary>Test seam: replaces the OVRPlugin headset-presence reading (true = worn, false = unworn, null = unknown). Never set in production.</summary>
+    [System.NonSerialized] public System.Func<bool?> HeadsetPresenceProbe;
+
+    /// <summary>Preparation state + manifest evidence of the Part currently running (see NpcPreparationInfo). Written to session_manifest.json as npc_preparation.</summary>
+    public NpcPreparationInfo NpcPreparation { get; } = new NpcPreparationInfo();
 
     [Header("Part1")]
     [Tooltip("Part1 start position (single).")]
@@ -497,7 +509,7 @@ public class ExperimentManager : MonoBehaviour
         var ss = new SceneSettings
         {
             Part1Duration = part1Duration, Part2FirstDuration = part2FirstDuration, Part2SecondDuration = part2SecondDuration,
-            Part3Destination1MaxSeconds = part3Destination1MaxSeconds, Part3TotalMaxSeconds = part3TotalMaxSeconds, NpcWarmupDuration = npcWarmupDuration,
+            Part3Destination1MaxSeconds = part3Destination1MaxSeconds, Part3TotalMaxSeconds = part3TotalMaxSeconds, NpcWarmupDuration = Mathf.Max(0f, npcWarmupDuration),
             AllowWrongCandidateSelection = allowWrongCandidateSelection, RestrictRiverTeleportToPart3 = restrictRiverTeleportToPart3,
         };
         ss.PartFlags[0] = FlagsOf(part1Config); ss.PartFlags[1] = FlagsOf(part2Config); ss.PartFlags[2] = FlagsOf(part3Config);
@@ -681,6 +693,12 @@ public class ExperimentManager : MonoBehaviour
     private void BeginTrial()
     {
         if (SessionEnded) return;
+        if (NpcPreparation.applicable && NpcPreparation.state == NpcPreparationState.Failed.ToString())
+        {
+            Debug.LogError("[ExperimentManager] Trial start refused: NPC preparation failed.", this);
+            return;
+        }
+        ResumeNpcBehaviourForTrialStart();   // NPC resume and trial start are one transition: same frame, resume first
         SetParticipantControl(true);
         OnTrialStart?.Invoke();
     }
@@ -730,6 +748,12 @@ public class ExperimentManager : MonoBehaviour
     {
         if (SessionEnded) return;
         SessionEnded = true;
+        if (NpcPreparation.applicable)
+        {
+            string st = NpcPreparation.state;
+            bool started = st == NpcPreparationState.Running.ToString() || st == NpcPreparationState.Ended.ToString();
+            if (st != NpcPreparationState.Failed.ToString()) SetNpcPreparation(started ? NpcPreparationState.Ended : NpcPreparationState.Cancelled);
+        }
         SetParticipantControl(false);
         runningCoroutine = null;
         if (enableLifecycleLogs) Debug.Log($"[ExperimentManager] Session ended after {part}: participant locked, NPC simulation stopping, no further Part can start.", this);
@@ -833,7 +857,7 @@ public class ExperimentManager : MonoBehaviour
     {
         if (RefuseStartAfterEnd("StartPart1")) return;
         if (!IdentityAllowsStart("StartPart1")) return;
-        if (runningCoroutine != null) StopCoroutine(runningCoroutine);
+        if (runningCoroutine != null) { StopCoroutine(runningCoroutine); CancelNpcPreparationIfInProgress(); }
         runningCoroutine = StartCoroutine(RunPart1());
     }
 
@@ -841,7 +865,7 @@ public class ExperimentManager : MonoBehaviour
     {
         if (RefuseStartAfterEnd("StartPart2")) return;
         if (!IdentityAllowsStart("StartPart2")) return;
-        if (runningCoroutine != null) StopCoroutine(runningCoroutine);
+        if (runningCoroutine != null) { StopCoroutine(runningCoroutine); CancelNpcPreparationIfInProgress(); }
         runningCoroutine = StartCoroutine(RunPart2());
     }
 
@@ -849,7 +873,7 @@ public class ExperimentManager : MonoBehaviour
     {
         if (RefuseStartAfterEnd("StartPart3")) return;
         if (!IdentityAllowsStart("StartPart3")) return;
-        if (runningCoroutine != null) StopCoroutine(runningCoroutine);
+        if (runningCoroutine != null) { StopCoroutine(runningCoroutine); CancelNpcPreparationIfInProgress(); }
         runningCoroutine = StartCoroutine(RunPart3());
     }
 
@@ -882,37 +906,271 @@ public class ExperimentManager : MonoBehaviour
     /// </summary>
     private IEnumerator RunNpcWarmup(PartCaptureConfig cfg, string partLabel)
     {
-        float warmupDuration = _effective != null ? _effective.NpcWarmupDuration : 0f;
+        float generationDuration = _effective != null ? Mathf.Max(0f, _effective.NpcWarmupDuration) : 0f;
         if (spawner != null)
-            spawner.ResetForNewPart();
+            spawner.ResetForNewPart();   // also releases any NPC pause left over from an earlier Part / Session
+
+        NpcPreparationInfo prep = NpcPreparation;
+        prep.ResetForPart(partLabel);
 
         if (cfg == null || !cfg.npcEnabled)
             yield break;
 
-        if (spawner != null)
+        // The effective preparation settings are frozen here, once per Part (npcWarmupDuration itself comes from the frozen session settings).
+        prep.applicable = true;
+        prep.hold_until_start = holdNpcsUntilStart;
+        prep.npc_generation_configured_duration_seconds = generationDuration;
+
+        if (spawner == null)
         {
-            spawner.defaultProfile = currentProfile;
-            // The NPC simulation runs from here until the session ends, independent of the Start panel, the trial window and
-            // the End panel (see SpawnerManager.BeginNpcSimulation).
-            spawner.BeginNpcSimulation();
+            SetNpcPreparation(NpcPreparationState.Failed, "failed_no_spawner");
+            Debug.LogError("[ExperimentManager] NPC preparation failed: no SpawnerManager in the scene (the Part has NPCs enabled). The Part cannot start.", this);
+            RaiseEvt("npc_pool_preparation_failed", partLabel, stringValue: "no_spawner");
+            yield break;
         }
 
-        if (warmupDuration <= 0f)
+        spawner.defaultProfile = currentProfile;
+        // NOTE: the NPC simulation (SpawnerManager.BeginNpcSimulation, which opens the spawn gate) is opened only AFTER the pool has been verified below, so an incomplete or failed pool can
+        // never produce an NPC.
+
+        // ---- Stage 1: POOL PREPARATION. Starts automatically; ends when the pool is complete, creation reports a failure, or the Part is cancelled. No time limit: a pool that is simply ----
+        // slow or stuck stays PoolPreparing (progress is in the manifest and the log) and is never silently skipped.
+        prep.pool_preparation_target_count = spawner.PoolPrewarmTarget;
+        bool alreadyReady = spawner.IsPoolReady;
+        SetNpcPreparation(alreadyReady ? NpcPreparationState.PoolReady : NpcPreparationState.PoolPreparing, alreadyReady ? "ready" : "preparing");
+        double poolClockStart = double.IsNaN(spawner.PoolPreparationStartTAbs) ? CaptureClock.TAbs : spawner.PoolPreparationStartTAbs;
+        prep.pool_preparation_started_t_abs = poolClockStart;
+        RaiseEvt("npc_pool_preparation_started", partLabel, numValue: spawner.PoolPrewarmTarget, stringValue: alreadyReady ? "already_ready" : "waiting_for_pool");
+        double nextProgressLog = CaptureClock.TAbs + 30.0;
+        while (spawner != null && !spawner.IsPoolReady && !spawner.PoolFailed)
+        {
+            if (SessionEnded) { if (prep.state != NpcPreparationState.Cancelled.ToString()) SetNpcPreparation(NpcPreparationState.Cancelled, "cancelled"); yield break; }
+            prep.pool_preparation_created_count = spawner.PoolPrewarmCreated;
+            prep.pool_preparation_last_progress_t_abs = double.IsNaN(spawner.PoolLastProgressTAbs) ? -1 : spawner.PoolLastProgressTAbs;
+            if (enableLifecycleLogs && CaptureClock.TAbs >= nextProgressLog)   // a status line every 30 s while preparing; diagnostic only, never a decision
+            {
+                nextProgressLog = CaptureClock.TAbs + 30.0;
+                double since = double.IsNaN(spawner.PoolLastProgressTAbs) ? -1 : CaptureClock.TAbs - spawner.PoolLastProgressTAbs;
+                Debug.Log($"[ExperimentManager] NPC pool preparation in progress: {spawner.PoolPrewarmCreated}/{spawner.PoolPrewarmTarget} objects, last object created {since:F1}s ago.", this);
+            }
+            yield return null;
+        }
+        if (spawner == null)
+        {
+            SetNpcPreparation(NpcPreparationState.Failed, "failed_no_spawner");
+            Debug.LogError("[ExperimentManager] NPC preparation failed: the SpawnerManager was destroyed during pool preparation.", this);
+            RaiseEvt("npc_pool_preparation_failed", partLabel, stringValue: "no_spawner");
             yield break;
+        }
+        prep.pool_preparation_created_count = spawner.PoolPrewarmCreated;
+        prep.pool_preparation_last_progress_t_abs = double.IsNaN(spawner.PoolLastProgressTAbs) ? -1 : spawner.PoolLastProgressTAbs;
+        if (spawner.PoolFailed)
+        {
+            prep.pool_preparation_error = spawner.PoolFailureReason;
+            SetNpcPreparation(NpcPreparationState.Failed, "failed_error");
+            Debug.LogError($"[ExperimentManager] NPC pool preparation failed ({spawner.PoolPrewarmCreated}/{spawner.PoolPrewarmTarget} objects): {spawner.PoolFailureReason}. NPC generation does not start and the participant cannot start.", this);
+            RaiseEvt("npc_pool_preparation_failed", partLabel, numValue: spawner.PoolPrewarmCreated, stringValue: "error");
+            yield break;
+        }
+        if (spawner.PoolPrewarmCreated != spawner.PoolPrewarmTarget)
+        {
+            SetNpcPreparation(NpcPreparationState.Failed, "failed_incomplete");
+            Debug.LogError($"[ExperimentManager] NPC pool is not complete: {spawner.PoolPrewarmCreated}/{spawner.PoolPrewarmTarget} objects. NPC generation does not start and the participant cannot start.", this);
+            RaiseEvt("npc_pool_preparation_failed", partLabel, numValue: spawner.PoolPrewarmCreated, stringValue: "incomplete");
+            yield break;
+        }
+        prep.pool_preparation_completed_t_abs = double.IsNaN(spawner.PoolPreparationEndTAbs) ? CaptureClock.TAbs : spawner.PoolPreparationEndTAbs;
+        prep.pool_preparation_duration_seconds = prep.pool_preparation_started_t_abs >= 0 ? prep.pool_preparation_completed_t_abs - prep.pool_preparation_started_t_abs : -1;
+        SetNpcPreparation(NpcPreparationState.PoolReady, "ready");
+        RaiseEvt("npc_pool_preparation_completed", partLabel, numValue: prep.pool_preparation_duration_seconds, stringValue: "created=" + spawner.PoolPrewarmCreated);
 
-        if (spawner != null)
-            spawner.BeginNpcWarmup();
+        // The verified pool opens the NPC simulation: from here until the session ends spawning and movement are independent of the Start panel, the trial window and the End panel.
+        spawner.BeginNpcSimulation();
 
-        RaiseEvt("npc_warmup_start", partLabel, numValue: warmupDuration);
+        if (generationDuration <= 0f)
+            yield break;   // no generation period configured and therefore nothing to hold: NPCs run from pool readiness on
 
-        double warmupStart = CaptureClock.TAbs;
-        yield return WaitExperimentSeconds(warmupDuration);
-        double wt = CaptureClock.TAbs - warmupStart;   // measured on the shared monotonic clock
+        // ---- Stage 2: NPC GENERATION (starts only now, automatically, whether or not anyone wears the headset). Spawning at spawnInterval and normal behaviour for 'generationDuration' ----
+        // seconds of EXECUTED time. Executed time = sum of per-frame unscaled deltas, each capped at Time.maximumDeltaTime - the cap the NPC simulation itself obeys, so the timer advances exactly as
+        // far as the simulation did. Unworn headset / lost focus with Unity still executing does not slow it; an interval in which Unity was not executing (OS suspension) contributes at most one
+        // capped step and is reported as non-executing time, never as generated NPC time. The duration is the only stopping condition (no population target).
+        spawner.BeginNpcWarmup();
+        SetNpcPreparation(NpcPreparationState.NpcGenerationRunning, "ready");
+        double genStart = CaptureClock.TAbs;
+        int spawnedAtStart = spawner.NpcSpawnedTotal;
+        double pauseSecAtStart = AppPauseSecondsNow, focusSecAtStart = FocusLostSecondsNow, unmountSecAtStart = HmdUnmountedSecondsNow;
+        int pauseCountAtStart = _appPauseCount, unmountCountAtStart = _hmdUnmountCount;
+        prep.npc_generation_started_t_abs = genStart;
+        RaiseEvt("npc_warmup_start", partLabel, numValue: generationDuration);   // marks the generation start (event name kept for compatibility)
 
-        RaiseEvt("npc_warmup_end", partLabel, numValue: wt);
+        double elapsed = 0, lastFrame = genStart, maxGap = 0;
+        int stalls = 0, pauseCountLastFrame = _appPauseCount;
+        while (true)
+        {
+            yield return null;
+            double now = CaptureClock.TAbs;
+            double gap = now - lastFrame; lastFrame = now;
+            double cap = Time.maximumDeltaTime;
+            elapsed += gap < cap ? gap : cap;
+            if (gap > maxGap) maxGap = gap;
+            if (gap > cap && !(_appPauseActive || _appPauseCount != pauseCountLastFrame)) stalls++;
+            pauseCountLastFrame = _appPauseCount;
+            if (elapsed >= generationDuration || SessionEnded) break;
+        }
+        if (SessionEnded) { if (prep.state != NpcPreparationState.Cancelled.ToString()) SetNpcPreparation(NpcPreparationState.Cancelled); yield break; }
 
-        if (spawner != null)
-            spawner.EndNpcWarmup();
+        // Generation over, in ONE synchronous step (no yield): close the generation gate, then stop spawning + hold every NPC, so no spawn can slip in between.
+        double genEnd = CaptureClock.TAbs;
+        RaiseEvt("npc_warmup_end", partLabel, numValue: elapsed);   // marks the generation end (value = EXECUTED generation seconds)
+        spawner.EndNpcWarmup();
+        prep.npc_generation_completed_t_abs = genEnd;
+        prep.npc_generation_actual_duration_seconds = elapsed;
+        prep.npc_generation_wall_clock_seconds = genEnd - genStart;
+        prep.npc_generation_non_executing_seconds = Math.Max(0.0, (genEnd - genStart) - elapsed);
+        prep.npc_generation_max_frame_gap_seconds = maxGap;
+        prep.npc_generation_unreported_stalls = stalls;
+        prep.npc_generation_app_pause_count = _appPauseCount - pauseCountAtStart;
+        prep.npc_generation_app_pause_seconds = AppPauseSecondsNow - pauseSecAtStart;
+        prep.npc_generation_focus_lost_seconds = FocusLostSecondsNow - focusSecAtStart;
+        prep.npc_generation_hmd_unmount_count = _hmdUnmountCount - unmountCountAtStart;
+        prep.npc_generation_hmd_unmounted_seconds = HmdUnmountedSecondsNow - unmountSecAtStart;
+        prep.npc_generation_spawn_count = spawner.NpcSpawnedTotal - spawnedAtStart;
+        prep.active_npcs_at_generation_end = spawner.ActiveAgents.Count;
+        SetNpcPreparation(NpcPreparationState.NpcGenerationCompleted);
+
+        // ---- Stage 3: START-GATED PAUSE. The Start panel is shown by the caller right after this returns; the Start click resumes the NPCs (BeginTrial). ----
+        if (holdNpcsUntilStart && !SessionEnded)
+        {
+            int held = spawner.PauseNpcBehaviour("generation_complete");
+            prep.npc_behaviour_paused_t_abs = CaptureClock.TAbs;
+            prep.active_npcs_at_pause = held;
+            prep.pause_reason = "generation_complete";
+            prep.pause_count++;
+            SetNpcPreparation(NpcPreparationState.PausedAwaitingParticipantStart);
+            RaiseEvt("npc_behaviour_paused", partLabel, numValue: held, stringValue: "generation_complete");
+        }
+        else
+        {
+            SetNpcPreparation(NpcPreparationState.Running);   // generation done, no hold configured: NPCs keep walking while the Start panel is read
+        }
+    }
+
+    // ---- application lifecycle DIAGNOSTICS (they never change the generation timer; see RunNpcWarmup). The three events are different things and are kept apart: ----
+    //   * headset unworn (OVRManager.HMDUnmounted): Unity keeps executing for as long as the system does not pause the app;
+    //   * focus lost (OnApplicationFocus(false)): Unity keeps executing;
+    //   * application pause (OnApplicationPause(true)): the system pauses the app - on Quest this follows an unmount only after the headset's Auto Sleep delay - and Unity stops executing frames.
+    private double _appPauseTotal, _focusLostTotal, _hmdUnmountedTotal;
+    private double _appPauseSince = -1, _focusLostSince = -1, _hmdUnmountedSince = -1;
+    private int _appPauseCount, _hmdUnmountCount;
+    private bool _appPauseActive => _appPauseSince >= 0;
+    private double AppPauseSecondsNow => _appPauseTotal + (_appPauseSince >= 0 ? CaptureClock.TAbs - _appPauseSince : 0.0);
+    private double FocusLostSecondsNow => _focusLostTotal + (_focusLostSince >= 0 ? CaptureClock.TAbs - _focusLostSince : 0.0);
+    private double HmdUnmountedSecondsNow => _hmdUnmountedTotal + (_hmdUnmountedSince >= 0 ? CaptureClock.TAbs - _hmdUnmountedSince : 0.0);
+
+    private void OnApplicationPause(bool paused)
+    {
+        if (paused) { if (_appPauseSince < 0) { _appPauseSince = CaptureClock.TAbs; _appPauseCount++; } }
+        else if (_appPauseSince >= 0) { _appPauseTotal += CaptureClock.TAbs - _appPauseSince; _appPauseSince = -1; }
+    }
+
+    private void OnApplicationFocus(bool hasFocus)
+    {
+        if (!hasFocus) { if (_focusLostSince < 0) _focusLostSince = CaptureClock.TAbs; }
+        else if (_focusLostSince >= 0) { _focusLostTotal += CaptureClock.TAbs - _focusLostSince; _focusLostSince = -1; }
+    }
+
+    private void OnHmdMounted() { NoteHmdMounted(true); }
+    private void OnHmdUnmounted() { NoteHmdMounted(false); }
+    private void NoteHmdMounted(bool mounted)
+    {
+        if (!mounted) { if (_hmdUnmountedSince < 0) { _hmdUnmountedSince = CaptureClock.TAbs; _hmdUnmountCount++; } }
+        else if (_hmdUnmountedSince >= 0) { _hmdUnmountedTotal += CaptureClock.TAbs - _hmdUnmountedSince; _hmdUnmountedSince = -1; }
+    }
+
+    private void OnEnable() { OVRManager.HMDMounted += OnHmdMounted; OVRManager.HMDUnmounted += OnHmdUnmounted; }
+    private void OnDisable() { OVRManager.HMDMounted -= OnHmdMounted; OVRManager.HMDUnmounted -= OnHmdUnmounted; }
+
+    // A Part / session that disappears while the preparation is still in progress is Cancelled, never left looking "in progress".
+    private void CancelNpcPreparationIfInProgress()
+    {
+        NpcPreparationInfo prep = NpcPreparation;
+        if (!prep.applicable) return;
+        string st = prep.state;
+        if (st == NpcPreparationState.PoolPreparing.ToString() || st == NpcPreparationState.PoolReady.ToString() || st == NpcPreparationState.NpcGenerationRunning.ToString() ||
+            st == NpcPreparationState.NpcGenerationCompleted.ToString() || st == NpcPreparationState.PausedAwaitingParticipantStart.ToString())
+            SetNpcPreparation(NpcPreparationState.Cancelled, "cancelled");
+    }
+
+    private void OnDestroy() { OVRManager.HMDMounted -= OnHmdMounted; OVRManager.HMDUnmounted -= OnHmdUnmounted; CancelNpcPreparationIfInProgress(); }
+
+    private bool? HeadsetWorn()
+    {
+        if (HeadsetPresenceProbe != null) return HeadsetPresenceProbe();
+        try { return OVRPlugin.initialized ? (bool?)OVRPlugin.userPresent : null; } catch { return null; }
+    }
+
+    // The Start panel is a participant-facing UI placed ONCE in front of the head pose it sees when it is shown. When generation finished while the headset was unworn, showing it at once would
+    // place it wherever the unworn headset lies. So the panel (only the panel) waits until the headset is worn; the NPCs are already paused and visible by then. Unknown presence = no wait.
+    private IEnumerator WaitForHeadsetBeforeStartPanel()
+    {
+        if (!waitForHeadsetBeforeStartPanel || !NpcPreparation.applicable) yield break;
+        if (HeadsetWorn() != false) yield break;
+        double t0 = CaptureClock.TAbs;
+        if (enableLifecycleLogs) Debug.Log("[ExperimentManager] NPC environment ready and paused; the Start panel waits until the headset is worn.", this);
+        while (HeadsetWorn() == false && !SessionEnded) yield return null;
+        NpcPreparation.start_panel_headset_wait_seconds = CaptureClock.TAbs - t0;
+    }
+
+    // True (and the Part is abandoned before ANY Start panel) when the NPC preparation failed: the participant must never be able to start without the prepared NPC population.
+    private bool AbortPartIfNpcPreparationFailed(string part)
+    {
+        NpcPreparationInfo prep = NpcPreparation;
+        if (!prep.applicable || prep.state != NpcPreparationState.Failed.ToString()) return false;
+        Debug.LogError($"[ExperimentManager] {part} aborted before the Start panel: NPC preparation failed ({prep.pool_preparation_status}). Fix the NPC pool configuration and start the Part again.", this);
+        RaiseEvt("npc_preparation_part_aborted", part, stringValue: prep.pool_preparation_status);
+        currentRunningPart = RunningPart.None;
+        runningCoroutine = null;
+        return true;
+    }
+
+    // Single place that changes the preparation state (name string is what the manifest records).
+    private void SetNpcPreparation(NpcPreparationState s, string poolStatus = null)
+    {
+        NpcPreparationInfo prep = NpcPreparation;
+        prep.state = s.ToString();
+        if (prep.state_trail.Length < 400) prep.state_trail += ">" + prep.state;
+        if (poolStatus != null) prep.pool_preparation_status = poolStatus;
+    }
+
+    // The Start click's NPC side, called from BeginTrial() - the one path every Part's participant start goes through - immediately before OnTrialStart, in the same frame.
+    // Idempotent: a duplicate start callback finds the NPCs already released and does nothing.
+    private void ResumeNpcBehaviourForTrialStart()
+    {
+        NpcPreparationInfo prep = NpcPreparation;
+        if (!prep.applicable) return;
+        double now = CaptureClock.TAbs;
+        if (prep.participant_start_t_abs < 0) prep.participant_start_t_abs = now;
+
+        if (prep.state == NpcPreparationState.PausedAwaitingParticipantStart.ToString())
+        {
+            int released = spawner != null ? spawner.ResumeNpcBehaviour("participant_start") : 0;
+            prep.npc_behaviour_resumed_t_abs = now;
+            prep.active_npcs_at_resume = released;
+            prep.resume_reason = "participant_start";
+            prep.resume_count++;
+            SetNpcPreparation(NpcPreparationState.Running);
+            RaiseEvt("npc_behaviour_resumed", prep.part, numValue: released, stringValue: "participant_start");
+        }
+        else if (prep.state == NpcPreparationState.PoolPreparing.ToString() || prep.state == NpcPreparationState.NpcGenerationRunning.ToString())
+        {
+            // Not reachable through the Part flows (the Start panel is only shown after RunNpcWarmup returned). Counted and reported, never silently accepted as a finished generation.
+            prep.early_start_attempts++;
+            Debug.LogError($"[ExperimentManager] Trial start while NPC preparation is '{prep.state}': the generation period was not completed (early_start_attempts={prep.early_start_attempts}).", this);
+        }
+        else if (prep.state == NpcPreparationState.PoolReady.ToString())
+        {
+            SetNpcPreparation(NpcPreparationState.Running);   // no generation period configured: NPCs were never paused
+        }
     }
 
     #endregion
@@ -955,7 +1213,9 @@ public class ExperimentManager : MonoBehaviour
         // Part1-specific special-casing here. With the shipped default (npcEnabled=false) this call returns
         // immediately after clearing any stale End-Panel hard-stop, exactly reproducing "Part1 is NPC-free".
         yield return RunNpcWarmup(CurrentPartConfig, "Part1");
+        if (AbortPartIfNpcPreparationFailed("Part1")) yield break;
 
+        yield return WaitForHeadsetBeforeStartPanel();
         bool started = false;
         RaiseEvt("panel_shown", "Part1", label: "part1_start");
         uiManager.ShowPart1StartPanel(() => { started = true; RaiseEvt("panel_confirmed", "Part1", label: "part1_start"); });
@@ -1016,7 +1276,9 @@ public class ExperimentManager : MonoBehaviour
         TeleportPlayerTo(chosenStart);
 
         yield return RunNpcWarmup(CurrentPartConfig, "Part2");
+        if (AbortPartIfNpcPreparationFailed("Part2")) yield break;
 
+        yield return WaitForHeadsetBeforeStartPanel();
         // Phase labels for Part 2 (metadata only - no timing or flow depends on them): the Start panel is being read until the participant confirms.
         SetPhase("p2_start_pending", "Part2");
         bool started = false;
@@ -1148,8 +1410,10 @@ public class ExperimentManager : MonoBehaviour
         // --- 6b. NPC warm-up: NPCs spawn/spread out via SpawnerManager's normal runtime behaviour, BEFORE
         // the Phase 3 Start panel is shown. Not part of the participant's trial - see DataCaptureManager.
         yield return RunNpcWarmup(CurrentPartConfig, "Part3");
+        if (AbortPartIfNpcPreparationFailed("Part3")) yield break;
 
         // --- 7. Phase 3 Start panel. (All candidates are still non-interactable ordinary buildings.) ---
+        yield return WaitForHeadsetBeforeStartPanel();
         bool started = false;
         RaiseEvt("panel_shown", "Part3", label: "part3_start");
         uiManager.ShowPart3StartPanel(() => { started = true; RaiseEvt("panel_confirmed", "Part3", label: "part3_start"); });

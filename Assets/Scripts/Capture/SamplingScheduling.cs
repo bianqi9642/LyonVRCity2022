@@ -71,9 +71,28 @@ public sealed class FrameTimingStats
     readonly double[] _ring = new double[BufferSize];
     int _count, _head;
 
+    // Per-stream observation windows: the longest frame and the number of frames seen since the stream last took its window. A sampling loop takes its window at every sample, so for a gap
+    // between two samples it knows whether Unity ran frames in between and how long the longest one was (a frame that merely happens to be short at the moment of the sample proves nothing).
+    public const int WindowStreams = 2;
+    readonly double[] _winMax = new double[WindowStreams];
+    readonly int[] _winFrames = new int[WindowStreams];
+    public void TakeWindow(int stream, out double maxFrameDt, out int frames)
+    {
+        maxFrameDt = _winFrames[stream] > 0 ? _winMax[stream] : double.NaN; frames = _winFrames[stream];
+        _winMax[stream] = 0.0; _winFrames[stream] = 0;
+    }
+
+    /// <summary>A frame too long for the frame statistics (a freeze / suspension, DataCaptureManager excludes them from the mean) is still evidence for the gap it caused: windows only.</summary>
+    public void OnStallFrame(double unscaledDt)
+    {
+        if (!(unscaledDt > 0.0) || double.IsInfinity(unscaledDt)) return;
+        for (int i = 0; i < WindowStreams; i++) { if (unscaledDt > _winMax[i]) _winMax[i] = unscaledDt; _winFrames[i]++; }
+    }
+
     public void OnFrame(double unscaledDt)
     {
         if (!(unscaledDt > 0.0) || double.IsInfinity(unscaledDt)) return;
+        for (int i = 0; i < WindowStreams; i++) { if (unscaledDt > _winMax[i]) _winMax[i] = unscaledDt; _winFrames[i]++; }
         Frames++; SumDt += unscaledDt;
         if (unscaledDt > MaxDt) MaxDt = unscaledDt;
         if (unscaledDt > 0.1) Over100ms++;
@@ -97,18 +116,76 @@ public sealed class FrameTimingStats
     }
 }
 
+/// <summary>The cause a single unexpected sampling gap can be attributed to, from measured evidence only.</summary>
+public enum GapCause { Frame, Scheduler, Io, Mixed, Unknown }
+
 public static class RateDiagnosis
 {
+    /// <summary>A cause explains a gap by itself when it accounts for at least this share of the gap's duration.</summary>
+    public const double DominantShare = 0.5;
+    /// <summary>A cause contributes materially to a gap (and, for two causes, makes it "mixed") from this share of the gap's duration.</summary>
+    public const double MaterialShare = 0.25;
+    /// <summary>At stream level a cause is material when it explains at least this share of the attributed gaps.</summary>
+    public const double StreamMaterialShare = 0.25;
+
     /// <summary>
-    /// insufficient_samples | nominal_achieved | frame_rate_limited | scheduling_or_io_limited.
-    /// frame_rate_limited = the stream runs at (about) one sample per frame and the frame rate itself is below the nominal rate - the sampler cannot do better.
-    /// scheduling_or_io_limited = well below BOTH nominal and the frame rate: samples were lost to blocked work, hitches or a scheduling defect.
+    /// Attributes ONE gap (seconds between two consecutive written samples) from three independent measurements of the interval:
+    ///   frameMax / frames - the longest Unity frame and the number of frames seen inside the gap (FrameTimingStats window): no frames = no update opportunity;
+    ///   prevWrite         - how long the previous row's synchronous write (open + append + close) blocked the main thread;
+    /// Io        : the write alone consumed at least half the gap (the write also lengthens the frame, so it is subtracted from the frame evidence - a slow write is I/O, not a "frame hitch");
+    /// Frame     : frame time NOT explained by the write consumed at least half the gap (Unity did not give the sampler a chance to run);
+    /// Mixed     : both consumed at least a quarter each;
+    /// Scheduler : frames ran normally and writes were quick, yet the sample was dispatched late (the scheduler / coroutine wait is the remaining cause);
+    /// Unknown   : no frame evidence (frames == 0 or NaN), so no cause can be established.
     /// </summary>
+    public static GapCause AttributeGap(double gap, double frameMax, int frames, double prevWrite)
+    {
+        if (!(gap > 0.0) || double.IsNaN(frameMax) || frames <= 0) return GapCause.Unknown;
+        double io = Math.Min(Math.Max(prevWrite, 0.0), gap);
+        double frameExcess = Math.Max(0.0, frameMax - Math.Max(prevWrite, 0.0));
+        bool ioMaterial = io >= MaterialShare * gap, frameMaterial = frameExcess >= MaterialShare * gap;
+        if (ioMaterial && frameMaterial) return GapCause.Mixed;
+        if (io >= DominantShare * gap) return GapCause.Io;
+        if (frameExcess >= DominantShare * gap) return GapCause.Frame;
+        return GapCause.Scheduler;
+    }
+
+    /// <summary>
+    /// Stream-level diagnosis: healthy | frame_limited | scheduler_limited | io_limited | mixed | unknown (+ the reason). The rate shortfall is read from the gaps that were attributed with the
+    /// evidence above; nothing is inferred from "the rate is low" alone.
+    ///   healthy           observed rate >= 90 % of nominal;
+    ///   no attributed gaps but a rate below nominal: frame_limited only when the MEAN frame rate itself is below nominal and the stream keeps up with it (>= 80 % of the frame rate, one
+    ///                     sample per frame is the ceiling of a coroutine); io_limited only with writer failures / dropped records; otherwise unknown;
+    ///   with attributed gaps: each cause's share counts "mixed" gaps for both frame and io; unknown gaps >= half of all -> unknown; one material cause (share >= 25 %) -> that cause;
+    ///                     two or more -> mixed; none -> unknown. Writer failures / dropped records are I/O evidence in their own right.
+    /// </summary>
+    public static string ClassifyStream(double nominalHz, double observedHz, double frameMeanHz, long gapsFrame, long gapsScheduler, long gapsIo, long gapsMixed, long gapsUnknown, long writerRowsDropped, out string reason)
+    {
+        reason = "";
+        if (double.IsNaN(observedHz) || observedHz <= 0.0 || nominalHz <= 0.0) { reason = "insufficient_samples"; return "unknown"; }
+        if (observedHz >= 0.9 * nominalHz) { reason = "observed_rate_within_10_percent_of_nominal"; return "healthy"; }
+        long attributed = gapsFrame + gapsScheduler + gapsIo + gapsMixed + gapsUnknown;
+        bool ioEvidence = writerRowsDropped > 0;
+        if (attributed == 0)
+        {
+            if (!double.IsNaN(frameMeanHz) && frameMeanHz > 0.0 && frameMeanHz < nominalHz && observedHz >= 0.8 * frameMeanHz) { reason = "mean_frame_rate_below_nominal_and_sampler_keeps_up"; return "frame_limited"; }
+            if (ioEvidence) { reason = "writer_dropped_records"; return "io_limited"; }
+            reason = "rate_below_nominal_without_attributable_gaps"; return "unknown";
+        }
+        if ((double)gapsUnknown / attributed >= DominantShare && !ioEvidence) { reason = "gaps_without_frame_evidence"; return "unknown"; }
+        double frameShare = (double)(gapsFrame + gapsMixed) / attributed, ioShare = (double)(gapsIo + gapsMixed) / attributed, schedShare = (double)gapsScheduler / attributed;
+        bool fm = frameShare >= StreamMaterialShare, im = ioShare >= StreamMaterialShare || ioEvidence, sm = schedShare >= StreamMaterialShare;
+        int n = (fm ? 1 : 0) + (im ? 1 : 0) + (sm ? 1 : 0);
+        if (n >= 2) { reason = "more_than_one_cause_is_material"; return "mixed"; }
+        if (fm) { reason = "gaps_explained_by_long_frames"; return "frame_limited"; }
+        if (im) { reason = ioEvidence ? "writer_dropped_records" : "gaps_explained_by_slow_writes"; return "io_limited"; }
+        if (sm) { reason = "frames_and_writes_normal_but_dispatch_late"; return "scheduler_limited"; }
+        reason = "no_cause_is_material"; return "unknown";
+    }
+
+    /// <summary>Coarse stream-less form (rate numbers only), kept for callers without gap evidence: healthy | frame_limited | unknown.</summary>
     public static string Classify(double nominalHz, double observedHz, double frameMeanHz)
     {
-        if (double.IsNaN(observedHz) || observedHz <= 0.0 || nominalHz <= 0.0) return "insufficient_samples";
-        if (observedHz >= 0.9 * nominalHz) return "nominal_achieved";
-        if (!double.IsNaN(frameMeanHz) && frameMeanHz > 0.0 && frameMeanHz < nominalHz && observedHz >= 0.8 * frameMeanHz) return "frame_rate_limited";
-        return "scheduling_or_io_limited";
+        return ClassifyStream(nominalHz, observedHz, frameMeanHz, 0, 0, 0, 0, 0, 0, out _);
     }
 }

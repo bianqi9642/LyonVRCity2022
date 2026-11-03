@@ -56,3 +56,15 @@ Open `session_manifest.json` (`eye_tracking`, `gaze_acquisition_status`, `gaze_a
 ## 6. What is NOT established by this work
 
 Real Quest Pro acquisition; whether the Link runtime exposes eye tracking; the built Android manifest contents; that `WorldSpace` gives correct gaze directions on device; behaviour of `OVRPlugin.StartEyeTracking` being called by two `OVREyeGaze` components in sequence (SDK design, unchanged); the actual frame rate on the Windows machine (the new `frame_timing` / `limit_diagnosis` fields will show it).
+
+## 7. Data-capture reliability additions (schema v11) - what each needs on a Quest Pro
+
+Implemented and Editor-tested only. See `docs/npc_data_schema.md` section 26 for the semantics.
+
+| Item | What was established without hardware | Hardware check required |
+|---|---|---|
+| Confidence (G2) | Source traced through SDK 201.0.0: native provider value, passed through unchanged; 0.5 is only the acceptance threshold. Raw value / blank-when-missing recording and the constant-stream flag are tested with synthetic input. | Record a session on Quest Pro (standalone and Link): does `eye_tracking.confidence.semantics` read `varying_provider_confidence` or `constant_on_this_runtime`? If constant, confidence must not be used as a quality metric on that runtime. |
+| Blink (G3) | Eye-gaze API has no openness; blink needs face tracking (`EyesClosedL/R`), not configured here -> `not_configured`. Detector + capability logic tested with synthetic signals. | Only if the study decides to enable face tracking (data-protection decision): enable `faceTrackingSupport`, the FACE_TRACKING permission and an `OVRFaceExpressions`, confirm `blink.status = available`, calibrate the thresholds on real closures, verify blink counts against a video reference. |
+| Canonical state (M1) | Capability / permission / configured / runtime_available / tracking_active transitions tested with a scripted lifecycle; aliases proven consistent. | Real permission grant / denial dialog, headset removal and resume: check `eye_tracking` and the aliases at each checkpoint. |
+| Session close (M2) | Late focus / pause / NPC / gaze callbacks, duplicate end requests and concurrent submissions tested. | Quit through the End panel and by removing the headset: `session_end` is the last `events.csv` row and no stream grows afterwards. |
+| Sampling diagnosis (M3) | Classification tested with synthetic timing evidence. | Check `rate_*.limit_diagnosis` and `gaps_*` on a real session against the frame timing you observe. |

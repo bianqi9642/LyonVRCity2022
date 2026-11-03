@@ -166,7 +166,7 @@ public partial class NpcLifecycleTests
         string manifest = File.ReadAllText(rig.File("session_manifest.json"));
         Call(rig.dcm, "WriteManifestEnd", "test");
         manifest = File.ReadAllText(rig.File("session_manifest.json"));
-        StringAssert.Contains("\"schema_version\": " + 9, manifest);
+        StringAssert.Contains("\"schema_version\": " + 11, manifest);
         StringAssert.Contains("\"events_csv_npc_rows_rejected\": 0", manifest);
         StringAssert.Contains("events.csv holds participant actions", manifest);
     }

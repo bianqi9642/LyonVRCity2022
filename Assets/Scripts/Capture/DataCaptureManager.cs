@@ -77,6 +77,9 @@ using System.Text;
 using UnityEngine;
 using UnityEngine.AI;
 
+/// <summary>One-way lifecycle of a session's data capture (see DataCaptureManager.FinalizeCapture).</summary>
+public enum CaptureLifecycle { Open, Closing, Closed }
+
 [DisallowMultipleComponent]
 [DefaultExecutionOrder(-100)]
 public class DataCaptureManager : MonoBehaviour
@@ -154,10 +157,10 @@ public class DataCaptureManager : MonoBehaviour
     /// fired (_endPanelActive). Replaces the old CurrentPart==Part2||Part3 rule, which could not express
     /// per-Part configurability.
     /// </summary>
-    public bool TrajectoryCaptureActive => CurrentConfig != null && CurrentConfig.trajectoryCaptureEnabled && _trialActive && !_endPanelActive;
+    public bool TrajectoryCaptureActive => CurrentConfig != null && CurrentConfig.trajectoryCaptureEnabled && _trialActive && !_endPanelActive && CaptureOpen;
 
     /// <summary>Gaze is captured only when the current Part's config enables it, a trial is open, and the End-Panel hard stop has not fired.</summary>
-    public bool GazeCaptureActive => CurrentConfig != null && CurrentConfig.gazeCaptureEnabled && _trialActive && !_endPanelActive;
+    public bool GazeCaptureActive => CurrentConfig != null && CurrentConfig.gazeCaptureEnabled && _trialActive && !_endPanelActive && CaptureOpen;
 
     /// <summary>
     /// THE NPC MASTER SWITCH. True when the effective PartCaptureConfig.npcCaptureEnabled is true: the current Part's config once a Part has started,
@@ -183,7 +186,7 @@ public class DataCaptureManager : MonoBehaviour
     {
         get
         {
-            if (_endPanelActive || !NpcRecordingEnabled) return false;
+            if (_endPanelActive || !NpcRecordingEnabled || !CaptureOpen) return false;
             ExperimentManager.PartCaptureConfig cfg = CurrentConfig ?? SelectedPartConfig();
             return cfg != null && cfg.npcEnabled;
         }
@@ -256,6 +259,7 @@ public class DataCaptureManager : MonoBehaviour
     string _runGuid = "";
     readonly List<string> _npcEventBuf = new List<string>(256);   // npc_events.csv lines waiting for the per-frame flush
     const int NpcEventBufMax = 4096;
+    long _npcEventBufHighWater;   // deepest the npc_events queue got between two flushes (the only write queue in the capture path)
 
     // NEW (NPC warm-up): true while ExperimentManager's pre-trial NPC warm-up window is open (between the
     // npc_warmup_start and npc_warmup_end experiment events for the current Part). Used only to gate
@@ -299,6 +303,7 @@ public class DataCaptureManager : MonoBehaviour
         public bool hasLastState;
         public Vector3 lastDest;
         public bool hasLastDest;
+        public bool destAssigned;       // the FIRST valid destination of this lifetime has been observed (N2: that observation is an initial assignment, never a "change")
         public Animator anim;           // humanoid animator for the LOS eye point (resolved once)
         public bool animLooked;
     }
@@ -317,6 +322,22 @@ public class DataCaptureManager : MonoBehaviour
     RiverTeleportPoint[] _riverPoints;
 
     bool _endWritten;
+
+    // ---- M2: the central capture lifecycle. Open -> Closing -> Closed, one-way. EVERY entry that records experimental data goes through Accepting(): an external caller (application focus /
+    // pause, an NPC callback, a delayed coroutine, another thread) is refused as soon as the state leaves Open; only the finalizing thread may still write while Closing (the records it flushes and
+    // the terminal session_end). The gate is guarded by one lock, so a submission racing the finalization is either entirely before it (accepted, flushed, ordered before session_end) or refused.
+    readonly object _gate = new object();
+    CaptureLifecycle _captureState = CaptureLifecycle.Open;
+    int _finalizerThreadId = -1;
+    long _lateEventsRejected, _lateNpcRecordsRejected;
+    double _captureClosedTAbs = -1;
+    public CaptureLifecycle CaptureState { get { lock (_gate) return _captureState; } }
+    public bool CaptureOpen { get { lock (_gate) return _captureState == CaptureLifecycle.Open; } }
+    /// <summary>Events / NPC records offered after the session closed and refused (diagnostic counters; never written as experimental rows).</summary>
+    public long LateEventsRejected => System.Threading.Interlocked.Read(ref _lateEventsRejected);
+    public long LateNpcRecordsRejected => System.Threading.Interlocked.Read(ref _lateNpcRecordsRejected);
+    bool AcceptingLocked() => _captureState == CaptureLifecycle.Open || (_captureState == CaptureLifecycle.Closing && _finalizerThreadId == System.Threading.Thread.CurrentThread.ManagedThreadId);
+    bool Accepting() { lock (_gate) return AcceptingLocked(); }
     bool _npcProduced;
     readonly List<string> _fileList = new List<string>();
     readonly HashSet<string> _warned = new HashSet<string>();
@@ -326,7 +347,9 @@ public class DataCaptureManager : MonoBehaviour
     // F-18 / F-09 evidence
     SamplingStats _trajStats;
     SampleScheduler _trajScheduler;
-    readonly FrameTimingStats _frameStats = new FrameTimingStats();   // frame durations while a capture window is open (schema v9)
+    readonly FrameTimingStats _frameStats = new FrameTimingStats();
+    /// <summary>Frame timing of the open capture windows (the evidence the sampling loops use to attribute a gap).</summary>
+    public FrameTimingStats FrameStats => _frameStats;   // frame durations while a capture window is open (schema v9)
     EyeTrackingLifecycle _hookedEyeLifecycle;
     int _appPauseCount, _appResumeCount, _trialsStarted, _trialsEnded, _manifestUpdates;
     bool _manifestDirty; string _manifestDirtyReason = ""; double _lastManifestWriteT = -1e9;
@@ -559,26 +582,57 @@ public class DataCaptureManager : MonoBehaviour
 
         NpcLifecycleBus.Detach(OnNpcLifecycle);
         NpcLifecycleBus.ClearGate(_npcGate);
-        EmitOpenLifetimes(_endWritten ? "destroyed_after_end" : "on_destroy");   // idempotent; also flushes npc_events
-
-        if (!_endWritten)
-        {
-            WriteEventRow(CaptureConstants.EvtSessionEnd, CurrentPart, CurrentPhase, "", "", "", "", "", null, "on_destroy", Vector3.zero, Vector3.zero);
-            WriteManifestEnd("on_destroy");
-            _endWritten = true;
-        }
+        FinalizeCapture("on_destroy", "on_destroy");   // a no-op when the session already ended through the End panel / application quit
     }
 
     // The participant confirmed the End panel: part_end was already written (ExperimentManager raises it first). Every row is
     // appended and closed immediately, so nothing is buffered; this writes the same session_end row and manifest end that
     // OnApplicationQuit/OnDestroy would, now, with the reason 'end_confirmed'. Idempotent via _endWritten.
-    void OnSessionEnded()
+    /// <summary>Records a blink start / end (participant stream, explicit event time). Refused after the session closed like every other experimental event.</summary>
+    public void RecordBlinkEvent(string type, double tAbs, double? durationSeconds, string note)
     {
-        EmitOpenLifetimes("session_end");
-        if (_endWritten) return;
-        WriteEventRow(CaptureConstants.EvtSessionEnd, CurrentPart, CurrentPhase, "", "", "", "", "", null, "end_confirmed", Vector3.zero, Vector3.zero);
-        WriteManifestEnd("end_confirmed");
-        _endWritten = true;
+        if (CurrentPart == CaptureConstants.Part1) return;
+        WriteEventRow(type, CurrentPart, CurrentPhase, "", "", "", "", "", durationSeconds, note, Vector3.zero, Vector3.zero, tAbs);
+    }
+
+    void OnSessionEnded() { FinalizeCapture("end_confirmed", "session_end"); }
+
+    // M2: the ONE way a session's data capture ends (End panel confirmed, application quit, component destroyed). Idempotent: only the first call does anything.
+    //   1. Open -> Closing, atomically: from this instant every external submission is refused (WriteEventRow, NPC records, gaze / trajectory / NPC-state samples via the *CaptureActive gates).
+    //   2. Records already accepted are flushed (open NPC lifetimes are closed out, the npc_events buffer is written, the gaze stream is closed after its last accepted row).
+    //   3. The single terminal session_end event is written - necessarily after everything accepted before it - and the manifest end snapshot.
+    //   4. Every session stream is closed (CaptureCsvWriter.Close: nothing can be appended afterwards) and the state becomes Closed.
+    void FinalizeCapture(string endReason, string openLifetimeReason)
+    {
+        lock (_gate)
+        {
+            if (_captureState != CaptureLifecycle.Open) return;
+            _captureState = CaptureLifecycle.Closing;
+            _finalizerThreadId = System.Threading.Thread.CurrentThread.ManagedThreadId;
+        }
+        try
+        {
+            EmitOpenLifetimes(openLifetimeReason);
+            FlushNpcEvents();
+            if (_gazeRecorder != null) _gazeRecorder.CloseForSession();
+            if (!_endWritten)
+            {
+                WriteEventRow(CaptureConstants.EvtSessionEnd, CurrentPart, CurrentPhase, "", "", "", "", "", null, endReason, Vector3.zero, Vector3.zero);
+                WriteManifestEnd(endReason);
+                _endWritten = true;
+            }
+        }
+        finally
+        {
+            CloseSessionStreams();
+            lock (_gate) { _captureState = CaptureLifecycle.Closed; _finalizerThreadId = -1; _captureClosedTAbs = CaptureClock.TAbs; }
+        }
+    }
+
+    void CloseSessionStreams()
+    {
+        foreach (CaptureCsvWriter w in new[] { _events, _traj, _npcState, _npcEvents, _npcLifetimes, _npcProfiles, _registry })
+            if (w != null) w.Close();   // capture_errors.csv is a diagnostic log, not an experimental stream: it stays open
     }
 
     void OnApplicationFocus(bool hasFocus)
@@ -608,14 +662,7 @@ public class DataCaptureManager : MonoBehaviour
         }
     }
 
-    void OnApplicationQuit()
-    {
-        EmitOpenLifetimes("app_quit");
-        if (_endWritten) return;
-        WriteEventRow(CaptureConstants.EvtSessionEnd, CurrentPart, CurrentPhase, "", "", "", "", "", null, "app_quit", Vector3.zero, Vector3.zero);
-        WriteManifestEnd("app_quit");
-        _endWritten = true;
-    }
+    void OnApplicationQuit() { FinalizeCapture("app_quit", "app_quit"); }
 
     // ---------------- experiment event stream ----------------
 
@@ -1098,7 +1145,11 @@ public class DataCaptureManager : MonoBehaviour
 
         long before = _traj.RowsWritten;
         _traj.WriteLine(_traj.Join(_rf));
-        if (_traj.RowsWritten > before) _trajStats?.OnSampleWithFrame(tNow, Time.unscaledDeltaTime);   // only SUCCESSFUL rows count, at the row's own t_abs
+        if (_traj.RowsWritten > before)   // only SUCCESSFUL rows count, at the row's own t_abs
+        {
+            _frameStats.TakeWindow(1, out double fMax, out int fCount);   // frames seen since the previous trajectory sample: the evidence that separates frame gaps from scheduler / writer gaps
+            _trajStats?.OnSampleWithEvidence(tNow, fMax, fCount, _traj.LastCommitSeconds);
+        }
     }
 
     void AppendControllerFields(Transform ct, int trackedFlag)
@@ -1242,13 +1293,24 @@ public class DataCaptureManager : MonoBehaviour
             if (!rec.hasLastState) { rec.lastState = state; rec.hasLastState = true; }
             else rec.lastState = state;
 
-            if (!rec.hasLastDest) { rec.lastDest = navDest; rec.hasLastDest = true; }
-            else if ((navDest - rec.lastDest).sqrMagnitude > 0.25f) // > ~0.5 m
+            if (!rec.destAssigned)
+            {
+                // N2: until the mover really received the lifetime's first destination, NavMeshAgent.destination is only a stale baseline (the pool-parking position / the previous lifetime's
+                // last target) - it is neither an assignment nor a change. The FIRST valid destination is an INITIAL ASSIGNMENT: its own cause, and no jump_m (there is no previous
+                // destination to jump from). The exact-time truth stays npc_movement_start / npc_target_set; this row is the observed destination at the sampling tick.
+                if (rec.pa.MovementStartedThisLife)
+                {
+                    WriteNpcEventRow(CaptureConstants.NpcEvtDestChange, rec, pos, yaw, navDest, "", "", "cause=" + CaptureConstants.DestCauseInitialAssignment + ";prev_dest=none", tAbs, tUnix);
+                    rec.destAssigned = true;
+                }
+                rec.lastDest = navDest; rec.hasLastDest = true;
+            }
+            else if ((navDest - rec.lastDest).sqrMagnitude > 0.25f) // > ~0.5 m: a repeated assignment of (about) the same destination is not a change
             {
                 // ONE observed-destination-change row (the former second row, npc_leg_start, carried identical data and is retired in schema v3).
                 // value_str says why the NavMeshAgent destination moved; the exact-time itinerary events are npc_movement_start / npc_target_set.
                 WriteNpcEventRow(CaptureConstants.NpcEvtDestChange, rec, pos, yaw, navDest, "", "",
-                    "cause=" + DestChangeCause(rec, navDest) + ";jump_m=" + F((navDest - rec.lastDest).magnitude), tAbs, tUnix);
+                    "cause=" + DestChangeCause(rec, navDest) + ";jump_m=" + F((navDest - rec.lastDest).magnitude) + ";prev_dest=" + F(rec.lastDest.x) + "|" + F(rec.lastDest.z), tAbs, tUnix);
                 rec.lastDest = navDest;
             }
         }
@@ -1299,7 +1361,7 @@ public class DataCaptureManager : MonoBehaviour
             Vector3 d = it[i].position - navDest; d.y = 0f;
             if (d.sqrMagnitude <= 2.25f) return "itinerary_target";   // within 1.5 m: NavMeshAgent snaps its destination onto the NavMesh
         }
-        return "other";
+        return CaptureConstants.DestCauseOther;   // a genuine change whose reason cannot be identified stays explicitly "other" (never relabelled as an initial assignment)
     }
 
     void WriteNpcEventRow(string type, NpcRec rec, Vector3 pos, float yaw, Vector3 dest,
@@ -1314,6 +1376,7 @@ public class DataCaptureManager : MonoBehaviour
         bool hasDest, Vector3 dest, string speedSetting, string cornersPacked, string valueStr, int itineraryIndex, string targetId)
     {
         if (_npcEvents == null || !NpcRecordingEnabled) return;
+        if (!Accepting()) { System.Threading.Interlocked.Increment(ref _lateNpcRecordsRejected); return; }
         var f = new List<string>(21);
         f.Add(F(tAbs));
         f.Add(tUnix.ToString(CultureInfo.InvariantCulture));
@@ -1332,6 +1395,7 @@ public class DataCaptureManager : MonoBehaviour
         f.Add(itineraryIndex >= 0 ? itineraryIndex.ToString(CultureInfo.InvariantCulture) : "");
         f.Add(S(targetId));
         _npcEventBuf.Add(_npcEvents.Join(f));
+        if (_npcEventBuf.Count > _npcEventBufHighWater) _npcEventBufHighWater = _npcEventBuf.Count;
         if (_npcEventBuf.Count >= NpcEventBufMax) FlushNpcEvents();
     }
 
@@ -1346,7 +1410,7 @@ public class DataCaptureManager : MonoBehaviour
     void LateUpdate()
     {
         FlushNpcEvents();
-        if (_trialActive && !_endPanelActive && Time.unscaledDeltaTime < 2.0f) _frameStats.OnFrame(Time.unscaledDeltaTime);
+        if (_trialActive && !_endPanelActive) { if (Time.unscaledDeltaTime < 2.0f) _frameStats.OnFrame(Time.unscaledDeltaTime); else _frameStats.OnStallFrame(Time.unscaledDeltaTime); }
         EnsureEyeLifecycleHooked();
         // A write error on any stream (including gaze, which owns its own writer) triggers a manifest checkpoint, so a failure is visible without waiting for the end.
         long errs = TotalWriteErrors();
@@ -1393,6 +1457,7 @@ public class DataCaptureManager : MonoBehaviour
     void WriteLifetimeRow(NpcRec rec, double spawnAbs, long spawnUnix, double registeredAbs, string registration)
     {
         if (_npcLifetimes == null || !NpcRecordingEnabled) return;
+        if (!Accepting()) { System.Threading.Interlocked.Increment(ref _lateNpcRecordsRejected); return; }
         PedestrianAgent pa = rec.pa;
         IReadOnlyList<Transform> it = pa.ItineraryTransformsView;
         int n = it != null ? it.Count : 0;
@@ -1461,6 +1526,7 @@ public class DataCaptureManager : MonoBehaviour
     void WriteProfileRegistryRow(NpcLifetimeProfile lp)
     {
         if (lp == null || lp.profileContentHash.Length == 0 || _npcProfiles == null || !NpcRecordingEnabled) return;
+        if (!Accepting()) { System.Threading.Interlocked.Increment(ref _lateNpcRecordsRejected); return; }
         if (!_profilesWritten.Add(lp.profileContentHash)) return;
         var f = new List<string>(5)
         {
@@ -1478,6 +1544,9 @@ public class DataCaptureManager : MonoBehaviour
     {
         try
         {
+            lock (_gate)   // check + write are one atomic step with respect to the finalization (see M2 above); the shared row buffer needs the lock anyway
+            {
+            if (!AcceptingLocked()) { System.Threading.Interlocked.Increment(ref _lateEventsRejected); return; }   // the session is closing / closed: no experimental event is accepted
             // ROUTING GUARD (last line of defence): events.csv is the participant / experiment stream. An NPC-subject event type, or any row that tries
             // to carry NPC identity, belongs to npc_events.csv and is refused here whatever path produced it (generic experiment callback, bus replay,
             // late registration ...). Counted in the manifest; it should stay 0.
@@ -1502,6 +1571,7 @@ public class DataCaptureManager : MonoBehaviour
             _rf.Add(S(SessionId));
             _rf.Add(S(interactionId));   // schema v6: links building_click to its correct/incorrect outcome; blank on every other event
             _events.WriteLine(_events.Join(_rf));
+            }
         }
         catch (Exception ex) { WarnOnce("evt_write", "events.csv write failed: " + ex.Message); }
     }
@@ -1699,11 +1769,15 @@ public class DataCaptureManager : MonoBehaviour
         public double nominal_hz, observed_hz = -1, mean_interval_s = -1, median_interval_s = -1, p95_interval_s = -1, max_interval_s = -1, gap_threshold_s;
         public long samples, intervals, epochs, intentional_breaks, unexpected_gaps, non_monotonic;
         public double first_t_abs = -1, last_t_abs = -1;
-        // schema v9: WHY the achieved rate differs from nominal. gaps_frame_limited = unexpected gaps mostly explained by one long frame. limit_diagnosis (see RateDiagnosis):
-        // insufficient_samples | nominal_achieved | frame_rate_limited | scheduling_or_io_limited. frame_mean_hz = measured update rate while capture windows were open.
-        public long gaps_frame_limited, scheduler_ticks, scheduler_skipped_ticks;
+        // WHY the achieved rate differs from nominal (schema v9, evidence model replaced in v11). Every unexpected gap is attributed from measurements (RateDiagnosis.AttributeGap): gaps_frame_limited
+        // (Unity gave the sampler no chance to run: long frame time not explained by writing), gaps_io_limited (the previous row's write consumed the gap), gaps_scheduler_limited (frames and writes were
+        // normal, dispatch was late), gaps_mixed (frame time and writes both material), gaps_unknown (no frame evidence). limit_diagnosis (RateDiagnosis.ClassifyStream):
+        // healthy | frame_limited | scheduler_limited | io_limited | mixed | unknown, with limit_diagnosis_reason. frame_mean_hz = measured update rate while capture windows were open.
+        public long gaps_frame_limited, gaps_io_limited, gaps_scheduler_limited, gaps_mixed, gaps_unknown, scheduler_ticks, scheduler_skipped_ticks;
         public double scheduler_max_lateness_s = -1, frame_mean_hz = -1;
-        public string limit_diagnosis = "insufficient_samples";
+        public string limit_diagnosis = "unknown", limit_diagnosis_reason = "insufficient_samples";
+        // The stream's own writer (synchronous open + append + close per row; there is no write queue): cost per row and any dropped record.
+        public long writer_commits, writer_rows_dropped; public double writer_write_ms_mean = -1, writer_write_ms_max = -1;
     }
 
     [Serializable]
@@ -1721,6 +1795,9 @@ public class DataCaptureManager : MonoBehaviour
         public bool is_editor;
         public string device_model, device_name, graphics_device, scene_name, xr_device;
         public int target_frame_rate;
+        // DEPRECATED COMPATIBILITY ALIASES (schema v11): recomputed from the canonical eye_tracking block at every serialisation (DeriveEyeTrackingAliases), never updated independently:
+        //   eye_tracking_supported = (eye_tracking.capability == "supported"); eye_tracking_enabled = eye_tracking.runtime_available (OVRPlugin reports eye tracking enabled);
+        //   eye_tracking_permission_granted = the permission requirement is satisfied (permission == "granted", or "not_applicable" on platforms without it).
         public bool eye_tracking_supported, eye_tracking_enabled, eye_tracking_permission_granted;
         public bool gaze_left_present, gaze_right_present;
         public float gaze_confidence_threshold;
@@ -1765,6 +1842,7 @@ public class DataCaptureManager : MonoBehaviour
         public float gaze_valid_eye_fraction = -1, gaze_valid_eye_rate_hz = -1;
         public int gaze_recording_starts, gaze_pause_count, gaze_resume_count;
         // "true" / "false" / "unknown" (unknown = not queryable on this platform, or the SDK threw). The legacy bool fields above cannot express unknown.
+        // deprecated string aliases of eye_tracking.capability / .tracking_enabled_state / .permission ("true" | "false" | "not_applicable" | "unknown"), derived like the booleans above
         public string eye_tracking_supported_state = "unknown", eye_tracking_enabled_state = "unknown", eye_tracking_permission_state = "unknown";
         public double eye_tracking_queried_t_abs = -1;
         // ---- schema v9: acquisition vs writer health (kept separate on purpose) ----
@@ -1773,6 +1851,15 @@ public class DataCaptureManager : MonoBehaviour
         //                           initialization_failed | running | tracking_unavailable | stopped). "writer ok" says NOTHING about the second one.
         public string gaze_writer_status = "unknown", gaze_acquisition_status = "unknown", gaze_acquisition_reason = "";
         public EyeTrackingManifest eye_tracking = new EyeTrackingManifest();
+
+        // ---- schema v10: NPC preparation (pool preparation vs fixed behaviour warm-up vs Start-gated pause / resume) and the random sources behind NPC behaviour ----
+        // pool_prewarm_* counts INACTIVE pool objects; active_npcs_* counts the visible NPC population. They are different quantities.
+        public NpcPreparationInfo npc_preparation = new NpcPreparationInfo();
+        // schema v11: the central capture lifecycle (Open / Closing / Closed) and what it refused. late_* are diagnostic counters of records offered after the session closed; they are never rows.
+        public string capture_lifecycle_state = "Open";
+        public double capture_closed_t_abs = -1;
+        public long late_events_rejected, late_npc_records_rejected, late_gaze_rows_rejected, npc_event_buffer_high_water;
+        public string npc_random_sources = "";
         public FrameTimingSummary frame_timing = new FrameTimingSummary();
         public int trials_started, trials_ended, app_pause_count, app_resume_count, manifest_updates;
         public string last_manifest_update_reason = "";
@@ -1894,14 +1981,8 @@ public class DataCaptureManager : MonoBehaviour
             scene_name = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name,
             xr_device  = SafeXrDevice(),
 
-            eye_tracking_supported_state = EyeStateSupported(),
-            eye_tracking_enabled_state = EyeStateEnabled(),
-            eye_tracking_permission_state = EyeStatePermission(),
             eye_tracking_queried_t_abs = CaptureClock.TAbs,
             gaze_recorder_present = _gazeRecorder != null,
-            eye_tracking_supported = SafeEyeSupported(),
-            eye_tracking_enabled   = SafeEyeEnabled(),
-            eye_tracking_permission_granted = SafeEyePermission(),
             gaze_left_present  = _gazeRecorder != null && _gazeRecorder.leftEyeGaze  != null,
             gaze_right_present = _gazeRecorder != null && _gazeRecorder.rightEyeGaze != null,
             gaze_confidence_threshold = _gazeRecorder != null ? _gazeRecorder.minConfidenceForValid : 0f,
@@ -2022,6 +2103,7 @@ public class DataCaptureManager : MonoBehaviour
     void WriteManifestEnd(string reason)
     {
         if (_manifest == null) return;
+        if (!Accepting()) return;   // M2: the end snapshot of a closed session is final - a late pause / quit callback must not overwrite end_reason / ended_utc
         _manifest.ended_utc     = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
         _manifest.t_abs_at_end  = F(CaptureClock.TAbs);
         _manifest.end_reason    = reason;
@@ -2096,13 +2178,14 @@ public class DataCaptureManager : MonoBehaviour
             _manifest.gaze_rows_left_valid = g.RowsLeftValid; _manifest.gaze_rows_right_valid = g.RowsRightValid;
             _manifest.gaze_recording_starts = g.RecordingStarts; _manifest.gaze_pause_count = g.PauseCount; _manifest.gaze_resume_count = g.ResumeCount;
             _manifest.gaze_valid_eye_fraction = g.RowsWritten > 0 ? (float)g.RowsValidEye / g.RowsWritten : -1f;
-            FillRate(_manifest.rate_gaze, g.Sampling, _frameStats, g.Scheduler);
+            FillRate(_manifest.rate_gaze, g.Sampling, _frameStats, g.Scheduler, g.Writer != null ? g.Writer.RowsDroppedAfterFailure : 0);
             _manifest.gaze_valid_eye_rate_hz = _manifest.rate_gaze.available && _manifest.gaze_valid_eye_fraction >= 0 ? (float)(_manifest.rate_gaze.observed_hz * _manifest.gaze_valid_eye_fraction) : -1f;
         }
         gh.status = StatusOf(gh, false);
-        FillRate(_manifest.rate_trajectory, _trajStats, _frameStats, _trajScheduler);
+        FillRate(_manifest.rate_trajectory, _trajStats, _frameStats, _trajScheduler, _traj != null ? _traj.RowsDroppedAfterFailure : 0);
         FillFrameTiming(_manifest.frame_timing);
         FillEyeTracking(gh);
+        FillNpcPreparation();
 
         _manifest.trials_started = _trialsStarted; _manifest.trials_ended = _trialsEnded;
         _manifest.app_pause_count = _appPauseCount; _manifest.app_resume_count = _appResumeCount;
@@ -2111,8 +2194,7 @@ public class DataCaptureManager : MonoBehaviour
         _lastManifestWriteT = CaptureClock.TAbs; _manifestDirty = false;
 
         // eye tracking state is re-queried at every checkpoint (capability can change: headset removed, permission granted late)
-        _manifest.eye_tracking_supported_state = EyeStateSupported(); _manifest.eye_tracking_enabled_state = EyeStateEnabled();
-        _manifest.eye_tracking_permission_state = EyeStatePermission(); _manifest.eye_tracking_queried_t_abs = CaptureClock.TAbs;
+        // (the eye-tracking aliases, including eye_tracking_queried_t_abs, are derived from the canonical block inside FillEyeTracking, in the same call: one source of truth)
 
         // legacy flags (see the Manifest comment): ok, or nothing was expected
         _manifest.trajectory_ok = OkOrNotExpected(_manifest.health_trajectory);
@@ -2154,12 +2236,54 @@ public class DataCaptureManager : MonoBehaviour
         return h.rows_written > 0 ? "ok" : "configured_no_rows";
     }
 
+    // NPC preparation block: the frozen settings + timestamps live in ExperimentManager.NpcPreparation; the live pool counters are refreshed here (a partial count while the pool is still being prepared).
+    void FillNpcPreparation()
+    {
+        if (_experimentManager != null)
+        {
+            NpcPreparationInfo prep = _experimentManager.NpcPreparation;
+            if (_spawner != null && prep.applicable)
+            {
+                prep.pool_preparation_target_count = _spawner.PoolPrewarmTarget;
+                prep.pool_preparation_created_count = _spawner.PoolPrewarmCreated;
+                if (!double.IsNaN(_spawner.PoolLastProgressTAbs)) prep.pool_preparation_last_progress_t_abs = _spawner.PoolLastProgressTAbs;
+            }
+            _manifest.npc_preparation = prep;
+        }
+        string entrance = (_spawner != null && _spawner.EntranceRngSeeded) ? ("seed=" + _spawner.EntranceRngSeed.ToString(System.Globalization.CultureInfo.InvariantCulture) + " (TickCount-based)") : "not_yet_created";
+        _manifest.npc_random_sources =
+            "UnityEngine.Random: not seeded (Unity's own startup seed, not readable); entrance placement: private System.Random " + entrance +
+            "; AttractorDwell: one TickCount-seeded System.Random per instance. A fixed warm-up duration standardises the preparation period only; NPC trajectories are NOT identical across sessions " +
+            "and are not replayable.";
+    }
+
     // Acquisition block + the explicit writer-vs-acquisition split. Reads only; the lifecycle itself is driven by EyeTrackingLifecycleController.
     void FillEyeTracking(StreamHealth gazeHealth)
     {
         EyeTrackingLifecycle lc = _gazeRecorder != null ? _gazeRecorder.Lifecycle : null;
         EyeTrackingManifest et = _manifest.eye_tracking;
         et.FillLifecycle(lc, CaptureClock.TAbs, _gazeRecorder != null && _gazeRecorder.lifecycleController != null ? _gazeRecorder.lifecycleController.HostConflict : "");
+        if (_gazeRecorder != null)
+        {
+            GazeRecorder gr = _gazeRecorder;
+            gr.ConfidenceInfo.project_acceptance_threshold = gr.minConfidenceForValid; gr.ConfidenceInfo.Refresh(); et.confidence = gr.ConfidenceInfo;
+            BlinkManifest bm = et.blink;
+            bm.status = gr.BlinkStatus; bm.reason = gr.BlinkReason; BlinkFacts bf = gr.BlinkFactsLast;
+            bm.ovrplugin_initialized = bf.OvrPluginInitialized; bm.runtime_face_tracking_supported = bf.FaceTrackingSupported; bm.runtime_face_tracking_enabled = bf.FaceTrackingEnabled;
+            bm.component_present = bf.ComponentPresent; bm.permission_granted = bf.PermissionGranted; bm.signal_valid = bf.SignalValid;
+            if (gr.Blink != null)
+            {
+                bm.close_threshold = gr.Blink.CloseThreshold; bm.open_threshold = gr.Blink.OpenThreshold;
+                bm.blinks_detected = gr.Blink.Blinks; bm.blinks_truncated = gr.Blink.TruncatedBlinks; bm.unilateral_closure_samples = gr.Blink.UnilateralClosureSamples;
+                bm.invalid_samples = gr.Blink.InvalidSamples; bm.out_of_range_samples = gr.Blink.OutOfRangeSamples;
+                bm.mean_duration_s = gr.Blink.Blinks > 0 ? gr.Blink.MeanDuration : -1; bm.max_duration_s = gr.Blink.Blinks > 0 ? gr.Blink.MaxDuration : -1;
+            }
+            bm.absence_of_blink_events_is_evidence_of_no_blinks = gr.BlinkStatus == BlinkCapability.Available;
+            _manifest.late_gaze_rows_rejected = gr.LateRowsRejected;
+        }
+        DeriveEyeTrackingAliases(et);
+        _manifest.capture_lifecycle_state = CaptureState.ToString(); _manifest.capture_closed_t_abs = _captureClosedTAbs;
+        _manifest.late_events_rejected = LateEventsRejected; _manifest.late_npc_records_rejected = LateNpcRecordsRejected; _manifest.npc_event_buffer_high_water = _npcEventBufHighWater;
         if (_gazeRecorder != null)
         {
             GazeRecorder g = _gazeRecorder;
@@ -2169,6 +2293,11 @@ public class DataCaptureManager : MonoBehaviour
             et.first_valid_row_t_abs = double.IsNaN(g.FirstValidRowT) ? -1 : g.FirstValidRowT;
             et.last_valid_row_t_abs = double.IsNaN(g.LastValidRowT) ? -1 : g.LastValidRowT;
             et.longest_no_valid_eye_s = g.LongestNoValidEyeSeconds;
+            EyeGazeOrigin.DeviationStats os = g.OriginStats;
+            et.origin_validation_enabled = g.validateProviderOrigin; et.origin_max_allowed_deviation_m = g.maxProviderOriginDeviationMeters;
+            et.origin_samples_checked = os.Checked; et.origin_samples_provider = os.Provider; et.origin_samples_eye_anchor_fallback = os.AnchorFallback; et.origin_samples_unchecked = os.Unchecked;
+            et.origin_deviation_max_m = os.FiniteCount > 0 ? os.MaxDeviation : -1; et.origin_deviation_mean_m = os.MeanDeviation;
+            Vector3 mo = os.MeanOffset; et.origin_mean_offset_x_m = mo.x; et.origin_mean_offset_y_m = mo.y; et.origin_mean_offset_z_m = mo.z;
         }
         _manifest.gaze_writer_status = gazeHealth.status;
         if (_gazeRecorder == null) { _manifest.gaze_acquisition_status = "unknown"; _manifest.gaze_acquisition_reason = "no_gaze_recorder"; }
@@ -2193,13 +2322,17 @@ public class DataCaptureManager : MonoBehaviour
         f.frames_over_100ms = _frameStats.Over100ms;
     }
 
-    static void FillRate(RateSummary r, SamplingStats st, FrameTimingStats fs = null, SampleScheduler sch = null)
+    static void FillRate(RateSummary r, SamplingStats st, FrameTimingStats fs = null, SampleScheduler sch = null, long writerRowsDropped = 0)
     {
         if (st == null) return;
-        r.gaps_frame_limited = st.GapsFrameLimited;
+        r.gaps_frame_limited = st.GapsFrameLimited; r.gaps_io_limited = st.GapsIoLimited; r.gaps_scheduler_limited = st.GapsSchedulerLimited; r.gaps_mixed = st.GapsMixed; r.gaps_unknown = st.GapsUnknown;
+        r.writer_commits = st.Writes; r.writer_rows_dropped = writerRowsDropped;
+        r.writer_write_ms_mean = st.Writes > 0 ? st.WriteSecondsSum / st.Writes * 1000.0 : -1; r.writer_write_ms_max = st.Writes > 0 ? st.WriteSecondsMax * 1000.0 : -1;
         if (sch != null) { r.scheduler_ticks = sch.Ticks; r.scheduler_skipped_ticks = sch.SkippedTicks; r.scheduler_max_lateness_s = sch.MaxLateness; }
         r.frame_mean_hz = fs != null && fs.Available ? fs.MeanHz : -1;
-        r.limit_diagnosis = RateDiagnosis.Classify(st.NominalHz, st.EstimateAvailable ? st.ObservedHz : double.NaN, fs != null && fs.Available ? fs.MeanHz : double.NaN);
+        r.limit_diagnosis = RateDiagnosis.ClassifyStream(st.NominalHz, st.EstimateAvailable ? st.ObservedHz : double.NaN, fs != null && fs.Available ? fs.MeanHz : double.NaN,
+            st.GapsFrameLimited, st.GapsSchedulerLimited, st.GapsIoLimited, st.GapsMixed, st.GapsUnknown, writerRowsDropped, out string why);
+        r.limit_diagnosis_reason = why;
         r.nominal_hz = st.NominalHz; r.gap_threshold_s = st.GapThreshold;
         r.samples = st.Samples; r.intervals = st.Intervals; r.epochs = st.Epochs; r.intentional_breaks = st.IntentionalBreaks;
         r.unexpected_gaps = st.UnexpectedGaps; r.non_monotonic = st.NonMonotonic;
@@ -2346,6 +2479,20 @@ public class DataCaptureManager : MonoBehaviour
 
     // Tri-state capability reporting: "true"/"false" only when the platform can really answer; otherwise "unknown" (never a disguised false).
     // In the Editor OVRPlugin cannot distinguish "no eye tracking" from "no runtime", so a false there is unknown; a true is real evidence.
+    // The legacy top-level eye-tracking fields are NOT state of their own: they are recomputed from the canonical eye_tracking block each time the manifest is built.
+    void DeriveEyeTrackingAliases(EyeTrackingManifest et)
+    {
+        _manifest.eye_tracking_supported_state = et.capability == "supported" ? "true" : (et.capability == "unsupported" ? "false" : "unknown");
+        _manifest.eye_tracking_enabled_state = et.tracking_enabled_state;
+        _manifest.eye_tracking_permission_state = et.permission == "granted" ? "true" : (et.permission == "denied" || et.permission == "denied_permanently" ? "false" : (et.permission == "not_applicable" ? "not_applicable" : "unknown"));
+        _manifest.eye_tracking_supported = et.capability == "supported";
+        _manifest.eye_tracking_enabled = et.runtime_available;
+        _manifest.eye_tracking_permission_granted = et.permission == "granted" || et.permission == "not_applicable";
+        _manifest.gaze_left_present = _gazeRecorder != null && _gazeRecorder.leftEyeGaze != null;
+        _manifest.gaze_right_present = _gazeRecorder != null && _gazeRecorder.rightEyeGaze != null;
+        _manifest.eye_tracking_queried_t_abs = et.queried_t_abs;
+    }
+
     static string EyeStateSupported() { try { bool v = OVRPlugin.eyeTrackingSupported; return v ? "true" : (Application.isEditor ? "unknown" : "false"); } catch { return "unknown"; } }
     static string EyeStateEnabled()   { try { bool v = OVRPlugin.eyeTrackingEnabled;   return v ? "true" : (Application.isEditor ? "unknown" : "false"); } catch { return "unknown"; } }
     static string EyeStatePermission()

@@ -291,6 +291,9 @@ public class UncertainBehavior : MonoBehaviour
 
     void Update()
     {
+        // NPC simulation pause (fixed warm-up -> Start panel): state timers and the per-second random rolls neither advance nor consume random numbers.
+        if (NpcSimulationGate.Paused) return;
+
         float dt = Time.deltaTime;
 
         // If we've been suspended due to arrival, do nothing — uncertain behavior is stopped.

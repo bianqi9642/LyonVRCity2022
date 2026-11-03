@@ -604,6 +604,20 @@ public sealed class EyeTrackingLifecycle
 [Serializable]
 public class EyeTrackingManifest
 {
+    // ================= CANONICAL eye-tracking state (schema v11): the ONE source of truth for the independent concepts below. Everything else in the manifest that mentions eye tracking status
+    // (eye_tracking_supported/_enabled/_permission_granted and their *_state strings) is an ALIAS computed from these at every serialisation - never an independently updated value. =================
+    //   capability      : does the hardware / runtime support the feature        supported | unsupported | unknown
+    //   permission      : is the platform permission satisfied                  granted | denied | denied_permanently | not_applicable (the platform has no such permission) | unknown | ...
+    //   configured      : did the application enable it (lifecycle active, both OVREyeGaze components present and not disabled by configuration)
+    //   runtime_available: is the provider accessible in this execution (OVRPlugin reports eye tracking enabled)
+    //   tracking_active : is valid tracking being supplied right now (lifecycle Running; TrackingUnavailable = lost, not "revoked")
+    // A temporary loss of tracking changes tracking_active only; it never changes capability, permission or configured.
+    public string capability = "unknown", permission = "unknown";
+    public bool configured, runtime_available, tracking_active;
+    public double last_state_change_t_abs = -1;
+    public string provider = "OVRPlugin.GetEyeGazesState via OVREyeGaze (Meta XR SDK)";
+    public string sdk_version = "unknown";
+
     public bool lifecycle_present;
     public string runtime_path = "unknown";
     public bool permission_applicable;
@@ -623,6 +637,16 @@ public class EyeTrackingManifest
     // recorder-level: counted from gaze.csv rows actually written
     public long rows_valid_combined, rows_fallback, rows_fallback_not_acquiring, rows_stale_confidence_rejected, rows_host_conflict_blocked, rows_left_valid, rows_right_valid;
     public double first_valid_row_t_abs = -1, last_valid_row_t_abs = -1, longest_no_valid_eye_s;
+
+    // gaze origin validation (schema v10): provider eye origin vs the rig's own eye anchor, counted over valid eye samples (see EyeGazeOrigin). origin_mean_offset_* is
+    // provider minus anchor in WORLD axes: a constant non-zero vertical component is the signature of a tracking-origin mismatch between the eye pose and the head pose.
+    public bool origin_validation_enabled;
+    public long origin_samples_checked, origin_samples_provider, origin_samples_eye_anchor_fallback, origin_samples_unchecked;
+    public double origin_deviation_max_m = -1, origin_deviation_mean_m = -1, origin_mean_offset_x_m, origin_mean_offset_y_m, origin_mean_offset_z_m, origin_max_allowed_deviation_m = -1;
+
+    // raw provider confidence behaviour (see GazeConfidence) and the blink-signal capability (see BlinkCapability)
+    public ConfidenceManifest confidence = new ConfidenceManifest();
+    public BlinkManifest blink = new BlinkManifest();
 
     public int transitions_dropped;
     public System.Collections.Generic.List<EyeTrackingTransition> transitions = new System.Collections.Generic.List<EyeTrackingTransition>();
@@ -650,6 +674,18 @@ public class EyeTrackingManifest
         transitions_dropped = lc.DroppedTransitions;
         transitions.Clear();
         for (int i = 0; i < lc.Transitions.Count; i++) transitions.Add(lc.Transitions[i]);
+        DeriveCanonical(lc);
+    }
+
+    void DeriveCanonical(EyeTrackingLifecycle lc)
+    {
+        capability = capability_state;
+        permission = permission_state;
+        configured = lc.State != EyeTrackingState.NotApplicable && lc.State != EyeTrackingState.Idle && left_component_state != "absent" && right_component_state != "absent";
+        runtime_available = tracking_enabled_state == "true";
+        tracking_active = lc.State == EyeTrackingState.Running;
+        last_state_change_t_abs = lc.Transitions.Count > 0 ? lc.Transitions[lc.Transitions.Count - 1].t_abs : -1;
+        try { sdk_version = "OVRPlugin " + OVRPlugin.version + " (Meta XR SDK Core 201.0.0)"; } catch (System.Exception) { sdk_version = "unknown"; }
     }
 }
 
@@ -663,4 +699,23 @@ public class FrameTimingSummary
     public long frames_over_100ms;
     public int target_frame_rate, vsync_count;
     public float capture_delta_time, time_scale;
+}
+
+
+/// <summary>Manifest block "eye_tracking.blink": whether a blink / eye-closure signal exists on this runtime and project configuration, and what was detected from it. The ABSENCE of blink events is
+/// evidence of "no blinks" only when status == available.</summary>
+[Serializable]
+public class BlinkManifest
+{
+    public string status = "unavailable";      // unsupported | unavailable | not_configured | available (BlinkCapability)
+    public string reason = "not_evaluated_yet";
+    public bool eye_gaze_api_exposes_openness = false;   // read from the installed SDK: EyeGazeState = { Pose, Confidence, IsValid }
+    public string signal = "FaceExpression.EyesClosedL / EyesClosedR blendshape weights (0..1) from Meta face tracking (OVRFaceExpressions); separate from eye tracking";
+    public string requires = "OculusProjectConfig.faceTrackingSupport + com.oculus.permission.FACE_TRACKING + an OVRFaceExpressions component; records facial data";
+    public bool ovrplugin_initialized, runtime_face_tracking_supported, runtime_face_tracking_enabled, component_present, permission_granted, signal_valid;
+    public bool thresholds_calibrated = false;
+    public float close_threshold, open_threshold;
+    public long blinks_detected, blinks_truncated, unilateral_closure_samples, invalid_samples, out_of_range_samples;
+    public double mean_duration_s = -1, max_duration_s = -1;
+    public bool absence_of_blink_events_is_evidence_of_no_blinks;
 }

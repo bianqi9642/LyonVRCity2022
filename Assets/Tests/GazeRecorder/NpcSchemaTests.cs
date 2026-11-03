@@ -90,11 +90,22 @@ public partial class NpcLifecycleTests
 
         // each dest_change: itinerary cause, a real jump, a preceding npc_target_set for the same target (exact time <= observation time)
         double prevX = double.NaN, prevZ = double.NaN;
+        int destIndex = 0;
         foreach (var r in dest)
         {
             string value = nev.Get(r, "value_str");
+            if (destIndex++ == 0)
+            {
+                // N2: the lifetime's FIRST valid destination is an initial assignment - not a change, no jump from a stale baseline
+                Assert.AreEqual("initial_assignment", ValueField(value, "cause"), value);
+                Assert.AreEqual("none", ValueField(value, "prev_dest"), value);
+                Assert.IsFalse(value.Contains("jump_m"), "no previous destination, so no jump: " + value);
+                prevX = D(nev.Get(r, "dest_x")); prevZ = D(nev.Get(r, "dest_z"));
+                continue;
+            }
             Assert.AreEqual("itinerary_target", ValueField(value, "cause"), value);
             Assert.Greater(D(ValueField(value, "jump_m")), 0.5, "a destination change is a jump of more than 0.5 m");
+            Assert.AreNotEqual("none", ValueField(value, "prev_dest"), "a genuine change names the destination it left");
             double x = D(nev.Get(r, "dest_x")), z = D(nev.Get(r, "dest_z"));
             if (!double.IsNaN(prevX)) Assert.Greater(Math.Sqrt((x - prevX) * (x - prevX) + (z - prevZ) * (z - prevZ)), 0.5, "consecutive rows have different destinations");
             prevX = x; prevZ = z;

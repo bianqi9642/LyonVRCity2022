@@ -47,6 +47,7 @@ public partial class NpcLifecycleTests
         T("CaptureIO").GetField("FaultInjector").SetValue(null, null);
         T("CaptureClock").GetField("TestSource").SetValue(null, null);
         CallStatic(AoiType, "ResetDiagnostics");
+        CallStatic(T("NpcSimulationGate"), "Reset");   // the NPC pause is process-wide static state: no test may inherit another test's pause
         _root = Path.Combine(Path.GetTempPath(), "NpcLifecycleTests_" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_root);
     }
@@ -58,6 +59,9 @@ public partial class NpcLifecycleTests
     {
         foreach (var o in _spawned) if (o != null) UnityEngine.Object.Destroy(o);
         _spawned.Clear();
+        yield return null;
+        // Pooled / instantiated NPC clones are not owned by the spawner's GameObject: a leftover clone (collider and all) would be hit by the next test's rays.
+        foreach (var leftover in UnityEngine.Object.FindObjectsOfType(PedType)) UnityEngine.Object.Destroy(((Component)leftover).gameObject);
         yield return null;
         yield return null;
         if (_navInstance.valid) NavMesh.RemoveNavMeshData(_navInstance);
@@ -101,6 +105,8 @@ public partial class NpcLifecycleTests
         public bool withAppearance = false;         // AppearanceController with hair + top SkinnedMeshRenderers
         public bool realPart = false;               // do NOT simulate part_start / the NPC simulation: the test starts the real ExperimentManager.RunPartN itself
         public UnityEngine.Object profile;          // AgentProfile applied through the production AgentFactory (null = none)
+        public bool noAgentPrefab = false;          // SpawnerManager.agentPrefab left null: pool creation must fail explicitly
+        public float prewarmBudgetMs = -1f;         // SpawnerManager.prewarmFrameBudgetMs (>= 0 overrides the default; tiny = about one pooled object per frame)
     }
 
     GameObject Make(string name, bool active = true)
@@ -224,7 +230,7 @@ public partial class NpcLifecycleTests
             Set(rig.spawner, "agentFactory", rig.factory);
             Set(rig.spawner, "defaultProfile", o.profile);
         }
-        Set(rig.spawner, "agentPrefab", rig.template);
+        if (!o.noAgentPrefab) Set(rig.spawner, "agentPrefab", rig.template);
         Set(rig.spawner, "entrances", rig.entrances);
         Set(rig.spawner, "exits", rig.exits);
         Set(rig.spawner, "wanderingPoints", rig.wandering);
@@ -233,6 +239,7 @@ public partial class NpcLifecycleTests
         Set(rig.spawner, "spawnInterval", o.spawnInterval);
         Set(rig.spawner, "usePooling", true);
         Set(rig.spawner, "entranceSpawnRadius", o.entranceRadius);
+        if (o.prewarmBudgetMs >= 0f) Set(rig.spawner, "prewarmFrameBudgetMs", o.prewarmBudgetMs);
         if (o.attractor)
         {
             var attractorType = T("AttractorInfo");
@@ -768,7 +775,7 @@ public partial class NpcLifecycleTests
         Call(rig.em, "TerminateSession", "Part3");
         yield return null;
         string manifest = File.ReadAllText(rig.File("session_manifest.json"));
-        StringAssert.Contains("\"schema_version\": " + 9, manifest);
+        StringAssert.Contains("\"schema_version\": " + 11, manifest);
         StringAssert.Contains("agent-lifetime-v1", manifest);
         StringAssert.Contains("(session_id, npc_spawn_instance_id)", manifest);
         StringAssert.Contains("master_switch", manifest);

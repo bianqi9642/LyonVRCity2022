@@ -35,6 +35,10 @@
 //    the provider probe is available and requireProviderValidity) the provider flagged that eye valid. Head-forward fallback rows stay identifiable (ray_is_eye_gaze=0).
 //  - Samples are scheduled on an absolute deadline grid (SampleScheduler) instead of "wait interval after each sample", which drifted below the nominal rate.
 //
+// Revision 4 (gaze origin, schema v10) - ADDITIVE: each eye's world-space origin is validated against the rig's own eye anchor (EyeGazeOrigin). The SDK's WorldSpace conversion mixes
+//  two tracking origins when the rig is EyeLevel and the eye pose is not (observed: constant +1.361 m vertical offset); an implausible provider origin is replaced by the rig eye anchor
+//  and labelled in the appended column gaze_origin_source. Direction, per-eye validity, confidence and the head-forward fallback are unchanged. See docs/gaze_origin_verification.md.
+//
 // All comments in English per project convention.
 
 using System;
@@ -70,6 +74,43 @@ public class GazeRecorder : MonoBehaviour
     [Tooltip("If true (default), eye samples are recorded as invalid (head_fallback) while an OVREyeGaze sits directly on an OVRCameraRig eye anchor: the rig rewrites that " +
              "transform every frame, so its pose would be the eye-camera pose, not the gaze pose.")]
     public bool blockEyeSamplesOnHostConflict = true;
+
+    [Header("Blink (Quest Pro FACE tracking - not part of eye tracking)")]
+    [Tooltip("Optional OVRFaceExpressions (Meta face tracking). The eye-gaze API has NO eye-openness signal; the only blink-capable signal in the installed SDK is FaceExpression.EyesClosedL/R from face tracking, " +
+             "which needs OculusProjectConfig.faceTrackingSupport, the FACE_TRACKING permission and this component. Left empty (the shipped state) the blink capability is reported 'not_configured' in the manifest and no " +
+             "blink is ever recorded or inferred. Enabling face tracking records facial data and is a data-protection decision for the study.")]
+    public OVRFaceExpressions faceExpressions;
+
+    [Tooltip("Both eyes' closure weight (0..1) at or above this starts a blink. UNCALIBRATED default - calibrate on a Quest Pro before analysing blink durations.")]
+    [Range(0.05f, 1f)] public float blinkCloseThreshold = 0.7f;
+    [Tooltip("Both eyes' closure weight at or below this ends the blink (hysteresis: must be below the close threshold).")]
+    [Range(0f, 0.95f)] public float blinkOpenThreshold = 0.5f;
+
+    /// <summary>Blink state machine; counts are reported in the manifest.</summary>
+    public BlinkDetector Blink { get; private set; }
+    /// <summary>unsupported | unavailable | not_configured | available - decided from observed runtime facts (BlinkCapability), re-evaluated about once per second.</summary>
+    public string BlinkStatus { get; private set; } = "unavailable";
+    public string BlinkReason { get; private set; } = "not_evaluated_yet";
+    public BlinkFacts BlinkFactsLast { get; private set; }
+    double _nextBlinkCapabilityT; bool _faceSearched;
+    /// <summary>Test seams (never set in production): replace the runtime facts / the two closure weights.</summary>
+    [NonSerialized] public Func<BlinkFacts> testBlinkFacts;
+    [NonSerialized] public Func<(float? left, float? right)> testEyeClosure;
+
+    [Header("Gaze origin (world space)")]
+    [Tooltip("Rig LeftEyeAnchor (world position of the left eye as the OVRCameraRig renders it). Auto-filled from the scene's OVRCameraRig when empty. Used ONLY to validate the provider's left-eye origin and, when that origin is not plausible, as that eye's origin (see EyeGazeOrigin).")]
+    public Transform leftEyeAnchor;
+
+    [Tooltip("Rig RightEyeAnchor. Same role as the left anchor.")]
+    public Transform rightEyeAnchor;
+
+    [Tooltip("If true (default), an OVREyeGaze origin farther than 'maxProviderOriginDeviationMeters' from its rig eye anchor is replaced by that anchor's world position and the row is labelled origin source 'eye_anchor'. " +
+             "Guards against a tracking-origin mismatch between the eye pose and the head pose (observed: a constant +1.361 m vertical offset). No height constant is applied anywhere.")]
+    public bool validateProviderOrigin = true;
+
+    [Tooltip("Plausibility bound (metres) between the provider's eye origin and the rig eye anchor. Real pupil-vs-eye-node differences are centimetres; this is a gate, never added to a coordinate.")]
+    [Range(0.02f, 0.5f)]
+    public float maxProviderOriginDeviationMeters = EyeGazeOrigin.DefaultMaxDeviationMeters;
 
     [Header("Head Reference")]
     [Tooltip("HMD transform (e.g. CenterEyeAnchor) used to log head position/rotation alongside gaze, " +
@@ -147,6 +188,10 @@ public class GazeRecorder : MonoBehaviour
     public long RowsStaleConfidenceRejected { get; private set; }
     /// <summary>Per-eye readings suppressed because the OVREyeGaze is hosted on an OVRCameraRig eye anchor.</summary>
     public long RowsHostConflictBlocked { get; private set; }
+    /// <summary>Provider-vs-rig-anchor origin diagnostics (counts by origin source, deviation summary). Written to the manifest eye_tracking block.</summary>
+    public EyeGazeOrigin.DeviationStats OriginStats { get; } = new EyeGazeOrigin.DeviationStats();
+    /// <summary>Behaviour of the raw provider confidence over the recorded rows (constant / varying / unavailable counts) - the manifest tells a reader whether the number carries information.</summary>
+    public ConfidenceManifest ConfidenceInfo { get; } = new ConfidenceManifest();
     /// <summary>Fallback rows written while the lifecycle was NOT in a running state (eye tracking never started / failed / denied / unsupported).</summary>
     public long RowsFallbackNotAcquiring { get; private set; }
     public double FirstValidRowT { get; private set; } = double.NaN;
@@ -199,6 +244,7 @@ public class GazeRecorder : MonoBehaviour
             headTransform = Camera.main.transform;
         }
 
+        ResolveEyeAnchors();
         EnsureLifecycleController();
 
         if (enableDebugLogs && (leftEyeGaze == null || rightEyeGaze == null))
@@ -206,6 +252,19 @@ public class GazeRecorder : MonoBehaviour
             Debug.LogWarning("[GazeRecorder] leftEyeGaze and/or rightEyeGaze is not assigned. This recorder " +
                 "will still run but will record all-invalid samples until both are assigned.");
         }
+    }
+
+    // The rig's own per-eye positions: OVRCameraRig.leftEyeAnchor / rightEyeAnchor. Explicit inspector slots win; otherwise the scene's OVRCameraRig. Missing anchors are
+    // not an error: the provider origin is then recorded unchecked (origin source 'provider_unchecked').
+    int _anchorSearches;
+    void ResolveEyeAnchors()
+    {
+        if (leftEyeAnchor != null && rightEyeAnchor != null) return;
+        _anchorSearches++;   // bounded: the rig creates its anchors in its own Awake/Update, which may run after this component's Awake, so the search is repeated a few times (Awake, Start, first samples)
+        OVRCameraRig rig = FindObjectOfType<OVRCameraRig>();
+        if (rig == null) return;
+        if (leftEyeAnchor == null) leftEyeAnchor = rig.leftEyeAnchor;
+        if (rightEyeAnchor == null) rightEyeAnchor = rig.rightEyeAnchor;
     }
 
     // The permission request, the start of OVREyeGaze and its retries belong to ONE owner (EyeTrackingLifecycleController); this recorder only makes sure it exists.
@@ -222,6 +281,7 @@ public class GazeRecorder : MonoBehaviour
 
     void Start()
     {
+        ResolveEyeAnchors();
         if (experimentManager == null) experimentManager = FindObjectOfType<ExperimentManager>();
         if (sessionController == null)  sessionController  = FindObjectOfType<ExternalSessionController>();
         if (dataCapture == null)        dataCapture        = FindObjectOfType<DataCaptureManager>();
@@ -339,6 +399,7 @@ public class GazeRecorder : MonoBehaviour
     /// </summary>
     public void StartRecording()
     {
+        if (_closedForSession) { LateRowsRejected++; return; }
         if (isRecording)
         {
             if (enableDebugLogs) Debug.LogWarning("[GazeRecorder] StartRecording() called while already recording; ignoring.");
@@ -487,7 +548,13 @@ public class GazeRecorder : MonoBehaviour
             // eye_tracking_state: lifecycle state at the sample (waiting_for_xr | ... | running | tracking_unavailable ...), blank without a lifecycle controller.
             // left/right_provider_valid: the provider's own per-eye IsValid at the sample (1/0), blank when no provider probe is available (never a guessed 0).
             "eye_tracking_state",
-            "left_provider_valid", "right_provider_valid"
+            "left_provider_valid", "right_provider_valid",
+            // ----- schema v10 appended column (gaze origin) -----
+            // gaze_origin_source: where the recorded eye origin(s) came from - provider | eye_anchor | provider_unchecked | mixed (two valid eyes disagree); blank for the head-fallback ray.
+            "gaze_origin_source",
+            // ----- schema v11 appended columns (blink signal; ALWAYS blank unless the face-tracking eye-closure signal is available - blank means "not measured", never "eyes open") -----
+            // eyes_closed_left / eyes_closed_right: raw FaceExpression.EyesClosedL / R weights 0..1; blink_state: 1 = inside a detected blink, 0 = not, blank = no valid measurement for both eyes.
+            "eyes_closed_left", "eyes_closed_right", "blink_state"
         });
     }
 
@@ -497,39 +564,94 @@ public class GazeRecorder : MonoBehaviour
         public float confidence;
         public Vector3 origin;
         public Vector3 direction;
+        public EyeOriginSource originSource;
+        public bool confidenceAvailable;   // a usable RAW provider confidence exists for this sample (see GazeConfidence); false = the confidence columns stay blank
     }
 
-    EyeSample ReadEye(OVREyeGaze eyeGaze, EyeInjection injected, bool providerKnown, bool providerValid, bool hostBlocked)
+    EyeSample ReadEye(OVREyeGaze eyeGaze, EyeInjection injected, bool providerKnown, bool providerValid, bool hostBlocked, Transform eyeAnchor = null)
     {
         EyeSample sample = new EyeSample
         {
             valid = false,
             confidence = 0f,
             origin = Vector3.zero,
-            direction = Vector3.forward
+            direction = Vector3.forward,
+            originSource = EyeOriginSource.ProviderUnchecked
         };
 
         if (injected != null && injected.active)
         {
             sample.confidence = injected.confidence;
+            sample.confidenceAvailable = GazeConfidence.Usable(sample.confidence);
             sample.origin = injected.origin;
             sample.direction = injected.direction;
-            sample.valid = sample.confidence >= minConfidenceForValid;
+            sample.valid = sample.confidenceAvailable && sample.confidence >= minConfidenceForValid;
             if (!injected.applyProviderGate) return sample;
         }
         else
         {
             if (eyeGaze == null || !eyeGaze.isActiveAndEnabled) return sample;
 
-            sample.confidence = eyeGaze.Confidence;
+            sample.confidence = eyeGaze.Confidence;   // RAW provider value (GazeConfidence documents the path); stale when the provider flags the eye invalid
+            sample.confidenceAvailable = GazeConfidence.Usable(sample.confidence);
             sample.origin = eyeGaze.transform.position;
             sample.direction = eyeGaze.transform.forward;
-            sample.valid = sample.confidence >= minConfidenceForValid;
+            // The threshold only ACCEPTS or REJECTS a measured value. A provider-valid eye with no usable confidence is not rejected by it (nothing was measured to compare), and a missing
+            // confidence never turns a valid ray into an invalid one.
+            sample.valid = GazeConfidence.IsValid(sample.confidence, sample.confidenceAvailable, minConfidenceForValid, providerKnown, providerValid);
+            if (validateProviderOrigin)
+            {
+                // Origin and direction must live in the same world frame. The direction is a rotation (unaffected by a translation between tracking origins); the origin is
+                // validated against the rig's own eye position (see EyeGazeOrigin for the observed mismatch). Nothing is added to or subtracted from a coordinate.
+                Vector3 providerWorld = sample.origin;
+                Vector3? anchorWorld = eyeAnchor != null ? eyeAnchor.position : (Vector3?)null;
+                sample.originSource = EyeGazeOrigin.Resolve(providerWorld, anchorWorld, maxProviderOriginDeviationMeters, out sample.origin, out float deviation);
+                if (sample.valid) OriginStats.Note(sample.originSource, providerWorld, anchorWorld, deviation);
+            }
         }
         // Provider gating (same rules for a real OVREyeGaze reading and for an injected one that opts in): host conflict and stale confidence.
         if (sample.valid && hostBlocked) { sample.valid = false; RowsHostConflictBlocked++; }
         else if (sample.valid && providerKnown && !providerValid) { sample.valid = false; RowsStaleConfidenceRejected++; }
+        // The SDK keeps its previous Confidence when the provider flags the eye invalid: that number is not an observation of THIS sample.
+        sample.confidenceAvailable = GazeConfidence.AvailableAfterProvider(sample.confidenceAvailable, providerKnown, providerValid);
         return sample;
+    }
+
+    // ---- blink signal plumbing (decisions live in BlinkCapability / BlinkDetector, both unit-tested) ----
+    void RefreshBlinkCapability(double now)
+    {
+        if (Blink == null) Blink = new BlinkDetector(blinkCloseThreshold, Mathf.Min(blinkOpenThreshold, blinkCloseThreshold - 0.01f));
+        if (now < _nextBlinkCapabilityT) return;
+        _nextBlinkCapabilityT = now + 1.0;
+        BlinkFacts f = testBlinkFacts != null ? testBlinkFacts() : ReadRuntimeBlinkFacts();
+        BlinkFactsLast = f;
+        BlinkStatus = BlinkCapability.Decide(f, out string reason);
+        BlinkReason = reason;
+    }
+
+    BlinkFacts ReadRuntimeBlinkFacts()
+    {
+        var f = new BlinkFacts();
+        try
+        {
+            f.OvrPluginInitialized = OVRPlugin.initialized;
+            if (f.OvrPluginInitialized) { f.FaceTrackingSupported = OVRPlugin.faceTracking2Supported; f.FaceTrackingEnabled = OVRPlugin.faceTracking2Enabled; }
+            f.PermissionGranted = OVRPermissionsRequester.IsPermissionGranted(OVRPermissionsRequester.Permission.FaceTracking);
+        }
+        catch (Exception) { }
+        if (faceExpressions == null && !_faceSearched) { _faceSearched = true; faceExpressions = FindObjectOfType<OVRFaceExpressions>(); }   // searched once: a scene-wide search every second would cost frames
+        f.ComponentPresent = faceExpressions != null && faceExpressions.isActiveAndEnabled;
+        f.SignalValid = f.ComponentPresent && faceExpressions.ValidExpressions;
+        return f;
+    }
+
+    void ReadEyeClosure(out float? left, out float? right)
+    {
+        left = right = null;
+        if (testEyeClosure != null) { var t = testEyeClosure(); left = t.left; right = t.right; return; }
+        if (faceExpressions == null) return;
+        if (faceExpressions.TryGetFaceExpressionWeight(OVRFaceExpressions.FaceExpression.EyesClosedL, out float l)) left = l;
+        if (faceExpressions.TryGetFaceExpressionWeight(OVRFaceExpressions.FaceExpression.EyesClosedR, out float r)) right = r;
     }
 
     IEnumerator SamplingLoop()
@@ -553,13 +675,15 @@ public class GazeRecorder : MonoBehaviour
                 continue;
             }
 
+            if ((leftEyeAnchor == null || rightEyeAnchor == null) && validateProviderOrigin && _anchorSearches < 8) ResolveEyeAnchors();
+
             // Acquisition context (cheap, no allocation): the provider probe is only trusted while the lifecycle says it is running and the last query succeeded.
             EyeTrackingLifecycle lc = Lifecycle;
             bool probeKnown = requireProviderValidity && lc != null && lc.ProviderProbeAvailable &&
                               (lc.State == EyeTrackingState.Running || lc.State == EyeTrackingState.TrackingUnavailable);
             bool hostBlocked = blockEyeSamplesOnHostConflict && lifecycleController != null && lifecycleController.HostConflict.Length > 0;
-            EyeSample left = ReadEye(leftEyeGaze, testLeftEye, probeKnown, lc != null && lc.LeftProviderValid, hostBlocked);
-            EyeSample right = ReadEye(rightEyeGaze, testRightEye, probeKnown, lc != null && lc.RightProviderValid, hostBlocked);
+            EyeSample left = ReadEye(leftEyeGaze, testLeftEye, probeKnown, lc != null && lc.LeftProviderValid, hostBlocked, leftEyeAnchor);
+            EyeSample right = ReadEye(rightEyeGaze, testRightEye, probeKnown, lc != null && lc.RightProviderValid, hostBlocked, rightEyeAnchor);
             bool leftInjected = testLeftEye != null && testLeftEye.active && !testLeftEye.applyProviderGate, rightInjected = testRightEye != null && testRightEye.active && !testRightEye.applyProviderGate;
 
             bool combinedValid;
@@ -602,6 +726,11 @@ public class GazeRecorder : MonoBehaviour
                 gazeRaySource = "head_fallback";
             }
 
+            // Combined confidence (schema v11): the mean of the contributing valid eyes' RAW confidences, defined only when each contributing eye has one; blank for the head-fallback ray.
+            bool combinedConfAvailable = GazeConfidence.TryCombine(left.valid, left.confidenceAvailable, left.confidence, right.valid, right.confidenceAvailable, right.confidence, out float combinedConfOut);
+            if (left.confidenceAvailable) { ConfidenceInfo.left.Observe(left.confidence); } else ConfidenceInfo.rows_confidence_unavailable_left++;
+            if (right.confidenceAvailable) { ConfidenceInfo.right.Observe(right.confidence); } else ConfidenceInfo.rows_confidence_unavailable_right++;
+
             // ROI raycast: ALWAYS performed (subject to enableROIRaycast). Uses the head-forward fallback
             // ray when eye tracking is invalid. combined_valid is NOT affected by this. The ray that was actually cast is recorded in the
             // ray_* columns together with ray_is_eye_gaze, so a hit produced by the fallback can never be mistaken for an eye-gaze fixation.
@@ -629,6 +758,21 @@ public class GazeRecorder : MonoBehaviour
             Quaternion headRot = headTransform != null ? headTransform.rotation : Quaternion.identity;
 
             double tAbs = CaptureClock.TAbs;
+
+            // Blink (schema v11): only from a real eye-closure signal. Gaze validity / confidence / tracking loss are never read as a blink.
+            float? cl = null, cr = null; string blinkState = "";
+            RefreshBlinkCapability(tAbs);
+            if (BlinkStatus == BlinkCapability.Available)
+            {
+                ReadEyeClosure(out cl, out cr);
+                BlinkDetector.Result br = Blink.Update(tAbs, cl, cr);
+                if (dataCapture != null)
+                {
+                    if (br.Started) dataCapture.RecordBlinkEvent(CaptureConstants.EvtBlinkStart, br.StartT, null, "");
+                    if (br.Ended) dataCapture.RecordBlinkEvent(CaptureConstants.EvtBlinkEnd, br.EndT, br.Duration, br.Truncated ? "truncated_by_missing_data" : "");
+                }
+                blinkState = (cl.HasValue && cr.HasValue) ? (Blink.InBlink ? "1" : "0") : "";
+            }
             double tRel = tAbs - recordingStartRealtime;
             long unixMs = CaptureClock.TUnixMs;
             string sessionId = (dataCapture != null && !string.IsNullOrEmpty(dataCapture.SessionId))
@@ -643,14 +787,14 @@ public class GazeRecorder : MonoBehaviour
                 Inv(unixMs),
                 SafeCsvField(subjectId),
                 SafeCsvField(trialId),
-                F3(left.confidence),
+                GazeConfidence.Format(left.confidence, left.confidenceAvailable),
                 left.valid ? "1" : "0",
                 V3(left.valid, left.origin), V3(left.valid, left.direction),
-                F3(right.confidence),
+                GazeConfidence.Format(right.confidence, right.confidenceAvailable),
                 right.valid ? "1" : "0",
                 V3(right.valid, right.origin), V3(right.valid, right.direction),
                 combinedValid ? "1" : "0",
-                F3(combinedConfidence),
+                GazeConfidence.Format(combinedConfOut, combinedConfAvailable),
                 // schema v5 (F-16): an invalid / unavailable vector is BLANK, never a fabricated default. Validity is decided ONLY by the *_valid flags
                 // (a valid vector may legitimately contain zeros). The head-forward fallback ray is not written here; see ray_* below.
                 V3(combinedValid, combinedOrigin), V3(combinedValid, combinedDirection),
@@ -686,7 +830,11 @@ public class GazeRecorder : MonoBehaviour
                 // ----- schema v8 appended columns -----
                 lc != null ? EyeTrackingNames.Of(lc.State) : "",
                 (probeKnown && !leftInjected) ? (lc.LeftProviderValid ? "1" : "0") : "",
-                (probeKnown && !rightInjected) ? (lc.RightProviderValid ? "1" : "0") : ""
+                (probeKnown && !rightInjected) ? (lc.RightProviderValid ? "1" : "0") : "",
+                // ----- schema v10 appended column -----
+                EyeGazeOrigin.CombinedName(left.valid, left.originSource, right.valid, right.originSource),
+                // ----- schema v11 appended columns -----
+                cl.HasValue ? F4(cl.Value) : "", cr.HasValue ? F4(cr.Value) : "", blinkState
             });
 
             if (WriteRow(row))
@@ -706,7 +854,13 @@ public class GazeRecorder : MonoBehaviour
                     if (double.IsNaN(FirstValidRowT)) FirstValidRowT = tAbs;
                     LastValidRowT = tAbs;
                 }
-                Sampling?.OnSampleWithFrame(tAbs, Time.unscaledDeltaTime);   // only a SUCCESSFULLY written row is a sample
+                if (dataCapture != null)
+                {
+                    dataCapture.FrameStats.TakeWindow(0, out double fMax, out int fCount);   // frames seen since the previous gaze sample (the evidence that separates frame / scheduler / writer gaps)
+                    Sampling?.OnSampleWithEvidence(tAbs, fMax, fCount, gazeWriter != null ? gazeWriter.LastCommitSeconds : double.NaN);
+                }
+                else Sampling?.OnSampleWithFrame(tAbs, Time.unscaledDeltaTime);   // standalone recorder (no capture manager): frame duration only
+                // only a SUCCESSFULLY written row is a sample
             }
 
             // Absolute deadline grid: the overshoot of one sample shortens the next wait, so the long-run rate converges to the nominal one when the frame rate allows it.
@@ -721,9 +875,23 @@ public class GazeRecorder : MonoBehaviour
     bool WriteRow(string row)
     {
         if (gazeWriter == null) return false;
+        if (_closedForSession) { LateRowsRejected++; return false; }
         long before = gazeWriter.RowsWritten;
         gazeWriter.WriteLine(row);
         return gazeWriter.RowsWritten > before;
+    }
+
+    // M2: the session's capture ended (DataCaptureManager.FinalizeCapture). Rows accepted so far are already on disk (every row is its own append); sampling stops for good, the stream is
+    // closed and any later row - or a later StartRecording - is refused and only counted.
+    bool _closedForSession;
+    public long LateRowsRejected { get; private set; }
+    public bool ClosedForSession => _closedForSession;
+    public void CloseForSession()
+    {
+        if (_closedForSession) return;
+        StopRecording();
+        _closedForSession = true;
+        if (gazeWriter != null) gazeWriter.Close();
     }
 
     // F-02: every number in gaze.csv is formatted with the invariant culture. The row is comma-joined without quoting, so a

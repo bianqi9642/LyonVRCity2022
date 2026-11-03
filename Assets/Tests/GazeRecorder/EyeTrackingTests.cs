@@ -450,10 +450,10 @@ public class EyeTrackingLifecycleTests
         Assert.AreEqual(0.25, Get<double>(fs, "MaxDt"), 1e-9); Assert.AreEqual(1.0 / ((0.25 * 10 + 0.12 * 90) / 100), Get<double>(fs, "MeanHz"), 1e-6);
         var rd = T("RateDiagnosis");
         string C(double nominal, double observed, double frameHz) => (string)CallStatic(rd, "Classify", nominal, observed, frameHz);
-        Assert.AreEqual("nominal_achieved", C(20, 19.5, 90));
-        Assert.AreEqual("frame_rate_limited", C(20, 7.39, 7.4), "observed ~ frame rate < nominal: the sampler cannot do better");
-        Assert.AreEqual("scheduling_or_io_limited", C(20, 7.39, 60), "frame rate is fine but samples are missing: blocked work / scheduling");
-        Assert.AreEqual("insufficient_samples", C(20, double.NaN, 60));
+        Assert.AreEqual("healthy", C(20, 19.5, 90));
+        Assert.AreEqual("frame_limited", C(20, 7.39, 7.4), "observed ~ frame rate < nominal: the sampler cannot do better");
+        Assert.AreEqual("unknown", C(20, 7.39, 60), "frame rate is fine but samples are missing and there is NO gap evidence: the cause is not guessed (the old catch-all scheduling_or_io_limited is retired)");
+        Assert.AreEqual("unknown", C(20, double.NaN, 60));
     }
 
     [Test]
@@ -489,7 +489,7 @@ public partial class NpcLifecycleTests
 
         var csv = Csv.Load(rig.File("gaze.csv"));
         Assert.Greater(csv.Rows.Count, 5);
-        Assert.AreEqual(69, csv.Header.Count);
+        Assert.AreEqual(73, csv.Header.Count);
         CollectionAssert.AreEqual(new[] { "eye_tracking_state", "left_provider_valid", "right_provider_valid" }, csv.Header.GetRange(66, 3), "schema v9 columns are appended at the END");
         foreach (var r in csv.Rows)
         {
@@ -499,7 +499,7 @@ public partial class NpcLifecycleTests
         }
 
         var m = JObject.Parse(File.ReadAllText(rig.File("session_manifest.json")));
-        Assert.AreEqual(9, (int)m["schema_version"]);
+        Assert.AreEqual(11, (int)m["schema_version"]);
         Assert.AreEqual("ok", (string)m["gaze_writer_status"], "the CSV WRITER is healthy ...");
         Assert.AreEqual("ok", (string)m["health_gaze"]["status"], "(unchanged legacy field)");
         Assert.AreEqual("not_applicable", (string)m["gaze_acquisition_status"], "... which says nothing about whether eyes were tracked");

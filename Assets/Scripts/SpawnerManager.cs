@@ -179,6 +179,11 @@ public class SpawnerManager : MonoBehaviour
     [Tooltip("Seconds to wait for the NavMesh to become available before pool prewarm / first spawns proceed anyway.")]
     // time to wait for NavMesh availability before giving up (seconds)
     public float navmeshWaitTimeout = 5f;
+    [Tooltip("Pool PREPARATION (object creation) is a separate stage from the NPC behaviour warm-up: the Part waits for it (IsPoolReady) before the warm-up timer starts and before any Start panel. " +
+             "Per-frame time budget of the prewarm loop in milliseconds: it yields as soon as a frame has spent this long instantiating (always at least one NPC per frame), which avoids the long " +
+             "hitches of the old fixed 8-per-frame batches. 0 = legacy behaviour (yield after every 8th instance).")]
+    [Min(0f)]
+    public float prewarmFrameBudgetMs = 8f;
 
     [Header("Agent Profile & NPC Configuration")]
     [Tooltip("Optional factory that applies the profile (appearance, speed, NavMeshAgent shape, UncertainBehavior roll) to each NPC.")]
@@ -244,6 +249,7 @@ public class SpawnerManager : MonoBehaviour
     // Population accounting: 'liveAgents' counts spawned-and-not-yet-finished NPCs (the maxAgents cap);
     // 'activeAgents' is the same set as GameObjects, so trial-state pause/resume/despawn can act on them as a group.
     private int liveAgents = 0;
+    private int spawnedTotal = 0;   // NPCs spawned since the scene started (cumulative; read as a difference to count a generation window)
     private List<GameObject> activeAgents = new List<GameObject>();
 
     // Spawn-gate flags (see section 4). All are written only by this class's event handlers / public methods.
@@ -255,6 +261,20 @@ public class SpawnerManager : MonoBehaviour
 
     // The spawn loop must not run before the NavMesh wait + prewarm finished.
     private bool poolInitializationComplete = false;
+
+    // Pool preparation evidence (read by ExperimentManager / the manifest). 'pool object count' is NOT an active NPC population: prewarmed objects are inactive and invisible.
+    private int poolPrewarmCreated = 0;
+    private double poolPreparationStartTAbs = double.NaN, poolPreparationEndTAbs = double.NaN, poolLastProgressTAbs = double.NaN;
+    private bool poolFailed = false;
+    private string poolFailureReason = "";
+
+    // NPC behaviour pause (see PauseNpcBehaviour): while true no NPC is spawned and every live NPC is held.
+    private bool npcBehaviourPaused = false;
+    private int npcPauseHeldCount = 0;
+
+    /// <summary>The seed of the private entrance-placement RNG (TickCount-based; recorded for provenance, not for replay - UnityEngine.Random is not seeded).</summary>
+    public int EntranceRngSeed { get; private set; }
+    public bool EntranceRngSeeded { get; private set; }
 
     // Reused buffer for BuildWanderingItinerary()'s leg reachability checks (created lazily on first use).
     private NavMeshPath routeCheckPath;
@@ -285,6 +305,28 @@ public class SpawnerManager : MonoBehaviour
 
     /// <summary>Read-only: whether an NPC warm-up window is currently open.</summary>
     public bool NpcWarmupActive => npcWarmupActive;
+
+    /// <summary>Cumulative number of NPCs spawned (not the active population, not the pool size).</summary>
+    public int NpcSpawnedTotal => spawnedTotal;
+
+    /// <summary>True once the NavMesh wait and the pool prewarm finished and the spawn loop has been started (or immediately when pooling is off).</summary>
+    public bool IsPoolReady => poolInitializationComplete;
+    /// <summary>Configured number of inactive objects to prepare (0 when pooling is off).</summary>
+    public int PoolPrewarmTarget => usePooling ? Mathf.Max(0, poolPrewarm) : 0;
+    /// <summary>Inactive pool objects created so far by the prewarm.</summary>
+    public int PoolPrewarmCreated => poolPrewarmCreated;
+    /// <summary>CaptureClock time at which the pool preparation began / ended (NaN until it happened).</summary>
+    public double PoolPreparationStartTAbs => poolPreparationStartTAbs;
+    public double PoolPreparationEndTAbs => poolPreparationEndTAbs;
+    /// <summary>CaptureClock time of the most recently created pooled object (NaN before the first). Diagnostic only: there is no pool deadline.</summary>
+    public double PoolLastProgressTAbs => poolLastProgressTAbs;
+    /// <summary>True when pool creation reported an error (exception). The pool is then never "ready" and the spawn loop never starts.</summary>
+    public bool PoolFailed => poolFailed;
+    public string PoolFailureReason => poolFailureReason;
+    /// <summary>True while NPC behaviour is paused (spawning stopped, every live NPC held).</summary>
+    public bool NpcBehaviourPaused => npcBehaviourPaused;
+    /// <summary>Number of live NPCs held by the current / last pause.</summary>
+    public int NpcPauseHeldCount => npcPauseHeldCount;
 
     /// <summary>Read-only: whether the End-Panel hard stop is currently in effect.</summary>
     public bool EndPanelActive => endPanelActive;
@@ -381,6 +423,7 @@ public class SpawnerManager : MonoBehaviour
 
     void OnDestroy()
     {
+        if (npcBehaviourPaused) { npcBehaviourPaused = false; NpcSimulationGate.Reset(); }
         // Unsubscribe to avoid referencing a destroyed SpawnerManager from ExperimentManager's events.
         if (experimentManager != null)
         {
@@ -435,7 +478,7 @@ public class SpawnerManager : MonoBehaviour
     //   - The population cap applies last.
     private bool ShouldSpawnNow()
     {
-        bool gateOpen = !sessionEnded && !endPanelActive && NpcsEnabledForActivePart() &&
+        bool gateOpen = !sessionEnded && !endPanelActive && !npcBehaviourPaused && NpcsEnabledForActivePart() &&
             ((!gateSpawningByTrialState) || trialActive || npcWarmupActive || (simulationIndependentOfTrial && simulationActive));
 
         return gateOpen && liveAgents < maxAgents;
@@ -519,6 +562,57 @@ public class SpawnerManager : MonoBehaviour
     }
 
     /// <summary>
+    /// Pauses the NPC simulation (end of the fixed behaviour warm-up, before the Start panel): spawning stops and every live NPC is held in place - NavMeshAgent stopped with its
+    /// destination / path intact, UncertainBehavior and dwell timers frozen (NpcSimulationGate) - until ResumeNpcBehaviour. GameObjects, renderers, colliders, identities,
+    /// lifetime registrations and every recorder stay active. Idempotent: a second call changes nothing. Refused after the session ended. Returns the number of NPCs held.
+    /// </summary>
+    public int PauseNpcBehaviour(string reason)
+    {
+        if (sessionEnded) return 0;
+        if (npcBehaviourPaused) return npcPauseHeldCount;
+        npcBehaviourPaused = true;
+        NpcSimulationGate.SetPaused(true);
+        int held = 0;
+        for (int i = 0; i < activeAgents.Count; i++)
+        {
+            GameObject go = activeAgents[i];
+            if (go == null) continue;
+            MoveToTarget mt = go.GetComponent<MoveToTarget>();
+            if (mt != null) mt.SetSimulationHold(true);
+            held++;
+        }
+        npcPauseHeldCount = held;
+        if (enableDebugLogs) Debug.Log($"[SpawnerManager] NPC behaviour paused ({reason}): {held} live NPC(s) held, spawning stopped.");
+        return held;
+    }
+
+    /// <summary>Resumes what PauseNpcBehaviour paused: every held NPC continues toward its existing destination with its remaining dwell / state timers, and spawning reopens. Idempotent. Returns the number of NPCs released.</summary>
+    public int ResumeNpcBehaviour(string reason)
+    {
+        if (!npcBehaviourPaused) return 0;
+        return ReleaseNpcBehaviourPause(reason);
+    }
+
+    // Shared release (resume, new Part, shutdown, destroy). Releases the agents first, then the gate, so no timer advances before every agent is free.
+    private int ReleaseNpcBehaviourPause(string reason)
+    {
+        if (!npcBehaviourPaused) { return 0; }
+        int released = 0;
+        for (int i = 0; i < activeAgents.Count; i++)
+        {
+            GameObject go = activeAgents[i];
+            if (go == null) continue;
+            MoveToTarget mt = go.GetComponent<MoveToTarget>();
+            if (mt != null) mt.SetSimulationHold(false);
+            released++;
+        }
+        npcBehaviourPaused = false;
+        NpcSimulationGate.SetPaused(false);
+        if (enableDebugLogs) Debug.Log($"[SpawnerManager] NPC behaviour resumed ({reason}): {released} live NPC(s) released.");
+        return released;
+    }
+
+    /// <summary>
     /// Called by ExperimentManager (RunNpcWarmup(), unconditionally, at the very start of every Part's NPC
     /// lifecycle) to clear any End-Panel hard stop left over from whichever Part ran previously. Must happen before
     /// the new Part's own warm-up/trial spawning decisions are evaluated - resetting only on OnTrialStart would be
@@ -526,6 +620,7 @@ public class SpawnerManager : MonoBehaviour
     /// </summary>
     public void ResetForNewPart()
     {
+        ReleaseNpcBehaviourPause("new_part");   // frozen NPCs never stay frozen into the next Part / Session
         endPanelActive = false;
         simulationActive = false;   // re-opened by BeginNpcSimulation() if the new Part has NPCs enabled
         if (enableDebugLogs) Debug.Log("[SpawnerManager] New Part starting -> End-Panel hard stop cleared.");
@@ -592,6 +687,7 @@ public class SpawnerManager : MonoBehaviour
     {
         if (sessionEnded) return;
         sessionEnded = true;      // closes ShouldSpawnNow() and BeginNpcSimulation() for good
+        ReleaseNpcBehaviourPause("shutdown");   // the permanent freeze below supersedes the temporary hold; the gate must not outlive the simulation
         simulationActive = false;
         endPanelActive = false;   // the per-frame legacy hard stop (Update) is superseded by the permanent freeze below
         StopAllCoroutines();   // SpawnLoop / prewarm: no scheduled spawn can run after this point
@@ -701,12 +797,14 @@ public class SpawnerManager : MonoBehaviour
 
     IEnumerator InitializePoolThenSpawn()
     {
+        poolPreparationStartTAbs = CaptureClock.TAbs;
         // Wait for NavMesh readiness (bounded by navmeshWaitTimeout) and prewarm the pool if configured.
         if (usePooling)
         {
             yield return StartCoroutine(WaitForNavMeshAvailability(
                 "Prewarm will still run but any prewarmed agents that cannot find NavMesh will have their NavMeshAgent disabled as a fallback."));
-            yield return StartCoroutine(PrewarmPoolCoroutine());
+            yield return StartCoroutine(RunPoolCreationGuarded(PrewarmPoolCoroutine()));
+            if (poolFailed) yield break;   // no pool, no spawn loop: the Part's preparation reports the failure (it never proceeds silently)
         }
         else
         {
@@ -716,9 +814,34 @@ public class SpawnerManager : MonoBehaviour
                 "Spawning will proceed but agents may be fallback to transform mode."));
         }
 
+        poolPreparationEndTAbs = CaptureClock.TAbs;
         poolInitializationComplete = true;
         // start main spawn loop after prewarm completes
         StartCoroutine(SpawnLoop());
+    }
+
+    // Runs the pool creation and turns ANY exception (missing prefab, destroyed object, ...) into an explicit, recorded failure. A coroutine that throws would otherwise just stop,
+    // leaving a pool that is neither ready nor failed. This catches errors only - it adds no time limit of any kind.
+    IEnumerator RunPoolCreationGuarded(IEnumerator inner)
+    {
+        while (true)
+        {
+            object current;
+            try
+            {
+                if (!inner.MoveNext()) yield break;
+                current = inner.Current;
+            }
+            catch (System.Exception e)
+            {
+                poolFailed = true;
+                poolFailureReason = e.GetType().Name + ": " + e.Message;
+                poolPreparationEndTAbs = CaptureClock.TAbs;
+                Debug.LogError($"[SpawnerManager] NPC pool creation failed after {poolPrewarmCreated}/{PoolPrewarmTarget} objects: {poolFailureReason}");
+                yield break;
+            }
+            yield return current;
+        }
     }
 
     // Sampling origin for pool initialisation: prefer the user-provided startTransform, then the first entrance,
@@ -786,6 +909,7 @@ public class SpawnerManager : MonoBehaviour
         Vector3 sampleOrigin = PoolSampleOrigin();
         float sampleRadius = Mathf.Max(0.1f, spawnSampleRadius);
 
+        var frameClock = System.Diagnostics.Stopwatch.StartNew();
         for (int i = 0; i < poolPrewarm; i++)
         {
             // instantiate the prefab (Awake will run here)
@@ -848,8 +972,15 @@ public class SpawnerManager : MonoBehaviour
             // Data capture: the object now exists as a reusable, INACTIVE pool member. This is not a live NPC and consumes no lifetime.
             RecordPoolObjectCreated(go, CaptureConstants.NpcEvtPrewarmCreated, "prewarm", i, createdTAbs, createdTUnix);
 
-            // yield occasionally to avoid editor freeze
-            if (i % 8 == 0) yield return null;
+            poolPrewarmCreated++;
+            poolLastProgressTAbs = CaptureClock.TAbs;
+
+            // Yield to keep frames short: a per-frame time budget (always >= 1 instance per frame), or the legacy every-8th rule when the budget is 0.
+            if (prewarmFrameBudgetMs > 0f)
+            {
+                if (frameClock.Elapsed.TotalMilliseconds >= prewarmFrameBudgetMs) { yield return null; frameClock.Restart(); }
+            }
+            else if (i % 8 == 0) yield return null;
         }
     }
 
@@ -1049,7 +1180,11 @@ public class SpawnerManager : MonoBehaviour
         float sampleY = hasBase ? baseHit.position.y : origin.y;
 
         if (entranceRng == null)
-            entranceRng = new System.Random(unchecked(System.Environment.TickCount * 397) ^ GetInstanceID());
+        {
+            EntranceRngSeed = unchecked(System.Environment.TickCount * 397) ^ GetInstanceID();
+            EntranceRngSeeded = true;
+            entranceRng = new System.Random(EntranceRngSeed);
+        }
 
         int attempts = Mathf.Max(1, entranceSpawnMaxAttempts);
         bool found = false, clear = false;
@@ -1664,6 +1799,7 @@ public class SpawnerManager : MonoBehaviour
     private void RegisterSpawnedAgent(GameObject go, PedestrianAgent agentScript)
     {
         liveAgents++;
+        spawnedTotal++;
         activeAgents.Add(go); // track for trial-state pause/resume/despawn
         agentScript.onAgentFinished += OnAgentFinished;
         RaiseAgentSpawned(agentScript);

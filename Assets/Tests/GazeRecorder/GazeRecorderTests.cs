@@ -218,7 +218,7 @@ public class GazeRecorderTests
         {
             Assert.GreaterOrEqual(rows.Count, 3, "expected a header plus several rows");
             int width = rows[0].Count;
-            Assert.AreEqual(69, width, "header width: 55 columns at HEAD + 11 appended in schema v5 + 3 appended in schema v9 (existing columns must never move)");
+            Assert.AreEqual(73, width, "header width: 55 columns at HEAD + 11 appended in schema v5 + 3 in v9 + 1 in v10 + 3 in v11 (existing columns must never move)");
             Assert.AreEqual("hit_is_interactable", rows[0][54], "the first 55 columns are unchanged");
             Assert.AreEqual("part", rows[0][55]);
             for (int i = 1; i < rows.Count; i++)
@@ -251,7 +251,7 @@ public class GazeRecorderTests
             Assert.AreEqual("", fr[1][hdr.IndexOf(col)], col + ": an invalid eye / combined vector is blank (schema v5)");
         Assert.AreEqual("0", fr[1][hdr.IndexOf("ray_is_eye_gaze")], "the fallback ray is marked as not eye gaze");
         Assert.AreEqual("head_fallback", fr[1][hdr.IndexOf("gaze_ray_source")]);
-        Assert.AreEqual("0.000", fr[1][hdr.IndexOf("left_confidence")]);
+        Assert.AreEqual("", fr[1][hdr.IndexOf("left_confidence")], "schema v11: an eye with no provider measurement has a BLANK confidence (it used to be written as 0.000)");
         foreach (var col in new[] { "left_confidence", "right_confidence", "combined_confidence" })
             Assert.IsFalse(fr[1][hdr.IndexOf(col)].Contains(","));
     }

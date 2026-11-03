@@ -120,19 +120,47 @@ public sealed class CaptureCsvWriter
         return _sb.ToString();
     }
 
+    /// <summary>True after Close(): the stream belongs to a finished session and accepts no further record.</summary>
+    public bool IsClosed { get; private set; }
+    /// <summary>Records offered after Close() and refused (never counted as attempted / written / failed).</summary>
+    public long RowsRejectedAfterClose { get; private set; }
+    /// <summary>Closes the stream for good. This writer opens, appends and closes the file on every commit, so no handle or buffer is left behind; what Close() adds is the guarantee that
+    /// nothing can be appended to a finished session's file afterwards, whatever component calls. Idempotent.</summary>
+    public void Close() { IsClosed = true; }
+
+    // Duration of the last / the worst commit (the synchronous open + append + close): the writer's own cost, used to tell I/O pressure from frame and scheduler delays.
+    public double LastCommitSeconds { get; private set; }
+    public double MaxCommitSeconds { get; private set; }
+    public double SumCommitSeconds { get; private set; }
+    public long Commits { get; private set; }
+
     public void WriteLine(string line)
     {
         if (IsDisabled) return;
+        if (IsClosed) { RowsRejectedAfterClose++; return; }
         Commit(null, line, 1);
     }
 
     public void WriteLines(IReadOnlyList<string> lines)
     {
         if (IsDisabled || lines == null || lines.Count == 0) return;
+        if (IsClosed) { RowsRejectedAfterClose += lines.Count; return; }
         Commit(lines, null, lines.Count);
     }
 
     void Commit(IReadOnlyList<string> lines, string single, int n)
+    {
+        long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        try { CommitCore(lines, single, n); }
+        finally
+        {
+            double sec = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) / (double)System.Diagnostics.Stopwatch.Frequency;
+            LastCommitSeconds = sec; SumCommitSeconds += sec; Commits++;
+            if (sec > MaxCommitSeconds) MaxCommitSeconds = sec;
+        }
+    }
+
+    void CommitCore(IReadOnlyList<string> lines, string single, int n)
     {
         RowsAttempted += n;
         if (State == WriterState.Failed && !TryRecover()) { RowsDroppedAfterFailure += n; return; }

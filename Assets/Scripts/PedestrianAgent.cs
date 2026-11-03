@@ -201,6 +201,8 @@ public class PedestrianAgent : MonoBehaviour
     /// <summary>The ID of the most recent lifetime, open or already ended (used to label its closing events).</summary>
     public string LastLifetimeId => lifetimeId;
     public bool HasOpenLifetime => lifetimeOpen;
+    /// <summary>True from the moment the FIRST destination of the current lifetime was handed to the mover (the npc_movement_start moment); reset at every lifetime start. Read-only observation.</summary>
+    public bool MovementStartedThisLife => movementStartedThisLife;
     public int LifetimeIndex => lifetimeCounter;
     public double LifetimeSpawnTAbs => lifetimeSpawnTAbs;
     public long LifetimeSpawnTUnixMs => lifetimeSpawnTUnixMs;
@@ -1146,7 +1148,7 @@ public class PedestrianAgent : MonoBehaviour
 
         if (lifetimeOpen) Emit(CaptureConstants.NpcEvtDwellStart, "dwell_s=" + dwellTime.ToString("F2", System.Globalization.CultureInfo.InvariantCulture));
 
-        yield return new WaitForSeconds(dwellTime);
+        yield return NpcSimulationGate.WaitSimSeconds(dwellTime);   // behaviour time: does not elapse while the NPC simulation is paused
 
         if (lifetimeOpen) Emit(CaptureConstants.NpcEvtDwellEnd);
 
@@ -1179,13 +1181,13 @@ public class PedestrianAgent : MonoBehaviour
         if (lifetimeOpen) Emit(CaptureConstants.NpcEvtDwellStart, "capacity_wait=1");
 
         float timeout = 30f;
-        float start = Time.time;
-        while (Time.time - start < timeout)
+        float start = NpcSimulationGate.SimTime;   // behaviour time (frozen while the NPC simulation is paused)
+        while (NpcSimulationGate.SimTime - start < timeout)
         {
             if (manager != null && manager.TryEnterAttractor(info, this))
             {
                 // once admitted, dwell and then release + advance
-                yield return new WaitForSeconds(dwellTime);
+                yield return NpcSimulationGate.WaitSimSeconds(dwellTime);
 
                 if (lifetimeOpen) Emit(CaptureConstants.NpcEvtDwellEnd);
 
@@ -1202,7 +1204,7 @@ public class PedestrianAgent : MonoBehaviour
                 AdvanceItinerary();
                 yield break;
             }
-            yield return new WaitForSeconds(1f);
+            yield return NpcSimulationGate.WaitSimSeconds(1f);
         }
 
         // timed out waiting -> give up and advance
@@ -1285,6 +1287,7 @@ public class PedestrianAgent : MonoBehaviour
     {
         while (state == State.WaitingAtAttractor && lookAt != null)
         {
+            if (NpcSimulationGate.Paused) { yield return null; continue; }   // a paused NPC stays stationary (no turning either)
             Vector3 dir = lookAt.position - transform.position;
             dir.y = 0f; // horizontal / yaw only - do not tilt the agent up or down
             if (dir.sqrMagnitude < 1e-6f)

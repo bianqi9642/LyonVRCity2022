@@ -123,6 +123,9 @@ public static class CaptureConstants
     // NPC warm-up window markers: EXPERIMENT WORKFLOW events (raised by ExperimentManager.RunNpcWarmup while the participant waits before the trial),
     // written to events.csv exactly like part_start/part_end, independent of npcCaptureEnabled. They carry no NPC identity and describe no NPC;
     // they only delimit the pre-trial window (the NPC files label the same window with capture_period = warmup). They never gate participant capture.
+    // Blink events (only ever written when the face-tracking eye-closure signal is available): value_num = blink duration (seconds) on blink_end, blank on blink_start.
+    public const string EvtBlinkStart           = "blink_start";
+    public const string EvtBlinkEnd             = "blink_end";
     public const string EvtNpcWarmupStart       = "npc_warmup_start";
     public const string EvtNpcWarmupEnd         = "npc_warmup_end";
 
@@ -133,6 +136,10 @@ public static class CaptureConstants
     public const string NpcEvtDwellEnd   = "npc_dwell_end";
     public const string NpcEvtArrived    = "npc_arrived";
     public const string NpcEvtDestChange = "npc_dest_change";
+    // value_str of npc_dest_change: "cause=<cause>;..." - cause is initial_assignment (the lifetime's first valid destination; prev_dest=none, no jump_m), detour, itinerary_target or other
+    // (a genuine change whose reason is not identified). Genuine changes also carry jump_m and prev_dest=<x>|<z>.
+    public const string DestCauseInitialAssignment = "initial_assignment";
+    public const string DestCauseOther = "other";
     public const string NpcEvtLegStart   = "npc_leg_start";   // RETIRED in schema v3: identical to npc_dest_change by construction; no longer emitted
 
     // Added with the lifetime identity work (schema v2). Every one has a real code trigger.
@@ -181,7 +188,18 @@ public static class CaptureConstants
     //    permission / capability / runtime path, startup counters, provider-level valid-sample counters, bounded transition log with the states at each transition),
     //    gaze_writer_status vs gaze_acquisition_status (+ reason), frame_timing and per-stream limit diagnosis (rate_gaze / rate_trajectory gain gaps_frame_limited,
     //    limit_diagnosis, frame_mean_hz). Existing fields keep their names, types and meaning.
-    public const int    SchemaVersion   = 9;
+    // 10: gaze origin + NPC preparation. gaze.csv appends gaze_origin_source (provider | eye_anchor | provider_unchecked | mixed; blank for the head-fallback ray); the manifest eye_tracking
+    //    block adds origin_* validation counters / deviation summary. The manifest adds the npc_preparation block (time-based preparation: pool preparation vs NPC generation period vs
+    //    Start-gated pause / resume - configured vs actual durations, counts, timestamps, state trail) and npc_random_sources. events.csv gains the workflow events npc_pool_preparation_started / _completed / _failed, npc_behaviour_paused / npc_behaviour_resumed.
+    //    No existing column or field changes name, order or meaning.
+    // 11: data-capture reliability. gaze.csv: left/right/combined_confidence are now the RAW provider value or BLANK when unavailable (previously "0.000" for a missing measurement) and combined is defined
+    //    only from contributing valid eyes that have one (semantic change); appends eyes_closed_left, eyes_closed_right, blink_state (blank unless a face-tracking eye-closure signal is available).
+    //    Manifest: eye_tracking gains the canonical capability / permission / configured / runtime_available / tracking_active / last_state_change_t_abs / provider / sdk_version plus confidence and blink
+    //    blocks; the top-level eye_tracking_* fields are deprecated ALIASES derived from it; capture_lifecycle_state + late_* counters; rate_gaze / rate_trajectory use the evidence-based diagnosis
+    //    (limit_diagnosis values change to healthy | frame_limited | scheduler_limited | io_limited | mixed | unknown, gaps_* attribution counters, writer_* cost) - the old value
+    //    scheduling_or_io_limited is retired. events.csv: session_end is the final row (events after it are refused), blink_start / blink_end only with an available signal. npc_events.csv: the first
+    //    destination of a lifetime is npc_dest_change cause=initial_assignment (prev_dest=none, no jump_m); genuine changes keep their cause and gain prev_dest. Older sessions are not reinterpreted.
+    public const int    SchemaVersion   = 11;
     public const string NpcIdScheme     = "agent-lifetime-v1: npc_id=AgentID (stable pooled GameObject); npc_spawn_instance_id=<AgentID>-S<n> (n = per-AgentID lifetime index, from 1)";
     public const string NpcCaptureModeText =
         "master_switch: npc_state.csv holds every active NPC lifetime of a Part whose npcCaptureEnabled is true, from the moment NPCs exist (warm-up, " +

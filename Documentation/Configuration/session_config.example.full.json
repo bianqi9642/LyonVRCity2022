@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "participantId": "P001",
+  "selectedPart": "Part3",
+  "part2GroupIndex": 0,
+  "part3GroupIndex": 1,
+  "autoStart": true,
+  "timing": {
+    "part1Duration": 15,
+    "part2FirstDuration": 15,
+    "part2SecondDuration": 15,
+    "part3Destination1MaxSeconds": 30,
+    "part3TotalMaxSeconds": 60,
+    "npcWarmupDuration": 10
+  },
+  "partConfig": {
+    "part1": { "npcEnabled": false, "npcDirectedMovement": true,  "npcCaptureEnabled": false, "gazeCaptureEnabled": false, "trajectoryCaptureEnabled": false },
+    "part2": { "npcEnabled": true,  "npcDirectedMovement": false, "npcCaptureEnabled": true, "gazeCaptureEnabled": true,  "trajectoryCaptureEnabled": true },
+    "part3": { "npcEnabled": true,  "npcDirectedMovement": true,  "npcCaptureEnabled": true,  "gazeCaptureEnabled": true,  "trajectoryCaptureEnabled": true }
+  }
+}

@@ -27,6 +27,14 @@
 //    computing Time.realtimeSinceStartupAsDouble / DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
 //    independently. Values are numerically identical; only the call site moved.
 //
+// Revision 3 (eye-tracking acquisition, schema v8) - ADDITIVE, existing columns unchanged:
+//  - The Android permission request is NO LONGER made here (it depended on Awake order and was skipped when eyeTrackingSupported was still false). The single owner of
+//    start / permission / retry is EyeTrackingLifecycleController (auto-created in Awake when the scene has none); this recorder stays the only reader of gaze data.
+//  - Appended gaze.csv columns: eye_tracking_state, left_provider_valid, right_provider_valid. The provider flags come from the SDK's per-eye IsValid and expose the
+//    stale OVREyeGaze.Confidence (the SDK leaves Confidence untouched on invalid samples). A per-eye sample is valid only if confidence >= minConfidenceForValid AND (when
+//    the provider probe is available and requireProviderValidity) the provider flagged that eye valid. Head-forward fallback rows stay identifiable (ray_is_eye_gaze=0).
+//  - Samples are scheduled on an absolute deadline grid (SampleScheduler) instead of "wait interval after each sample", which drifted below the nominal rate.
+//
 // All comments in English per project convention.
 
 using System;
@@ -39,10 +47,10 @@ using UnityEngine;
 public class GazeRecorder : MonoBehaviour
 {
     [Header("Eye Tracking Sources (Meta Quest Pro)")]
-    [Tooltip("OVREyeGaze component configured with Eye = Left. Typically a child of CenterEyeAnchor.")]
+    [Tooltip("OVREyeGaze component configured with Eye = Left. Must be an independent object (NOT the OVRCameraRig Left/Right/CenterEyeAnchor itself: the rig rewrites that transform every frame), ideally TrackingMode = WorldSpace under an identity-rotation parent.")]
     public OVREyeGaze leftEyeGaze;
 
-    [Tooltip("OVREyeGaze component configured with Eye = Right. Typically a child of CenterEyeAnchor.")]
+    [Tooltip("OVREyeGaze component configured with Eye = Right. Same hosting rule as the left eye.")]
     public OVREyeGaze rightEyeGaze;
 
     [Tooltip("Minimum OVREyeGaze.Confidence (0..1) for a single eye's sample to be treated as valid. " +
@@ -50,6 +58,18 @@ public class GazeRecorder : MonoBehaviour
              "is the documented signal to threshold on.")]
     [Range(0f, 1f)]
     public float minConfidenceForValid = 0.5f;
+
+    [Header("Acquisition lifecycle")]
+    [Tooltip("Optional: the EyeTrackingLifecycleController that owns start/permission/retry. If empty, the scene's one is found, or one is created on this GameObject in Awake.")]
+    public EyeTrackingLifecycleController lifecycleController;
+
+    [Tooltip("If true (default), a per-eye sample also needs the provider's own IsValid flag whenever the lifecycle's provider probe is available. Guards against a stale " +
+             "OVREyeGaze.Confidence being read as a live eye. Has no effect when no probe is available (Editor without runtime, tests) - the legacy confidence rule then applies.")]
+    public bool requireProviderValidity = true;
+
+    [Tooltip("If true (default), eye samples are recorded as invalid (head_fallback) while an OVREyeGaze sits directly on an OVRCameraRig eye anchor: the rig rewrites that " +
+             "transform every frame, so its pose would be the eye-camera pose, not the gaze pose.")]
+    public bool blockEyeSamplesOnHostConflict = true;
 
     [Header("Head Reference")]
     [Tooltip("HMD transform (e.g. CenterEyeAnchor) used to log head position/rotation alongside gaze, " +
@@ -122,6 +142,22 @@ public class GazeRecorder : MonoBehaviour
     public long RowsFallback { get; private set; }
     public long RowsLeftValid { get; private set; }
     public long RowsRightValid { get; private set; }
+    // ---- acquisition evidence (schema v8) ----
+    /// <summary>Eye samples whose confidence passed the threshold but whose provider flag said invalid (stale confidence) - recorded as invalid.</summary>
+    public long RowsStaleConfidenceRejected { get; private set; }
+    /// <summary>Per-eye readings suppressed because the OVREyeGaze is hosted on an OVRCameraRig eye anchor.</summary>
+    public long RowsHostConflictBlocked { get; private set; }
+    /// <summary>Fallback rows written while the lifecycle was NOT in a running state (eye tracking never started / failed / denied / unsupported).</summary>
+    public long RowsFallbackNotAcquiring { get; private set; }
+    public double FirstValidRowT { get; private set; } = double.NaN;
+    public double LastValidRowT { get; private set; } = double.NaN;
+    /// <summary>Longest stretch (seconds) between two rows with a valid eye, or from the first row to the first valid row, while sampling.</summary>
+    public double LongestNoValidEyeSeconds { get; private set; }
+    /// <summary>The acquisition state machine (null until a controller exists).</summary>
+    public EyeTrackingLifecycle Lifecycle => lifecycleController != null ? lifecycleController.Lifecycle : null;
+    /// <summary>Deadline-grid scheduler of the sampling loop (statistics: ticks, skipped ticks, max lateness).</summary>
+    public SampleScheduler Scheduler { get; private set; }
+    double _noValidSince = double.NaN;
     /// <summary>The CSV writer (shared failure/recovery policy and counters); null until the first StartRecording.</summary>
     public CaptureCsvWriter Writer => gazeWriter;
     CaptureCsvWriter gazeWriter;
@@ -139,7 +175,7 @@ public class GazeRecorder : MonoBehaviour
 
     /// <summary>Test seam: replaces the OVREyeGaze reading of one eye with a fixed sample (null/inactive = real reading). Never set in production.</summary>
     [Serializable]
-    public class EyeInjection { public bool active = true; public float confidence; public Vector3 origin; public Vector3 direction = Vector3.forward; }
+    public class EyeInjection { public bool active = true; public float confidence; public Vector3 origin; public Vector3 direction = Vector3.forward; public bool applyProviderGate; }
     [NonSerialized] public EyeInjection testLeftEye;
     [NonSerialized] public EyeInjection testRightEye;
 
@@ -163,28 +199,24 @@ public class GazeRecorder : MonoBehaviour
             headTransform = Camera.main.transform;
         }
 
-        // Android runtime eye-tracking permission. Meta XR SDK 201: OVRPermissionsRequester is a static
-        // requester that does NOT require an OVRManager in the scene. No effect outside an Android build.
-#if UNITY_ANDROID && !UNITY_EDITOR
-        try
-        {
-            if (!OVRPermissionsRequester.IsPermissionGranted(OVRPermissionsRequester.Permission.EyeTracking))
-            {
-                OVRPermissionsRequester.Request(new[] { OVRPermissionsRequester.Permission.EyeTracking });
-            }
-        }
-        catch (Exception e)
-        {
-            if (enableDebugLogs)
-                Debug.LogWarning($"[GazeRecorder] Eye-tracking permission request failed: {e.Message}. " +
-                    "Verify OVRPermissionsRequester exists in the installed Meta XR SDK version.");
-        }
-#endif
+        EnsureLifecycleController();
 
         if (enableDebugLogs && (leftEyeGaze == null || rightEyeGaze == null))
         {
             Debug.LogWarning("[GazeRecorder] leftEyeGaze and/or rightEyeGaze is not assigned. This recorder " +
                 "will still run but will record all-invalid samples until both are assigned.");
+        }
+    }
+
+    // The permission request, the start of OVREyeGaze and its retries belong to ONE owner (EyeTrackingLifecycleController); this recorder only makes sure it exists.
+    void EnsureLifecycleController()
+    {
+        if (lifecycleController == null) lifecycleController = FindObjectOfType<EyeTrackingLifecycleController>();
+        if (lifecycleController == null)
+        {
+            lifecycleController = gameObject.AddComponent<EyeTrackingLifecycleController>();
+            lifecycleController.leftEyeGaze = leftEyeGaze;
+            lifecycleController.rightEyeGaze = rightEyeGaze;
         }
     }
 
@@ -329,10 +361,20 @@ public class GazeRecorder : MonoBehaviour
         }
 
         if (string.IsNullOrEmpty(subjectId) && dataCapture != null && !string.IsNullOrEmpty(dataCapture.ParticipantId)) subjectId = dataCapture.ParticipantId;
-        if (string.IsNullOrEmpty(subjectId) && sessionController != null) subjectId = sessionController.participantId;
+        if (string.IsNullOrEmpty(subjectId) && sessionController != null)
+        {
+            // A session controller exists, so this is an experiment session: the participant must be the VALIDATED one. Never record under a placeholder.
+            if (!sessionController.ValidateIdentity().IsValid)
+            {
+                Debug.LogError("[GazeRecorder] StartRecording refused: the session configuration/participant identity is not valid (" + sessionController.Resolved.Identity.message + ")");
+                return;
+            }
+            subjectId = sessionController.ActiveParticipantId;
+        }
+        // Legacy standalone/development fallback ONLY: no session controller exists in the scene at all (never reached in an experiment session).
         if (string.IsNullOrEmpty(subjectId)) subjectId = "UNKNOWN_SUBJECT";
 
-        if (string.IsNullOrEmpty(trialId) && sessionController != null) trialId = sessionController.selectedPart.ToString();
+        if (string.IsNullOrEmpty(trialId) && sessionController != null) trialId = sessionController.ActivePart.ToString();
         if (string.IsNullOrEmpty(trialId)) trialId = "UNKNOWN_TRIAL";
 
         fullPath = BuildFullPath();
@@ -440,7 +482,12 @@ public class GazeRecorder : MonoBehaviour
             "ray_origin_x", "ray_origin_y", "ray_origin_z",
             "ray_dir_x", "ray_dir_y", "ray_dir_z",
             "hit_is_current_target",
-            "hit_assigned_destination"
+            "hit_assigned_destination",
+            // ----- schema v8 appended columns (eye-tracking acquisition) -----
+            // eye_tracking_state: lifecycle state at the sample (waiting_for_xr | ... | running | tracking_unavailable ...), blank without a lifecycle controller.
+            // left/right_provider_valid: the provider's own per-eye IsValid at the sample (1/0), blank when no provider probe is available (never a guessed 0).
+            "eye_tracking_state",
+            "left_provider_valid", "right_provider_valid"
         });
     }
 
@@ -452,7 +499,7 @@ public class GazeRecorder : MonoBehaviour
         public Vector3 direction;
     }
 
-    EyeSample ReadEye(OVREyeGaze eyeGaze, EyeInjection injected)
+    EyeSample ReadEye(OVREyeGaze eyeGaze, EyeInjection injected, bool providerKnown, bool providerValid, bool hostBlocked)
     {
         EyeSample sample = new EyeSample
         {
@@ -468,21 +515,29 @@ public class GazeRecorder : MonoBehaviour
             sample.origin = injected.origin;
             sample.direction = injected.direction;
             sample.valid = sample.confidence >= minConfidenceForValid;
-            return sample;
+            if (!injected.applyProviderGate) return sample;
         }
+        else
+        {
+            if (eyeGaze == null || !eyeGaze.isActiveAndEnabled) return sample;
 
-        if (eyeGaze == null || !eyeGaze.isActiveAndEnabled) return sample;
-
-        sample.confidence = eyeGaze.Confidence;
-        sample.origin = eyeGaze.transform.position;
-        sample.direction = eyeGaze.transform.forward;
-        sample.valid = sample.confidence >= minConfidenceForValid;
+            sample.confidence = eyeGaze.Confidence;
+            sample.origin = eyeGaze.transform.position;
+            sample.direction = eyeGaze.transform.forward;
+            sample.valid = sample.confidence >= minConfidenceForValid;
+        }
+        // Provider gating (same rules for a real OVREyeGaze reading and for an injected one that opts in): host conflict and stale confidence.
+        if (sample.valid && hostBlocked) { sample.valid = false; RowsHostConflictBlocked++; }
+        else if (sample.valid && providerKnown && !providerValid) { sample.valid = false; RowsStaleConfidenceRejected++; }
         return sample;
     }
 
     IEnumerator SamplingLoop()
     {
         float interval = (sampleRate > 0f) ? (1f / sampleRate) : (1f / 30f);
+        if (Scheduler == null) Scheduler = new SampleScheduler(interval); else Scheduler.SetInterval(interval);
+        Scheduler.Reset();
+        _noValidSince = double.NaN;
 
         while (true)
         {
@@ -492,12 +547,20 @@ public class GazeRecorder : MonoBehaviour
             if (dataCapture != null && !dataCapture.GazeCaptureActive)
             {
                 Sampling?.BreakEpoch();   // intentional gap: capture window closed (trial not open / End panel / Part has gaze capture off)
+                Scheduler.Reset();
+                _noValidSince = double.NaN;
                 yield return new WaitForSecondsRealtime(interval);
                 continue;
             }
 
-            EyeSample left = ReadEye(leftEyeGaze, testLeftEye);
-            EyeSample right = ReadEye(rightEyeGaze, testRightEye);
+            // Acquisition context (cheap, no allocation): the provider probe is only trusted while the lifecycle says it is running and the last query succeeded.
+            EyeTrackingLifecycle lc = Lifecycle;
+            bool probeKnown = requireProviderValidity && lc != null && lc.ProviderProbeAvailable &&
+                              (lc.State == EyeTrackingState.Running || lc.State == EyeTrackingState.TrackingUnavailable);
+            bool hostBlocked = blockEyeSamplesOnHostConflict && lifecycleController != null && lifecycleController.HostConflict.Length > 0;
+            EyeSample left = ReadEye(leftEyeGaze, testLeftEye, probeKnown, lc != null && lc.LeftProviderValid, hostBlocked);
+            EyeSample right = ReadEye(rightEyeGaze, testRightEye, probeKnown, lc != null && lc.RightProviderValid, hostBlocked);
+            bool leftInjected = testLeftEye != null && testLeftEye.active && !testLeftEye.applyProviderGate, rightInjected = testRightEye != null && testRightEye.active && !testRightEye.applyProviderGate;
 
             bool combinedValid;
             float combinedConfidence;
@@ -619,7 +682,11 @@ public class GazeRecorder : MonoBehaviour
                 F4(combinedOrigin.x), F4(combinedOrigin.y), F4(combinedOrigin.z),
                 F4(combinedDirection.x), F4(combinedDirection.y), F4(combinedDirection.z),
                 aoi.isCurrentTarget,
-                SafeCsvField(aoi.assignedDestination)
+                SafeCsvField(aoi.assignedDestination),
+                // ----- schema v8 appended columns -----
+                lc != null ? EyeTrackingNames.Of(lc.State) : "",
+                (probeKnown && !leftInjected) ? (lc.LeftProviderValid ? "1" : "0") : "",
+                (probeKnown && !rightInjected) ? (lc.RightProviderValid ? "1" : "0") : ""
             });
 
             if (WriteRow(row))
@@ -627,13 +694,23 @@ public class GazeRecorder : MonoBehaviour
                 RowsWritten++;
                 if (double.IsNaN(FirstRowT)) FirstRowT = tAbs;
                 LastRowT = tAbs;
-                if (combinedValid) RowsValidEye++; else RowsFallback++;
+                if (combinedValid) RowsValidEye++; else { RowsFallback++; if (lc == null || lc.State != EyeTrackingState.Running) RowsFallbackNotAcquiring++; }
                 if (left.valid) RowsLeftValid++;
                 if (right.valid) RowsRightValid++;
-                Sampling?.OnSample(tAbs);   // only a SUCCESSFULLY written row is a sample
+                // Longest stretch without a valid eye INSIDE one capture epoch (the reference restarts after a pause / closed capture window).
+                if (double.IsNaN(_noValidSince)) _noValidSince = tAbs;
+                if (combinedValid)
+                {
+                    LongestNoValidEyeSeconds = Math.Max(LongestNoValidEyeSeconds, tAbs - _noValidSince);
+                    _noValidSince = tAbs;
+                    if (double.IsNaN(FirstValidRowT)) FirstValidRowT = tAbs;
+                    LastValidRowT = tAbs;
+                }
+                Sampling?.OnSampleWithFrame(tAbs, Time.unscaledDeltaTime);   // only a SUCCESSFULLY written row is a sample
             }
 
-            yield return new WaitForSecondsRealtime(interval);
+            // Absolute deadline grid: the overshoot of one sample shortens the next wait, so the long-run rate converges to the nominal one when the frame rate allows it.
+            yield return new WaitForSecondsRealtime((float)Scheduler.WaitAfterSample(CaptureClock.TAbs));
         }
     }
 

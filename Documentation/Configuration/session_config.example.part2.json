@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "participantId": "P001",
+  "selectedPart": "Part2",
+  "part2GroupIndex": 0,
+  "part3GroupIndex": 1,
+  "autoStart": true
+}

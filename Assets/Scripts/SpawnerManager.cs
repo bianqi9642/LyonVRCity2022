@@ -371,6 +371,10 @@ public class SpawnerManager : MonoBehaviour
             experimentManager.OnSessionEnded += HandleSessionEnded;
         }
 
+        // The session settings are frozen before the pool is prewarmed (idempotent; a no-op when already frozen). Prewarm itself reads no Part setting; spawning
+        // later reads only the frozen ExperimentManager.CurrentPartConfig.
+        if (experimentManager != null) experimentManager.EnsureSessionOverridesApplied();
+
         // Start sequence that waits/attempts NavMesh prewarm and only then starts spawn loop.
         StartCoroutine(InitializePoolThenSpawn());
     }

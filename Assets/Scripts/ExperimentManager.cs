@@ -9,7 +9,7 @@ using UnityEngine;
 /// Part 1 / Part 2: unchanged.
 ///
 /// Part 3 (15-minute Main Experimental Phase):
-///  - The participant's assigned group (1..12, from ExternalSessionController.part3GroupIndex, 0-based)
+///  - The participant's assigned group (0..11, from ExternalSessionController.ActivePart3GroupIndex; Group Number == Group Index; an out-of-range index refuses the Part, it is never clamped)
 ///    is looked up in a fixed table that yields (StartZone, Destination1Zone, Destination2Zone).
 ///  - StartZone selects one of four FIXED start Transforms. The participant is teleported there.
 ///  - Destination1Zone / Destination2Zone each have exactly two candidate buildings; exactly ONE per
@@ -348,22 +348,35 @@ public class ExperimentManager : MonoBehaviour
         }
     }
 
-    // Fixed group -> (start zone, destination 1 zone, destination 2 zone). Index 0 == Group 1.
+    // Fixed group -> (start zone, destination 1 zone, destination 2 zone). Group Number == Group Index (0..11).
     private static readonly Part3GroupDef[] Part3GroupTable =
     {
-        new Part3GroupDef(Part3Zone.GE, Part3Zone.GU, Part3Zone.OE), // Group 1
-        new Part3GroupDef(Part3Zone.GE, Part3Zone.OE, Part3Zone.GU), // Group 2
-        new Part3GroupDef(Part3Zone.GE, Part3Zone.OU, Part3Zone.GE), // Group 3
-        new Part3GroupDef(Part3Zone.GU, Part3Zone.GE, Part3Zone.OU), // Group 4
-        new Part3GroupDef(Part3Zone.GU, Part3Zone.OE, Part3Zone.GU), // Group 5
-        new Part3GroupDef(Part3Zone.GU, Part3Zone.OU, Part3Zone.GE), // Group 6
-        new Part3GroupDef(Part3Zone.OE, Part3Zone.GE, Part3Zone.OU), // Group 7
-        new Part3GroupDef(Part3Zone.OE, Part3Zone.GU, Part3Zone.OE), // Group 8
-        new Part3GroupDef(Part3Zone.OE, Part3Zone.OU, Part3Zone.GE), // Group 9
-        new Part3GroupDef(Part3Zone.OU, Part3Zone.GE, Part3Zone.OU), // Group 10
-        new Part3GroupDef(Part3Zone.OU, Part3Zone.GU, Part3Zone.OE), // Group 11
-        new Part3GroupDef(Part3Zone.OU, Part3Zone.OE, Part3Zone.GU), // Group 12
+        new Part3GroupDef(Part3Zone.GE, Part3Zone.GU, Part3Zone.OE), // Group 0
+        new Part3GroupDef(Part3Zone.GE, Part3Zone.OE, Part3Zone.GU), // Group 1
+        new Part3GroupDef(Part3Zone.GE, Part3Zone.OU, Part3Zone.GE), // Group 2
+        new Part3GroupDef(Part3Zone.GU, Part3Zone.GE, Part3Zone.OU), // Group 3
+        new Part3GroupDef(Part3Zone.GU, Part3Zone.OE, Part3Zone.GU), // Group 4
+        new Part3GroupDef(Part3Zone.GU, Part3Zone.OU, Part3Zone.GE), // Group 5
+        new Part3GroupDef(Part3Zone.OE, Part3Zone.GE, Part3Zone.OU), // Group 6
+        new Part3GroupDef(Part3Zone.OE, Part3Zone.GU, Part3Zone.OE), // Group 7
+        new Part3GroupDef(Part3Zone.OE, Part3Zone.OU, Part3Zone.GE), // Group 8
+        new Part3GroupDef(Part3Zone.OU, Part3Zone.GE, Part3Zone.OU), // Group 9
+        new Part3GroupDef(Part3Zone.OU, Part3Zone.GU, Part3Zone.OE), // Group 10
+        new Part3GroupDef(Part3Zone.OU, Part3Zone.OE, Part3Zone.GU), // Group 11
     };
+
+    /// <summary>Number of Part 3 groups in the authoritative assignment table (valid zero-based group indices are 0..Part3GroupCount-1).</summary>
+    public static int Part3GroupCount => Part3GroupTable.Length;
+
+    /// <summary>The (start, destination 1, destination 2) zones of a zero-based Part 3 group index, for configuration diagnostics. False if the index is out of range.</summary>
+    public static bool TryGetPart3GroupZones(int groupIndex, out string startZone, out string destination1Zone, out string destination2Zone)
+    {
+        startZone = destination1Zone = destination2Zone = "";
+        if (groupIndex < 0 || groupIndex >= Part3GroupTable.Length) return false;
+        Part3GroupDef d = Part3GroupTable[groupIndex];
+        startZone = d.StartZone.ToString(); destination1Zone = d.Destination1Zone.ToString(); destination2Zone = d.Destination2Zone.ToString();
+        return true;
+    }
 
     // internal state
     private Coroutine runningCoroutine;
@@ -400,10 +413,112 @@ public class ExperimentManager : MonoBehaviour
     private void Awake()
     {
         if (uiManager == null) Debug.LogWarning("ExperimentManager: UIManager not assigned in inspector.");
-        if (sessionController == null) Debug.LogWarning("ExperimentManager: ExternalSessionController not assigned in inspector.");
-
+        // The session configuration is NOT frozen here: Awake order across GameObjects is unspecified and the Inspector values are final only once every Awake
+        // has run. EnsureSessionOverridesApplied() (below) freezes them on first need - at the latest from Start(), always before a Part, the NPC gate or the
+        // manifest reads them.
         EnsureExplorationBoundaryInitialised();
     }
+
+    // ---------------------------------------------------------------------------------------------------------------------------------------------
+    // Frozen session configuration. The effective settings (JSON overrides merged with the Scene-owned values below, each with provenance) are captured ONCE from the
+    // resolved ExternalSessionController snapshot and the current Scene values; every runtime read afterwards (durations, per-Part NPC/capture flags,
+    // wrong-candidate protocol, river-teleport restriction) goes through them, so later Inspector edits or file changes cannot alter the running session.
+    // The public Inspector fields stay the Scene-owned source that is read at the moment of freezing.
+    // ---------------------------------------------------------------------------------------------------------------------------------------------
+    private EffectiveSettings _effective;
+    private readonly PartCaptureConfig[] _frozenPartConfigs = new PartCaptureConfig[3];
+    private bool _configDependencyErrorLogged;
+
+    /// <summary>The session's controller: the Inspector reference, else the scene's single ExternalSessionController. Null = no configuration source exists.</summary>
+    private ExternalSessionController Controller
+    {
+        get
+        {
+            if (sessionController == null)
+            {
+                sessionController = FindObjectOfType<ExternalSessionController>(true);
+                if (sessionController != null)
+                    Debug.LogWarning("[ExperimentManager] sessionController is not assigned in the Inspector; using the ExternalSessionController found in the scene.");
+            }
+            return sessionController;
+        }
+    }
+
+    /// <summary>
+    /// Idempotent. Resolves the session configuration (if not yet) and freezes the effective settings exactly once. Returns true when the frozen settings are
+    /// available; false (fail closed, nothing applied) when there is no ExternalSessionController or the configuration is Invalid. Safe to call from any component
+    /// and at any time, in any Awake/Start order.
+    /// </summary>
+    public bool EnsureSessionOverridesApplied()
+    {
+        if (_effective != null) return true;
+
+        ExternalSessionController c = Controller;
+        if (c == null)
+        {
+            if (!_configDependencyErrorLogged)
+            {
+                _configDependencyErrorLogged = true;
+                Debug.LogError("[ExperimentManager] No ExternalSessionController is assigned or present in the scene: the session configuration cannot be resolved. " +
+                               "Part start, auto-start and recording are blocked.");
+            }
+            return false;
+        }
+        if (c.Initialize() != ExternalSessionController.ConfigState.Valid) return false;
+
+        EffectiveSettings e = c.FreezeEffective(CaptureSceneSettings());
+        if (e == null) return false;
+        for (int i = 0; i < 3; i++)
+        {
+            PartFlagValues f = e.GetPartFlags(i + 1);
+            _frozenPartConfigs[i] = new PartCaptureConfig
+            {
+                npcEnabled = f.NpcEnabled, npcDirectedMovement = f.NpcDirectedMovement, npcCaptureEnabled = f.NpcCaptureEnabled,
+                gazeCaptureEnabled = f.GazeCaptureEnabled, trajectoryCaptureEnabled = f.TrajectoryCaptureEnabled
+            };
+        }
+        _effective = e;
+        return true;
+    }
+
+    /// <summary>The frozen effective settings, or null while the configuration is Invalid / unavailable (this call freezes them on first use).</summary>
+    public EffectiveSettings Effective => EnsureSessionOverridesApplied() ? _effective : null;
+
+    /// <summary>The frozen PartCaptureConfig of Part 1..3 (a private copy: Inspector edits do not reach it), or null while the configuration is unavailable.</summary>
+    public PartCaptureConfig GetEffectivePartConfig(int partNumber)
+        => partNumber >= 1 && partNumber <= 3 && EnsureSessionOverridesApplied() ? _frozenPartConfigs[partNumber - 1] : null;
+
+    private static PartFlagValues FlagsOf(PartCaptureConfig c)
+        => c == null ? default(PartFlagValues) : new PartFlagValues(c.npcEnabled, c.npcDirectedMovement, c.npcCaptureEnabled, c.gazeCaptureEnabled, c.trajectoryCaptureEnabled);
+
+    // Reads the Scene-owned values at the moment of freezing (the only place the Inspector fields are read for the running session).
+    private SceneSettings CaptureSceneSettings()
+    {
+        var ss = new SceneSettings
+        {
+            Part1Duration = part1Duration, Part2FirstDuration = part2FirstDuration, Part2SecondDuration = part2SecondDuration,
+            Part3Destination1MaxSeconds = part3Destination1MaxSeconds, Part3TotalMaxSeconds = part3TotalMaxSeconds, NpcWarmupDuration = npcWarmupDuration,
+            AllowWrongCandidateSelection = allowWrongCandidateSelection, RestrictRiverTeleportToPart3 = restrictRiverTeleportToPart3,
+        };
+        ss.PartFlags[0] = FlagsOf(part1Config); ss.PartFlags[1] = FlagsOf(part2Config); ss.PartFlags[2] = FlagsOf(part3Config);
+
+        SpawnerManager sp = spawner != null ? spawner : FindObjectOfType<SpawnerManager>(true);
+        if (sp != null)
+        {
+            ss.SpawnerMaxAgents = sp.maxAgents; ss.SpawnerPoolPrewarm = sp.poolPrewarm; ss.SpawnerSpawnInterval = sp.spawnInterval;
+            ss.SpawnerDwellTimeMin = sp.dwellTimeSec.x; ss.SpawnerDwellTimeMax = sp.dwellTimeSec.y;
+        }
+        // The profile the NPC system will actually use: RunNpcWarmup assigns currentProfile to the spawner when a Part with NPCs starts.
+        AgentProfile prof = currentProfile != null ? currentProfile : (sp != null ? sp.defaultProfile : null);
+        if (prof != null)
+        {
+            ss.AgentProfileName = prof.name;
+            try { ss.AgentProfileHash = AgentProfileSnapshot.Describe(prof, out _); } catch (Exception) { ss.AgentProfileHash = ""; }
+        }
+        return ss;
+    }
+
+    private bool RestrictRiverTeleport => EnsureSessionOverridesApplied() ? _effective.RestrictRiverTeleportToPart3 : true;   // unavailable config: most restrictive
 
     /// <summary>
     /// The ExplorationBoundary component lives under EnvironmentConfig/Participant/..., organisation objects that are
@@ -443,34 +558,45 @@ public class ExperimentManager : MonoBehaviour
 
         ValidateTargetIds();
 
-        if (sessionController != null && sessionController.autoStart)
+        // Freeze the effective settings now (before any auto-start, trial or recording read) and auto-start only a Valid configuration.
+        EnsureSessionOverridesApplied();
+        ExternalSessionController c = Controller;
+        if (c != null && c.ActiveAutoStart)
         {
             StartSelectedPart();
         }
     }
 
     // F-14: no participant Part (and therefore no auto-start) begins while the session identity/configuration is invalid. NPC simulation of a scene without a
-    // running Part is unaffected; only the participant trial is held back. A manager without a session controller has no identity source and is not gated here
-    // (the recorder is: DataCaptureManager refuses to persist anything without a valid identity).
+    // running Part is unaffected; only the participant trial is held back. FAIL CLOSED: without any ExternalSessionController there is no configuration source and
+    // no Part can start; the effective settings must also be frozen before a Part runs.
     private bool IdentityAllowsStart(string what)
     {
-        if (sessionController == null) return true;
-        SessionIdentity.Result r = sessionController.ValidateIdentity();
-        if (r.IsValid) return true;
-        Debug.LogError($"ExperimentManager: {what} refused - invalid session identity/configuration ({r.status}): {r.message}");
-        return false;
+        ExternalSessionController c = Controller;
+        if (c == null)
+        {
+            Debug.LogError($"ExperimentManager: {what} refused - no ExternalSessionController is assigned or present (the session configuration cannot be resolved).");
+            return false;
+        }
+        SessionIdentity.Result r = c.ValidateIdentity();
+        if (!r.IsValid)
+        {
+            Debug.LogError($"ExperimentManager: {what} refused - invalid session identity/configuration ({r.status}): {r.message}");
+            return false;
+        }
+        if (!EnsureSessionOverridesApplied())
+        {
+            Debug.LogError($"ExperimentManager: {what} refused - the effective session settings could not be frozen.");
+            return false;
+        }
+        return true;
     }
 
     public void StartSelectedPart()
     {
         if (!IdentityAllowsStart("StartSelectedPart")) return;
-        if (sessionController == null)
-        {
-            Debug.LogError("ExperimentManager: Cannot StartSelectedPart because sessionController is null.");
-            return;
-        }
 
-        switch (sessionController.selectedPart)
+        switch (Controller.ActivePart)
         {
             case ExternalSessionController.ExperimentPart.Part1: StartPart1(); break;
             case ExternalSessionController.ExperimentPart.Part2: StartPart2(); break;
@@ -519,7 +645,7 @@ public class ExperimentManager : MonoBehaviour
     /// disagree. The scheduled Part 2 cross-bank transition is NOT a river-point interaction.
     /// </summary>
     public bool IsRiverTeleportAvailable =>
-        ParticipantControlEnabled && (!restrictRiverTeleportToPart3 || (currentRunningPart == RunningPart.Part3 && !EndPanelActive));
+        ParticipantControlEnabled && (!RestrictRiverTeleport || (currentRunningPart == RunningPart.Part3 && !EndPanelActive));
 
     /// <summary>
     /// A participant-initiated XRI teleport was EXECUTED. Raised through the existing "teleport" event so the
@@ -756,6 +882,7 @@ public class ExperimentManager : MonoBehaviour
     /// </summary>
     private IEnumerator RunNpcWarmup(PartCaptureConfig cfg, string partLabel)
     {
+        float warmupDuration = _effective != null ? _effective.NpcWarmupDuration : 0f;
         if (spawner != null)
             spawner.ResetForNewPart();
 
@@ -770,16 +897,16 @@ public class ExperimentManager : MonoBehaviour
             spawner.BeginNpcSimulation();
         }
 
-        if (npcWarmupDuration <= 0f)
+        if (warmupDuration <= 0f)
             yield break;
 
         if (spawner != null)
             spawner.BeginNpcWarmup();
 
-        RaiseEvt("npc_warmup_start", partLabel, numValue: npcWarmupDuration);
+        RaiseEvt("npc_warmup_start", partLabel, numValue: warmupDuration);
 
         double warmupStart = CaptureClock.TAbs;
-        yield return WaitExperimentSeconds(npcWarmupDuration);
+        yield return WaitExperimentSeconds(warmupDuration);
         double wt = CaptureClock.TAbs - warmupStart;   // measured on the shared monotonic clock
 
         RaiseEvt("npc_warmup_end", partLabel, numValue: wt);
@@ -812,8 +939,10 @@ public class ExperimentManager : MonoBehaviour
 
     private IEnumerator RunPart1()
     {
+        if (!EnsureSessionOverridesApplied()) { Debug.LogError("ExperimentManager.RunPart1 refused: the effective session settings are not available."); yield break; }
+
         currentRunningPart = RunningPart.Part1;
-        CurrentPartConfig = part1Config;
+        CurrentPartConfig = _frozenPartConfigs[0];
         EndPanelActive = false;
         endPanelDisplayHandled = false;
         endPanelVisibleRealtime = double.NaN;
@@ -825,7 +954,7 @@ public class ExperimentManager : MonoBehaviour
         // NPC presence is now controlled entirely by part1Config.npcEnabled (Requirement 1/3) - no more
         // Part1-specific special-casing here. With the shipped default (npcEnabled=false) this call returns
         // immediately after clearing any stale End-Panel hard-stop, exactly reproducing "Part1 is NPC-free".
-        yield return RunNpcWarmup(part1Config, "Part1");
+        yield return RunNpcWarmup(CurrentPartConfig, "Part1");
 
         bool started = false;
         RaiseEvt("panel_shown", "Part1", label: "part1_start");
@@ -835,7 +964,7 @@ public class ExperimentManager : MonoBehaviour
         BeginTrial();
 
         targetWasSelected = false;
-        yield return WaitExperimentSeconds(part1Duration);
+        yield return WaitExperimentSeconds(_effective.Part1Duration);
 
         EndTrial();
 
@@ -856,20 +985,29 @@ public class ExperimentManager : MonoBehaviour
 
     private IEnumerator RunPart2()
     {
+        if (!EnsureSessionOverridesApplied()) { Debug.LogError("ExperimentManager.RunPart2 refused: the effective session settings are not available."); yield break; }
+
+        // The group index comes from the resolved (validated) session configuration and is NEVER clamped: an index outside the configured groups would silently
+        // run a different experimental condition, so the Part is refused before anything starts. Part 2 Group Number == Group Index (0..part2Groups.Length-1).
+        int gIdx = Controller.ActivePart2GroupIndex;
+        if (part2Groups != null && part2Groups.Length > 0 && (gIdx < 0 || gIdx >= part2Groups.Length))
+        {
+            Debug.LogError($"ExperimentManager.RunPart2 refused: part2GroupIndex {gIdx} is outside 0..{part2Groups.Length - 1} (the scene has {part2Groups.Length} Part 2 groups). Fix the session configuration.");
+            yield break;
+        }
+
         currentRunningPart = RunningPart.Part2;
-        CurrentPartConfig = part2Config;
+        CurrentPartConfig = _frozenPartConfigs[1];
         EndPanelActive = false;
         endPanelDisplayHandled = false;
         endPanelVisibleRealtime = double.NaN;
         RaiseEvt("part_start", "Part2");
 
-        int gIdx = (sessionController != null) ? sessionController.part2GroupIndex : 0;
         if (part2Groups == null || part2Groups.Length == 0)
         {
             Debug.LogError("ExperimentManager.RunPart2: No Part2 groups configured in inspector.");
             yield break;
         }
-        gIdx = Mathf.Clamp(gIdx, 0, part2Groups.Length - 1);
         Part2Group group = part2Groups[gIdx];
 
         Transform chosenStart = ChooseRandomFromArray(group.startPositions);
@@ -877,7 +1015,7 @@ public class ExperimentManager : MonoBehaviour
 
         TeleportPlayerTo(chosenStart);
 
-        yield return RunNpcWarmup(part2Config, "Part2");
+        yield return RunNpcWarmup(CurrentPartConfig, "Part2");
 
         // Phase labels for Part 2 (metadata only - no timing or flow depends on them): the Start panel is being read until the participant confirms.
         SetPhase("p2_start_pending", "Part2");
@@ -892,7 +1030,7 @@ public class ExperimentManager : MonoBehaviour
         BeginTrial();
 
         targetWasSelected = false;
-        yield return WaitExperimentSeconds(part2FirstDuration);
+        yield return WaitExperimentSeconds(_effective.Part2FirstDuration);
 
         bool teleported = false;
         SetPhase("p2_continue_pending", "Part2");   // Continue panel being read: the trial is open and recorded, but this is NOT task time
@@ -907,7 +1045,7 @@ public class ExperimentManager : MonoBehaviour
 
         yield return new WaitUntil(() => teleported);
 
-        yield return WaitExperimentSeconds(part2SecondDuration);
+        yield return WaitExperimentSeconds(_effective.Part2SecondDuration);
 
         EndTrial();
         SetPhase("ended", "Part2");
@@ -927,12 +1065,23 @@ public class ExperimentManager : MonoBehaviour
 
     private IEnumerator RunPart3()
     {
+        if (!EnsureSessionOverridesApplied()) { Debug.LogError("[ExperimentManager] RunPart3 refused: the effective session settings are not available."); yield break; }
+
+        // Resolve the group first and refuse (never clamp) an out-of-range index: clamping would silently run another group's start/destinations.
+        // The zero-based Group Index IS the Group Number (0..11) and indexes Part3GroupTable directly.
+        int groupIndex = Controller.ActivePart3GroupIndex;
+        if (groupIndex < 0 || groupIndex >= Part3GroupTable.Length)
+        {
+            Debug.LogError($"[ExperimentManager] RunPart3 refused: part3GroupIndex {groupIndex} is outside 0..{Part3GroupTable.Length - 1}. Fix the session configuration.");
+            yield break;
+        }
+
         currentRunningPart = RunningPart.Part3;
-        CurrentPartConfig = part3Config;
+        CurrentPartConfig = _frozenPartConfigs[2];
         EndPanelActive = false;
         endPanelDisplayHandled = false;
         endPanelVisibleRealtime = double.NaN;
-        p3Timing = new Part3ValidTiming(part3Destination1MaxSeconds, part3TotalMaxSeconds);
+        p3Timing = new Part3ValidTiming(_effective.Part3Destination1MaxSeconds, _effective.Part3TotalMaxSeconds);
         p3D2Ran = false;
         RaiseEvt("part_start", "Part3");
         SetPhase("idle");
@@ -942,18 +1091,8 @@ public class ExperimentManager : MonoBehaviour
         selectionWindowOpen = false;
         pendingSelections.Clear();
 
-        // --- 1. Resolve the participant's group (index 0..11 -> Group 1..12). ---
-        int groupNumber = 1;
-        if (sessionController != null)
-        {
-            int requested = sessionController.part3GroupIndex + 1;
-            groupNumber = Mathf.Clamp(requested, 1, Part3GroupTable.Length);
-            if (requested != groupNumber)
-            {
-                Debug.LogWarning($"[ExperimentManager] Part3 group index {sessionController.part3GroupIndex} is out of range (valid 0..{Part3GroupTable.Length - 1}); clamped to group {groupNumber}.");
-            }
-        }
-        Part3GroupDef def = Part3GroupTable[groupNumber - 1];
+        // --- 1. Resolve the participant's group (Group Index == Group Number, 0..11). ---
+        Part3GroupDef def = Part3GroupTable[groupIndex];
 
         // --- 2. Resolve the fixed start point and the two destination zones. ---
         Transform startPoint = ResolvePart3Start(def.StartZone);
@@ -1003,12 +1142,12 @@ public class ExperimentManager : MonoBehaviour
         TeleportPlayerTo(startPoint);
 
         // --- 6. Persist the assignment immediately via the capture event (legacy CSV removed). ---
-        AppendPart3Log("assigned", groupNumber, def, startPoint, destination1Building, destination2Building,
+        AppendPart3Log("assigned", groupIndex, def, startPoint, destination1Building, destination2Building,
             selectedId: "", found: false, elapsedSeconds: 0.0, notes: "");
 
         // --- 6b. NPC warm-up: NPCs spawn/spread out via SpawnerManager's normal runtime behaviour, BEFORE
         // the Phase 3 Start panel is shown. Not part of the participant's trial - see DataCaptureManager.
-        yield return RunNpcWarmup(part3Config, "Part3");
+        yield return RunNpcWarmup(CurrentPartConfig, "Part3");
 
         // --- 7. Phase 3 Start panel. (All candidates are still non-interactable ordinary buildings.) ---
         bool started = false;
@@ -1044,7 +1183,7 @@ public class ExperimentManager : MonoBehaviour
         SetAllPart3CandidatesInteractable(false);
         SetCandidateInteractable(destination1Building, true);
         RaiseEvt("candidate_interactable_on", "Part3", label: "D1", building: destination1Building);
-        GameObject d1Alternate = allowWrongCandidateSelection ? GetAlternateCandidate(d1ZoneTargets, destination1Building) : null;
+        GameObject d1Alternate = _effective.AllowWrongCandidateSelection ? GetAlternateCandidate(d1ZoneTargets, destination1Building) : null;
         if (d1Alternate != null)
         {
             SetCandidateInteractable(d1Alternate, true);
@@ -1082,7 +1221,7 @@ public class ExperimentManager : MonoBehaviour
                 string clickedId = sel.id;
                 bool correct = !string.IsNullOrEmpty(d1AssignedId) && clickedId == d1AssignedId;
 
-                AppendPart3Log("d1_click", groupNumber, def, startPoint, destination1Building, destination2Building,
+                AppendPart3Log("d1_click", groupIndex, def, startPoint, destination1Building, destination2Building,
                     selectedId: clickedId, found: correct,
                     elapsedSeconds: sel.realtime - d1StartRealtime,
                     notes: correct ? "correct" : "wrong_building", interactionId: sel.interactionId);
@@ -1123,7 +1262,7 @@ public class ExperimentManager : MonoBehaviour
             RaiseEvt("candidate_interactable_off", "Part3", label: "D1", building: d1Alternate);
         }
 
-        AppendPart3Log("d1_result", groupNumber, def, startPoint, destination1Building, destination2Building,
+        AppendPart3Log("d1_result", groupIndex, def, startPoint, destination1Building, destination2Building,
             selectedId: d1SelectedId, found: d1Found, elapsedSeconds: d1Elapsed,
             notes: d1Found ? "found" : (totalTimeUpAfterD1 ? "total_time_reached" : "d1_timeout_10min"),
             terminationReason: p3Timing.D1EndReason);
@@ -1170,7 +1309,7 @@ public class ExperimentManager : MonoBehaviour
             SetAllPart3CandidatesInteractable(false);
             SetCandidateInteractable(destination2Building, true);
             RaiseEvt("candidate_interactable_on", "Part3", label: "D2", building: destination2Building);
-            GameObject d2Alternate = allowWrongCandidateSelection ? GetAlternateCandidate(d2ZoneTargets, destination2Building) : null;
+            GameObject d2Alternate = _effective.AllowWrongCandidateSelection ? GetAlternateCandidate(d2ZoneTargets, destination2Building) : null;
             if (d2Alternate != null)
             {
                 SetCandidateInteractable(d2Alternate, true);
@@ -1205,7 +1344,7 @@ public class ExperimentManager : MonoBehaviour
                     string clickedId = sel.id;
                     bool correct = !string.IsNullOrEmpty(d2AssignedId) && clickedId == d2AssignedId;
 
-                    AppendPart3Log("d2_click", groupNumber, def, startPoint, destination1Building, destination2Building,
+                    AppendPart3Log("d2_click", groupIndex, def, startPoint, destination1Building, destination2Building,
                         selectedId: clickedId, found: correct,
                         elapsedSeconds: sel.realtime - d2StartRealtime,
                         notes: correct ? "correct" : "wrong_building", interactionId: sel.interactionId);
@@ -1259,10 +1398,10 @@ public class ExperimentManager : MonoBehaviour
 
         // The structured reason (not the legacy note text) is what DataCaptureManager classifies as a timeout. A skipped D2 never ran,
         // so it carries NoBudgetRemaining, which Part3TerminationReason.IsTimeout rejects.
-        AppendPart3Log(d2Ran ? "d2_result" : "d2_skipped", groupNumber, def, startPoint, destination1Building, destination2Building,
+        AppendPart3Log(d2Ran ? "d2_result" : "d2_skipped", groupIndex, def, startPoint, destination1Building, destination2Building,
             selectedId: d2SelectedId, found: d2Found, elapsedSeconds: d2Elapsed, notes: endReason,
             terminationReason: d2Ran ? p3Timing.D2EndReason : Part3TerminationReason.NoBudgetRemaining);
-        AppendPart3Log("phase_end", groupNumber, def, startPoint, destination1Building, destination2Building,
+        AppendPart3Log("phase_end", groupIndex, def, startPoint, destination1Building, destination2Building,
             selectedId: "", found: (d1Found && d2Found), elapsedSeconds: phaseTotalElapsed, notes: endReason);
 
         EndTrial();
@@ -1481,7 +1620,7 @@ public class ExperimentManager : MonoBehaviour
     /// Every argument is a value already computed by the (unchanged) Part 3 scoring logic - this method
     /// only observes them.
     /// </summary>
-    private void AppendPart3Log(string eventName, int groupNumber, Part3GroupDef def,
+    private void AppendPart3Log(string eventName, int groupIndex, Part3GroupDef def,
         Transform startPoint, GameObject d1Building, GameObject d2Building,
         string selectedId, bool found, double elapsedSeconds, string notes, string terminationReason = "", string interactionId = "")
     {
@@ -1498,7 +1637,8 @@ public class ExperimentManager : MonoBehaviour
             interactionId = interactionId ?? "",
             boolValue = found,
             notes = notes ?? "",
-            groupNumber = groupNumber,
+            groupNumber = groupIndex,   // zero-based: Group Number == Group Index
+            hasGroup = true,
             startZone = def.StartZone.ToString(),
             d1Zone = def.Destination1Zone.ToString(),
             d2Zone = def.Destination2Zone.ToString(),
@@ -1581,7 +1721,8 @@ public struct ExperimentEventInfo
     public bool boolValue;      // correct / found
     public string notes;        // legacy Part 3 "notes" / endReason string
 
-    public int groupNumber;         // Part 3 group (1..12), else 0
+    public int groupNumber;         // Part 3 group, zero-based (0..11; Group Number == Group Index). Meaningful ONLY when hasGroup is true (0 is a real Group 0)
+    public bool hasGroup;           // true for part3_log events (they carry a group); false = not applicable (serialised as -1)
     public string startZone;        // Part 3 start zone label
     public string d1Zone;           // Part 3 destination 1 zone label
     public string d2Zone;           // Part 3 destination 2 zone label

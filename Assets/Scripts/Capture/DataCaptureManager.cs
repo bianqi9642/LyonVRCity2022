@@ -325,6 +325,9 @@ public class DataCaptureManager : MonoBehaviour
 
     // F-18 / F-09 evidence
     SamplingStats _trajStats;
+    SampleScheduler _trajScheduler;
+    readonly FrameTimingStats _frameStats = new FrameTimingStats();   // frame durations while a capture window is open (schema v9)
+    EyeTrackingLifecycle _hookedEyeLifecycle;
     int _appPauseCount, _appResumeCount, _trialsStarted, _trialsEnded, _manifestUpdates;
     bool _manifestDirty; string _manifestDirtyReason = ""; double _lastManifestWriteT = -1e9;
     long _seenWriteErrors;
@@ -400,21 +403,17 @@ public class DataCaptureManager : MonoBehaviour
         if (_experimentManager != null && _sessionController != null) return;
         if (Time.frameCount < _nextConfigLookupFrame) return;          // a missing source is re-searched at most once per second-ish, not per event
         _nextConfigLookupFrame = Time.frameCount + 60;
-        if (_experimentManager == null) _experimentManager = FindObjectOfType<ExperimentManager>();
-        if (_sessionController == null) _sessionController = FindObjectOfType<ExternalSessionController>();
+        if (_experimentManager == null) _experimentManager = FindObjectOfType<ExperimentManager>(true);   // includeInactive: an inactive manager must be found and reported, not silently ignored
+        if (_sessionController == null) _sessionController = FindObjectOfType<ExternalSessionController>(true);
     }
 
     // The configuration of the Part selected in ExternalSessionController, used only until the first Part has set CurrentPartConfig.
     ExperimentManager.PartCaptureConfig SelectedPartConfig()
     {
+        // The FROZEN per-Part config (ExperimentManager.GetEffectivePartConfig freezes the session settings on first use): never the live Inspector object.
+        // Null while the configuration is Invalid / unavailable, so unknown never means "record".
         if (_experimentManager == null || _sessionController == null) return null;
-        switch (_sessionController.selectedPart)
-        {
-            case ExternalSessionController.ExperimentPart.Part1: return _experimentManager.part1Config;
-            case ExternalSessionController.ExperimentPart.Part2: return _experimentManager.part2Config;
-            case ExternalSessionController.ExperimentPart.Part3: return _experimentManager.part3Config;
-            default: return null;
-        }
+        return _experimentManager.GetEffectivePartConfig((int)_sessionController.ActivePart);
     }
 
     void OnValidate()
@@ -459,6 +458,14 @@ public class DataCaptureManager : MonoBehaviour
         if (!idr.IsValid) { BlockRecording("invalid participant/session configuration (" + idr.status + "): " + idr.message); return; }
         ParticipantId = idr.participantId;
 
+        // The experiment settings must be frozen (and the configuration Valid) before anything is recorded; an inactive manager is reported explicitly.
+        if (_experimentManager != null)
+        {
+            if (!_experimentManager.isActiveAndEnabled)
+                Debug.LogError("[DataCapture] The ExperimentManager is inactive or disabled: no Part can run in this session (recording continues; the manifest reports effective_settings_status).");
+            if (!_experimentManager.EnsureSessionOverridesApplied()) { BlockRecording("the effective experiment settings could not be frozen (see the ExperimentManager / ExternalSessionController log)"); return; }
+        }
+
         // ---- unique session: the run GUID, not the participant ID, makes the folder name; an existing directory is never reused ----
         string root = string.IsNullOrEmpty(outputRootOverride) ? Application.persistentDataPath : outputRootOverride;
         string folder = null;
@@ -489,7 +496,7 @@ public class DataCaptureManager : MonoBehaviour
         _npcProfiles = MakeWriter("npc_profiles.csv",     CaptureConstants.NpcProfilesHeader);
         _registry  = MakeWriter("building_registry.csv", CaptureConstants.BuildingRegistryHeader);
 
-        CurrentPart = (_sessionController != null) ? _sessionController.selectedPart.ToString() : "Unknown";
+        CurrentPart = (_sessionController != null) ? _sessionController.ActivePart.ToString() : "Unknown";
         CurrentPhase = "idle";
         _d1TimeoutLogged = false;
         _d2TimeoutLogged = false;
@@ -516,6 +523,7 @@ public class DataCaptureManager : MonoBehaviour
         _trajStats = new SamplingStats(trajectoryHz);
         BuildManifestPass1();
         WriteManifest();
+        WriteUsedConfig();
         WriteEventRow(CaptureConstants.EvtSessionStart, CurrentPart, CurrentPhase, "", "", "", "", "", null, "", Vector3.zero, Vector3.zero);
 
         // The session now exists: attach as the NPC lifecycle sink. Everything raised earlier (e.g. prewarm_created, if SpawnerManager started
@@ -533,6 +541,7 @@ public class DataCaptureManager : MonoBehaviour
 
     void OnDestroy()
     {
+        if (_hookedEyeLifecycle != null) { _hookedEyeLifecycle.Transitioned -= OnEyeTrackingTransition; _hookedEyeLifecycle = null; }
         if (RecordingBlocked) { NpcLifecycleBus.ClearGate(_npcGate); return; }
         if (_experimentManager != null)
         {
@@ -732,7 +741,7 @@ public class DataCaptureManager : MonoBehaviour
 
                 string bid = Name(e.d1Building) + "|" + Name(e.d2Building);
                 string tid = S(e.d1TargetId) + "|" + S(e.d2TargetId);
-                string vs  = $"group={e.groupNumber};start_zone={e.startZone};d1_zone={e.d1Zone};d2_zone={e.d2Zone};start_point={S(e.startPointName)}";
+                string vs  = $"group={(e.hasGroup ? e.groupNumber : -1)};start_zone={e.startZone};d1_zone={e.d1Zone};d2_zone={e.d2Zone};start_point={S(e.startPointName)}";
                 WriteEventRow(CaptureConstants.EvtTargetAssigned, CaptureConstants.Part3, CurrentPhase, "", bid, tid, "", "", null, vs, Vector3.zero, Vector3.zero);
                 UpdateManifestAssigned(e);
                 return;
@@ -1044,10 +1053,12 @@ public class DataCaptureManager : MonoBehaviour
             // additional OnTrialStart/OnTrialEnd (see ExperimentManager.RunPart3: exactly one pair per Part),
             // so this does not fragment trajectory capture within Part 3 - it only trims the pre-trial and
             // post-trial/End-Panel edges.
-            if (!TrajectoryCaptureActive) { _trajStats?.BreakEpoch(); yield return new WaitForSecondsRealtime(interval); continue; }   // intentional gap: trial closed / capture off
+            if (_trajScheduler == null) _trajScheduler = new SampleScheduler(interval); else _trajScheduler.SetInterval(interval);
+            if (!TrajectoryCaptureActive) { _trajStats?.BreakEpoch(); _trajScheduler.Reset(); yield return new WaitForSecondsRealtime(interval); continue; }   // intentional gap: trial closed / capture off
             try { SampleTrajectory(); }
             catch (Exception e) { WarnOnce("traj_tick", "trajectory sample failed: " + e.Message); }
-            yield return new WaitForSecondsRealtime(interval);
+            // Absolute deadline grid (see SampleScheduler): no per-sample frame overshoot accumulating into a lower-than-nominal rate.
+            yield return new WaitForSecondsRealtime((float)_trajScheduler.WaitAfterSample(CaptureClock.TAbs));
         }
     }
 
@@ -1087,7 +1098,7 @@ public class DataCaptureManager : MonoBehaviour
 
         long before = _traj.RowsWritten;
         _traj.WriteLine(_traj.Join(_rf));
-        if (_traj.RowsWritten > before) _trajStats?.OnSample(tNow);   // only SUCCESSFUL rows count, at the row's own t_abs
+        if (_traj.RowsWritten > before) _trajStats?.OnSampleWithFrame(tNow, Time.unscaledDeltaTime);   // only SUCCESSFUL rows count, at the row's own t_abs
     }
 
     void AppendControllerFields(Transform ct, int trackedFlag)
@@ -1335,10 +1346,30 @@ public class DataCaptureManager : MonoBehaviour
     void LateUpdate()
     {
         FlushNpcEvents();
+        if (_trialActive && !_endPanelActive && Time.unscaledDeltaTime < 2.0f) _frameStats.OnFrame(Time.unscaledDeltaTime);
+        EnsureEyeLifecycleHooked();
         // A write error on any stream (including gaze, which owns its own writer) triggers a manifest checkpoint, so a failure is visible without waiting for the end.
         long errs = TotalWriteErrors();
         if (errs != _seenWriteErrors) { _seenWriteErrors = errs; RequestManifestUpdate("write_error", immediate: false); }
         if (_manifestDirty && CaptureClock.TAbs - _lastManifestWriteT >= 0.5) { string r = _manifestDirtyReason; WriteManifestCheckpoint(r); }
+    }
+
+    // The eye-tracking lifecycle lives on a controller GazeRecorder creates in its Awake (possibly after this manager started), so it is hooked lazily. Every state change
+    // marks the manifest stale (written by the next LateUpdate, at most every 0.5 s); the transition itself carries the permission / capability / tracking state at that moment.
+    void EnsureEyeLifecycleHooked()
+    {
+        if (_gazeRecorder == null) return;
+        EyeTrackingLifecycle lc = _gazeRecorder.Lifecycle;
+        if (lc == _hookedEyeLifecycle) return;
+        if (_hookedEyeLifecycle != null) _hookedEyeLifecycle.Transitioned -= OnEyeTrackingTransition;
+        _hookedEyeLifecycle = lc;
+        if (lc != null) lc.Transitioned += OnEyeTrackingTransition;
+    }
+
+    void OnEyeTrackingTransition(EyeTrackingTransition t)
+    {
+        if (t.event_name == "application_paused" || t.event_name == "application_resumed") return;   // DataCaptureManager already checkpoints pause / resume itself
+        RequestManifestUpdate("eye_tracking_" + t.event_name, immediate: false);
     }
 
     long TotalWriteErrors()
@@ -1602,19 +1633,36 @@ public class DataCaptureManager : MonoBehaviour
     public class PartConfigSnapshot
     {
         public bool npc_enabled;
+        public bool npc_directed_movement;
         public bool npc_capture_enabled;
         public bool gaze_capture_enabled;
         public bool trajectory_capture_enabled;
 
         public PartConfigSnapshot() { }
-        public PartConfigSnapshot(ExperimentManager.PartCaptureConfig cfg)
+        public PartConfigSnapshot(EffectiveSettings eff, int partNumber)
         {
-            if (cfg == null) return;
-            npc_enabled = cfg.npcEnabled;
-            npc_capture_enabled = cfg.npcCaptureEnabled;
-            gaze_capture_enabled = cfg.gazeCaptureEnabled;
-            trajectory_capture_enabled = cfg.trajectoryCaptureEnabled;
+            if (eff == null) return;
+            PartFlagValues f = eff.GetPartFlags(partNumber);
+            npc_enabled = f.NpcEnabled;
+            npc_directed_movement = f.NpcDirectedMovement;
+            npc_capture_enabled = f.NpcCaptureEnabled;
+            gaze_capture_enabled = f.GazeCaptureEnabled;
+            trajectory_capture_enabled = f.TrajectoryCaptureEnabled;
         }
+    }
+
+    [Serializable]
+    public class SettingEntryRecord { public string key, value, source; }
+
+    /// <summary>session_config.used.json: the resolved configuration this session actually used (never a re-read of the external file).</summary>
+    [Serializable]
+    class UsedConfigRecord
+    {
+        public int manifest_schema_version;
+        public string session_id, participant_id, config_source, config_hash, config_file_name, selected_part, config_overrides;
+        public int config_schema_version, part2_group_index, part3_group_index, active_group_index;
+        public bool auto_start;
+        public SettingEntryRecord[] setting_entries;
     }
 
     /// <summary>
@@ -1651,6 +1699,11 @@ public class DataCaptureManager : MonoBehaviour
         public double nominal_hz, observed_hz = -1, mean_interval_s = -1, median_interval_s = -1, p95_interval_s = -1, max_interval_s = -1, gap_threshold_s;
         public long samples, intervals, epochs, intentional_breaks, unexpected_gaps, non_monotonic;
         public double first_t_abs = -1, last_t_abs = -1;
+        // schema v9: WHY the achieved rate differs from nominal. gaps_frame_limited = unexpected gaps mostly explained by one long frame. limit_diagnosis (see RateDiagnosis):
+        // insufficient_samples | nominal_achieved | frame_rate_limited | scheduling_or_io_limited. frame_mean_hz = measured update rate while capture windows were open.
+        public long gaps_frame_limited, scheduler_ticks, scheduler_skipped_ticks;
+        public double scheduler_max_lateness_s = -1, frame_mean_hz = -1;
+        public string limit_diagnosis = "insufficient_samples";
     }
 
     [Serializable]
@@ -1659,7 +1712,8 @@ public class DataCaptureManager : MonoBehaviour
         public string session_id, participant_id, started_utc, ended_utc = "", t_abs_at_start, t_abs_at_end = "", end_reason = "";
         public string selected_part;
         public int part2_group_index, part3_group_index;
-        public int part3_group_number;
+        // Zero-based: equals part3_group_index in a Part 3 session; -1 = not applicable (Part 1 / Part 2). Explicitly -1, not the default 0 (which is a real Group 0).
+        public int part3_group_number = -1;
         public string part3_start_zone = "", part3_start_point_name = "", part3_d1_zone = "", part3_d2_zone = "";
         public string part3_d1_assigned_building_id = "pending", part3_d2_assigned_building_id = "pending";
         public string part3_d1_assigned_target_id   = "pending", part3_d2_assigned_target_id   = "pending";
@@ -1713,6 +1767,13 @@ public class DataCaptureManager : MonoBehaviour
         // "true" / "false" / "unknown" (unknown = not queryable on this platform, or the SDK threw). The legacy bool fields above cannot express unknown.
         public string eye_tracking_supported_state = "unknown", eye_tracking_enabled_state = "unknown", eye_tracking_permission_state = "unknown";
         public double eye_tracking_queried_t_abs = -1;
+        // ---- schema v9: acquisition vs writer health (kept separate on purpose) ----
+        // gaze_writer_status  = did gaze.csv get written (same value as health_gaze.status).
+        // gaze_acquisition_status = did the eye tracker deliver eyes (unknown | not_applicable | not_enabled | unsupported | permission_required | permission_denied | initializing |
+        //                           initialization_failed | running | tracking_unavailable | stopped). "writer ok" says NOTHING about the second one.
+        public string gaze_writer_status = "unknown", gaze_acquisition_status = "unknown", gaze_acquisition_reason = "";
+        public EyeTrackingManifest eye_tracking = new EyeTrackingManifest();
+        public FrameTimingSummary frame_timing = new FrameTimingSummary();
         public int trials_started, trials_ended, app_pause_count, app_resume_count, manifest_updates;
         public string last_manifest_update_reason = "";
         public double last_manifest_update_t_abs = -1;
@@ -1725,6 +1786,21 @@ public class DataCaptureManager : MonoBehaviour
         public int manifest_revision, manifest_write_failures;
         public string manifest_last_install_mode = "", manifest_last_error = "";
         public string participant_id_status = "Valid", config_source = "", config_hash = "", config_file_name = "";
+        // configuration provenance (additive): schema of the external file (0 = none / invalid; the Inspector source is schema 1), whether the file declared it,
+        // the optional overrides that were applied ("key=value;..."), the group index ACTIVE for the selected Part (-1 for Part 1) and the effective durations.
+        public int config_schema_version;
+        // Valid | Invalid (a recorded session is always Valid) - the state of the single configuration resolution.
+        public string config_state = "";
+        // frozen | unavailable_no_experiment_manager | unavailable_configuration_not_valid. 'frozen': setting_entries lists every effective value with its source.
+        public string effective_settings_status = "";
+        public bool allow_wrong_candidate_selection, restrict_river_teleport_to_part3, auto_start;
+        public string agent_profile_name = "", agent_profile_hash = "";
+        // key / value / source (EXTERNAL_JSON | SCENE_INHERITED | INSPECTOR | DOCUMENTED_DEFAULT) for each effective setting.
+        public SettingEntryRecord[] setting_entries = new SettingEntryRecord[0];
+        public bool config_schema_declared;
+        public string config_overrides = "";
+        public int active_group_index = -1, part2_group_count, part3_group_count;
+        public float part1_duration_seconds, part2_first_duration_seconds, part2_second_duration_seconds, part3_destination1_max_seconds, part3_total_max_seconds;
         public long npc_los_clear, npc_los_blocked, npc_los_unavailable;
         public long npc_los_missing_participant_target, npc_los_missing_npc_origin, npc_los_invalid_geometry, npc_los_hit_buffer_overflow, npc_los_query_error;
         public int events_csv_npc_rows_rejected;
@@ -1746,8 +1822,33 @@ public class DataCaptureManager : MonoBehaviour
         public bool npc_state_budget_unachievable_seen;
     }
 
+    // session_config.used.json: the resolved configuration actually used by this session (identity/selection values + every effective setting with its source),
+    // written once into the session folder next to the manifest. It is NOT a copy of, and never touches, the external session_config.json.
+    void WriteUsedConfig()
+    {
+        if (_manifest == null || string.IsNullOrEmpty(SessionFolder)) return;
+        try
+        {
+            var u = new UsedConfigRecord
+            {
+                manifest_schema_version = _manifest.schema_version, session_id = _manifest.session_id, participant_id = _manifest.participant_id,
+                config_source = _manifest.config_source, config_hash = _manifest.config_hash, config_file_name = _manifest.config_file_name,
+                config_schema_version = _manifest.config_schema_version, selected_part = _manifest.selected_part, config_overrides = _manifest.config_overrides,
+                part2_group_index = _manifest.part2_group_index, part3_group_index = _manifest.part3_group_index, active_group_index = _manifest.active_group_index,
+                auto_start = _manifest.auto_start, setting_entries = _manifest.setting_entries,
+            };
+            string path = Path.Combine(SessionFolder, "session_config.used.json");
+            if (File.Exists(path)) return;   // write-once: the session folder is brand new, an existing file is never replaced
+            File.WriteAllText(path, JsonUtility.ToJson(u, true), new System.Text.UTF8Encoding(false));
+        }
+        catch (Exception e) { Debug.LogWarning("[DataCapture] session_config.used.json could not be written: " + e.Message); }
+    }
+
     void BuildManifestPass1()
     {
+        // The frozen effective settings (null without an ExperimentManager, or when the configuration is unavailable). Every effective value below comes from here,
+        // never from live Inspector fields.
+        EffectiveSettings _effective = _experimentManager != null ? _experimentManager.Effective : null;
         _manifest = new Manifest
         {
             session_id      = SessionId,
@@ -1763,11 +1864,23 @@ public class DataCaptureManager : MonoBehaviour
             config_source   = _sessionController != null ? _sessionController.ConfigSource : "",
             config_hash     = _sessionController != null ? _sessionController.ConfigHash : "",
             config_file_name = (_sessionController != null && _sessionController.useExternalJson) ? _sessionController.externalFileName : "",
+            config_schema_version = (_sessionController != null && _sessionController.Resolved.IsValid) ? _sessionController.Resolved.SchemaVersion : 0,
+            config_schema_declared = _sessionController != null && _sessionController.Resolved.SchemaVersionDeclared,
+            config_overrides = _sessionController != null ? string.Join(";", _sessionController.Resolved.Overrides.Applied) : "",
+            config_state = _sessionController != null ? _sessionController.State.ToString() : "Pending",
+            active_group_index = _sessionController != null ? _sessionController.Resolved.ActiveGroupIndex : -1,
+            part2_group_count = _experimentManager != null && _experimentManager.part2Groups != null ? _experimentManager.part2Groups.Length : 0,
+            part3_group_count = ExperimentManager.Part3GroupCount,
+            part1_duration_seconds = _effective != null ? _effective.Part1Duration : 0f,
+            part2_first_duration_seconds = _effective != null ? _effective.Part2FirstDuration : 0f,
+            part2_second_duration_seconds = _effective != null ? _effective.Part2SecondDuration : 0f,
+            part3_destination1_max_seconds = _effective != null ? _effective.Part3Destination1MaxSeconds : 0f,
+            part3_total_max_seconds = _effective != null ? _effective.Part3TotalMaxSeconds : 0f,
             started_utc     = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture),
             t_abs_at_start  = F(CaptureClock.TAbs),
-            selected_part   = _sessionController != null ? _sessionController.selectedPart.ToString() : "Unknown",
-            part2_group_index = _sessionController != null ? _sessionController.part2GroupIndex : 0,
-            part3_group_index = _sessionController != null ? _sessionController.part3GroupIndex : 0,
+            selected_part   = _sessionController != null ? _sessionController.ActivePart.ToString() : "Unknown",
+            part2_group_index = _sessionController != null ? _sessionController.ActivePart2GroupIndex : 0,
+            part3_group_index = _sessionController != null ? _sessionController.ActivePart3GroupIndex : 0,
 
             unity_version = Application.unityVersion,
             app_version   = Application.version,
@@ -1801,21 +1914,44 @@ public class DataCaptureManager : MonoBehaviour
             npc_state_max_interval_seconds = _rate.MaxInterval,
             npc_state_data_budget_mb_per_minute = (float)_rate.BudgetMBPerMinute,
 
-            npc_capture = (_sessionController != null && _sessionController.selectedPart == ExternalSessionController.ExperimentPart.Part3),
+            npc_capture = (_sessionController != null && _sessionController.ActivePart == ExternalSessionController.ExperimentPart.Part3),
 
             // NEW (NPC warm-up, OPTIONAL): record the configured warm-up duration for reproducibility.
-            npc_warmup_duration_seconds = _experimentManager != null ? _experimentManager.npcWarmupDuration : 0f,
+            npc_warmup_duration_seconds = _effective != null ? _effective.NpcWarmupDuration : 0f,
 
             // NEW (per-Part config, OPTIONAL): snapshot all three Parts' configuration up front - these are
             // static Inspector values, readable regardless of which Part this session will actually run.
-            part1_config = new PartConfigSnapshot(_experimentManager?.part1Config),
-            part2_config = new PartConfigSnapshot(_experimentManager?.part2Config),
-            part3_config = new PartConfigSnapshot(_experimentManager?.part3Config),
+            part1_config = new PartConfigSnapshot(_effective, 1),
+            part2_config = new PartConfigSnapshot(_effective, 2),
+            part3_config = new PartConfigSnapshot(_effective, 3),
         };
 
-        _manifest.part3_group_number = Mathf.Clamp(_manifest.part3_group_index + 1, 1, 12);
+        // Zero-based convention: Group Number == Group Index (Part 3: 0..11). Only a Part 3 session has an active Part 3 group; Part 1/2 report -1 (not applicable).
+        _manifest.part3_group_number = (_sessionController != null && _sessionController.ActivePart == ExternalSessionController.ExperimentPart.Part3) ? _manifest.part3_group_index : -1;
 
-        if (_spawner != null)
+        _manifest.effective_settings_status = _effective != null ? "frozen"
+            : _experimentManager == null ? "unavailable_no_experiment_manager"
+            : "unavailable_configuration_not_valid";
+        if (_effective != null)
+        {
+            _manifest.allow_wrong_candidate_selection = _effective.AllowWrongCandidateSelection;
+            _manifest.restrict_river_teleport_to_part3 = _effective.RestrictRiverTeleportToPart3;
+            _manifest.auto_start = _sessionController != null && _sessionController.Resolved.AutoStart;
+            _manifest.agent_profile_name = _effective.AgentProfileName;
+            _manifest.agent_profile_hash = _effective.AgentProfileHash;
+            var entries = new SettingEntryRecord[_effective.Entries.Count];
+            for (int i = 0; i < entries.Length; i++) entries[i] = new SettingEntryRecord { key = _effective.Entries[i].Key, value = _effective.Entries[i].Value, source = _effective.Entries[i].Source };
+            _manifest.setting_entries = entries;
+        }
+
+        if (_effective != null)
+        {
+            _manifest.max_agents      = _effective.SpawnerMaxAgents;
+            _manifest.spawn_interval  = _effective.SpawnerSpawnInterval;
+            _manifest.dwell_time_min  = _effective.SpawnerDwellTimeMin;
+            _manifest.dwell_time_max  = _effective.SpawnerDwellTimeMax;
+        }
+        else if (_spawner != null)
         {
             _manifest.max_agents      = _spawner.maxAgents;
             _manifest.spawn_interval  = _spawner.spawnInterval;
@@ -1827,7 +1963,7 @@ public class DataCaptureManager : MonoBehaviour
     void UpdateManifestAssigned(ExperimentEventInfo e)
     {
         if (_manifest == null) return;
-        _manifest.part3_group_number = e.groupNumber;
+        if (e.hasGroup) _manifest.part3_group_number = e.groupNumber;   // zero-based, == part3_group_index
         _manifest.part3_start_zone   = e.startZone ?? "";
         _manifest.part3_start_point_name = e.startPointName ?? "";
         _manifest.part3_d1_zone = e.d1Zone ?? "";
@@ -1960,11 +2096,13 @@ public class DataCaptureManager : MonoBehaviour
             _manifest.gaze_rows_left_valid = g.RowsLeftValid; _manifest.gaze_rows_right_valid = g.RowsRightValid;
             _manifest.gaze_recording_starts = g.RecordingStarts; _manifest.gaze_pause_count = g.PauseCount; _manifest.gaze_resume_count = g.ResumeCount;
             _manifest.gaze_valid_eye_fraction = g.RowsWritten > 0 ? (float)g.RowsValidEye / g.RowsWritten : -1f;
-            FillRate(_manifest.rate_gaze, g.Sampling);
+            FillRate(_manifest.rate_gaze, g.Sampling, _frameStats, g.Scheduler);
             _manifest.gaze_valid_eye_rate_hz = _manifest.rate_gaze.available && _manifest.gaze_valid_eye_fraction >= 0 ? (float)(_manifest.rate_gaze.observed_hz * _manifest.gaze_valid_eye_fraction) : -1f;
         }
         gh.status = StatusOf(gh, false);
-        FillRate(_manifest.rate_trajectory, _trajStats);
+        FillRate(_manifest.rate_trajectory, _trajStats, _frameStats, _trajScheduler);
+        FillFrameTiming(_manifest.frame_timing);
+        FillEyeTracking(gh);
 
         _manifest.trials_started = _trialsStarted; _manifest.trials_ended = _trialsEnded;
         _manifest.app_pause_count = _appPauseCount; _manifest.app_resume_count = _appResumeCount;
@@ -2016,9 +2154,52 @@ public class DataCaptureManager : MonoBehaviour
         return h.rows_written > 0 ? "ok" : "configured_no_rows";
     }
 
-    static void FillRate(RateSummary r, SamplingStats st)
+    // Acquisition block + the explicit writer-vs-acquisition split. Reads only; the lifecycle itself is driven by EyeTrackingLifecycleController.
+    void FillEyeTracking(StreamHealth gazeHealth)
+    {
+        EyeTrackingLifecycle lc = _gazeRecorder != null ? _gazeRecorder.Lifecycle : null;
+        EyeTrackingManifest et = _manifest.eye_tracking;
+        et.FillLifecycle(lc, CaptureClock.TAbs, _gazeRecorder != null && _gazeRecorder.lifecycleController != null ? _gazeRecorder.lifecycleController.HostConflict : "");
+        if (_gazeRecorder != null)
+        {
+            GazeRecorder g = _gazeRecorder;
+            et.rows_valid_combined = g.RowsValidEye; et.rows_fallback = g.RowsFallback; et.rows_fallback_not_acquiring = g.RowsFallbackNotAcquiring;
+            et.rows_stale_confidence_rejected = g.RowsStaleConfidenceRejected; et.rows_host_conflict_blocked = g.RowsHostConflictBlocked;
+            et.rows_left_valid = g.RowsLeftValid; et.rows_right_valid = g.RowsRightValid;
+            et.first_valid_row_t_abs = double.IsNaN(g.FirstValidRowT) ? -1 : g.FirstValidRowT;
+            et.last_valid_row_t_abs = double.IsNaN(g.LastValidRowT) ? -1 : g.LastValidRowT;
+            et.longest_no_valid_eye_s = g.LongestNoValidEyeSeconds;
+        }
+        _manifest.gaze_writer_status = gazeHealth.status;
+        if (_gazeRecorder == null) { _manifest.gaze_acquisition_status = "unknown"; _manifest.gaze_acquisition_reason = "no_gaze_recorder"; }
+        else
+        {
+            _manifest.gaze_acquisition_status = et.acquisition_status;
+            _manifest.gaze_acquisition_reason = et.acquisition_reason;
+            // A host conflict means the recorded eye pose cannot be trusted whatever the tracker state is.
+            if (et.gaze_host_conflict.Length > 0 && _gazeRecorder.blockEyeSamplesOnHostConflict) _manifest.gaze_acquisition_reason = "gaze_host_conflict:" + et.gaze_host_conflict + " (" + et.acquisition_reason + ")";
+        }
+    }
+
+    void FillFrameTiming(FrameTimingSummary f)
+    {
+        f.target_frame_rate = Application.targetFrameRate; f.vsync_count = QualitySettings.vSyncCount;
+        f.capture_delta_time = Time.captureDeltaTime; f.time_scale = Time.timeScale;
+        f.frames = _frameStats.Frames; f.available = _frameStats.Available;
+        f.mean_hz = _frameStats.Available ? _frameStats.MeanHz : -1;
+        f.median_frame_ms = _frameStats.Available ? _frameStats.MedianDt * 1000.0 : -1;
+        f.p95_frame_ms = _frameStats.Available ? _frameStats.P95Dt * 1000.0 : -1;
+        f.max_frame_ms = _frameStats.Frames > 0 ? _frameStats.MaxDt * 1000.0 : -1;
+        f.frames_over_100ms = _frameStats.Over100ms;
+    }
+
+    static void FillRate(RateSummary r, SamplingStats st, FrameTimingStats fs = null, SampleScheduler sch = null)
     {
         if (st == null) return;
+        r.gaps_frame_limited = st.GapsFrameLimited;
+        if (sch != null) { r.scheduler_ticks = sch.Ticks; r.scheduler_skipped_ticks = sch.SkippedTicks; r.scheduler_max_lateness_s = sch.MaxLateness; }
+        r.frame_mean_hz = fs != null && fs.Available ? fs.MeanHz : -1;
+        r.limit_diagnosis = RateDiagnosis.Classify(st.NominalHz, st.EstimateAvailable ? st.ObservedHz : double.NaN, fs != null && fs.Available ? fs.MeanHz : double.NaN);
         r.nominal_hz = st.NominalHz; r.gap_threshold_s = st.GapThreshold;
         r.samples = st.Samples; r.intervals = st.Intervals; r.epochs = st.Epochs; r.intentional_breaks = st.IntentionalBreaks;
         r.unexpected_gaps = st.UnexpectedGaps; r.non_monotonic = st.NonMonotonic;

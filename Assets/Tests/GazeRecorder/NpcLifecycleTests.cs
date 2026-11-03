@@ -80,6 +80,7 @@ public partial class NpcLifecycleTests
     sealed class RigOptions
     {
         public int prewarm = 4, maxAgents = 4;
+        public Action<object> emSetup;              // runs on the ExperimentManager right after it is created, BEFORE any Start: the effective settings are frozen on first use (from Start on), so Scene values the test needs (durations, wrong-candidate protocol) are set here
         public bool part2 = false;                  // wandering itinerary instead of attractor itinerary
         public bool npcCaptureEnabled = true;       // PartCaptureConfig.npcCaptureEnabled
         public bool selectedPartFallback = false;   // CurrentPartConfig stays null until after the first frame; DCM must resolve the SELECTED Part's config
@@ -182,6 +183,7 @@ public partial class NpcLifecycleTests
 
         var emGo = Make("TestExperimentManager");
         rig.em = emGo.AddComponent(EmType);
+        o.emSetup?.Invoke(rig.em);
         object cfg = Activator.CreateInstance(CfgType);
         Set(cfg, "npcEnabled", true);
         Set(cfg, "npcDirectedMovement", !o.part2);
@@ -766,7 +768,7 @@ public partial class NpcLifecycleTests
         Call(rig.em, "TerminateSession", "Part3");
         yield return null;
         string manifest = File.ReadAllText(rig.File("session_manifest.json"));
-        StringAssert.Contains("\"schema_version\": 7", manifest);
+        StringAssert.Contains("\"schema_version\": " + 9, manifest);
         StringAssert.Contains("agent-lifetime-v1", manifest);
         StringAssert.Contains("(session_id, npc_spawn_instance_id)", manifest);
         StringAssert.Contains("master_switch", manifest);

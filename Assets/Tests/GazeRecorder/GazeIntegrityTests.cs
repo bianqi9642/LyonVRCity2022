@@ -82,7 +82,7 @@ public partial class NpcLifecycleTests
 
         var csv = Csv.Load(path);
         AssertWidths(csv, "gaze.csv");
-        Assert.AreEqual(66, csv.Header.Count);
+        Assert.AreEqual(69, csv.Header.Count);
         string[] lv = { "left_origin_x", "left_origin_y", "left_origin_z", "left_dir_x", "left_dir_y", "left_dir_z" };
         string[] rv = { "right_origin_x", "right_origin_y", "right_origin_z", "right_dir_x", "right_dir_y", "right_dir_z" };
         string[] cv = { "combined_origin_x", "combined_origin_y", "combined_origin_z", "combined_dir_x", "combined_dir_y", "combined_dir_z" };
@@ -318,7 +318,8 @@ public partial class NpcLifecycleTests
     {
         var camGo = new GameObject("Cam"); camGo.tag = "MainCamera"; camGo.AddComponent<Camera>(); _spawned.Add(camGo);
         Rig rig = null;
-        yield return BuildRig(new RigOptions { part2 = true, selectedPartFallback = true, realPart = true, prewarm = 1, maxAgents = 1, npcSpeed = 0.3f, npcCaptureEnabled = false }, r => rig = r);
+        yield return BuildRig(new RigOptions { part2 = true, selectedPartFallback = true, realPart = true, prewarm = 1, maxAgents = 1, npcSpeed = 0.3f, npcCaptureEnabled = false,
+            emSetup = em => { Set(em, "part2FirstDuration", 0.6f); Set(em, "part2SecondDuration", 0.6f); Set(em, "npcWarmupDuration", 0f); } }, r => rig = r);
 
         // UIManager with real PanelController templates: the confirm button is "pressed" by the test
         var uiGo = Make("UI"); var ui = uiGo.AddComponent(T("UIManager"));
@@ -328,7 +329,6 @@ public partial class NpcLifecycleTests
         var group = Activator.CreateInstance(groupType); Set(group, "startPositions", new[] { p0 }); Set(group, "teleportPositions", new[] { p1 });
         var groups = Array.CreateInstance(groupType, 1); groups.SetValue(group, 0);
         Set(rig.em, "uiManager", ui); Set(rig.em, "playerRig", rigT); Set(rig.em, "spawner", rig.spawner); Set(rig.em, "part2Groups", groups);
-        Set(rig.em, "part2FirstDuration", 0.6f); Set(rig.em, "part2SecondDuration", 0.6f); Set(rig.em, "npcWarmupDuration", 0f);
         var head = Make("Head").transform; head.position = new Vector3(0f, 1f, -5f);
         var wall = GameObject.CreatePrimitive(PrimitiveType.Cube); _spawned.Add(wall); wall.transform.position = new Vector3(0f, 1f, 0f); wall.transform.localScale = new Vector3(40f, 40f, 0.2f);
         var rec = MakeGaze(rig, head, 30f);

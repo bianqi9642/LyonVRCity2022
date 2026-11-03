@@ -218,7 +218,7 @@ public class GazeRecorderTests
         {
             Assert.GreaterOrEqual(rows.Count, 3, "expected a header plus several rows");
             int width = rows[0].Count;
-            Assert.AreEqual(66, width, "header width: 55 columns at HEAD + 11 appended in schema v5 (existing columns must never move)");
+            Assert.AreEqual(69, width, "header width: 55 columns at HEAD + 11 appended in schema v5 + 3 appended in schema v9 (existing columns must never move)");
             Assert.AreEqual("hit_is_interactable", rows[0][54], "the first 55 columns are unchanged");
             Assert.AreEqual("part", rows[0][55]);
             for (int i = 1; i < rows.Count; i++)
@@ -281,6 +281,9 @@ public class GazeRecorderTests
 
     IEnumerator MakeRig(Action<Rig> done)
     {
+        // Like a production scene: a session controller with a REAL participant id exists (the experiment manager refuses to run without a resolvable configuration).
+        var scGo = new GameObject("GazeTestSessionController"); scGo.SetActive(false); _spawned.Add(scGo);
+        var sc = scGo.AddComponent(Reflect.T("ExternalSessionController")); Set(sc, "participantId", "ZZ-0001"); scGo.SetActive(true);
         var emGo = new GameObject("GazeTestExperimentManager");
         _spawned.Add(emGo);
         var em = emGo.AddComponent(ExperimentType);

@@ -134,14 +134,14 @@ public partial class NpcLifecycleTests
         InstallJumpClock();
         try
         {
-            yield return BuildRig(new RigOptions { part2 = true, selectedPartFallback = true, realPart = true, prewarm = 1, maxAgents = 1, npcSpeed = 0.3f, npcCaptureEnabled = false }, r => rig = r);
+            yield return BuildRig(new RigOptions { part2 = true, selectedPartFallback = true, realPart = true, prewarm = 1, maxAgents = 1, npcSpeed = 0.3f, npcCaptureEnabled = false,
+                emSetup = em => { Set(em, "part2FirstDuration", 5f); Set(em, "part2SecondDuration", 4f); Set(em, "npcWarmupDuration", 0f); } }, r => rig = r);
             var ui = MakeUi("part2StartPanelTemplate", "part2ContinuePanelTemplate", "part2EndPanelTemplate");
             var rigT = Make("PlayerRig").transform; var p0 = Make("Start0").transform; var p1 = Make("Tele0").transform;
             var groupType = Type.GetType("ExperimentManager+Part2Group, Assembly-CSharp");
             var group = Activator.CreateInstance(groupType); Set(group, "startPositions", new[] { p0 }); Set(group, "teleportPositions", new[] { p1 });
             var groups = Array.CreateInstance(groupType, 1); groups.SetValue(group, 0);
             Set(rig.em, "uiManager", ui); Set(rig.em, "playerRig", rigT); Set(rig.em, "spawner", rig.spawner); Set(rig.em, "part2Groups", groups);
-            Set(rig.em, "part2FirstDuration", 5f); Set(rig.em, "part2SecondDuration", 4f); Set(rig.em, "npcWarmupDuration", 0f);
             yield return null;
 
             Call(rig.em, "StartPart2");
@@ -192,14 +192,14 @@ public partial class NpcLifecycleTests
         try
         {
             var camGo2 = new GameObject("Cam2"); camGo2.tag = "MainCamera"; camGo2.AddComponent<Camera>(); _spawned.Add(camGo2);
-            yield return BuildRig(new RigOptions { part2 = true, selectedPartFallback = true, realPart = true, prewarm = 1, maxAgents = 1, npcSpeed = 0.3f, npcCaptureEnabled = false }, r => rig2 = r);
+            yield return BuildRig(new RigOptions { part2 = true, selectedPartFallback = true, realPart = true, prewarm = 1, maxAgents = 1, npcSpeed = 0.3f, npcCaptureEnabled = false,
+                emSetup = em => { Set(em, "part2FirstDuration", 0.6f); Set(em, "part2SecondDuration", 0.6f); Set(em, "npcWarmupDuration", 0f); } }, r => rig2 = r);
             var ui2 = MakeUi("part2StartPanelTemplate", "part2ContinuePanelTemplate", "part2EndPanelTemplate");
             var rigT2 = Make("PlayerRig").transform; var a0 = Make("S").transform; var a1 = Make("T").transform;
             var groupType2 = Type.GetType("ExperimentManager+Part2Group, Assembly-CSharp");
             var g2 = Activator.CreateInstance(groupType2); Set(g2, "startPositions", new[] { a0 }); Set(g2, "teleportPositions", new[] { a1 });
             var groups2 = Array.CreateInstance(groupType2, 1); groups2.SetValue(g2, 0);
             Set(rig2.em, "uiManager", ui2); Set(rig2.em, "playerRig", rigT2); Set(rig2.em, "spawner", rig2.spawner); Set(rig2.em, "part2Groups", groups2);
-            Set(rig2.em, "part2FirstDuration", 0.6f); Set(rig2.em, "part2SecondDuration", 0.6f); Set(rig2.em, "npcWarmupDuration", 0f);
             yield return null;
             Call(rig2.em, "StartPart2");
             yield return PressPanel(ui2, "Start panel");
@@ -223,10 +223,10 @@ public partial class NpcLifecycleTests
         InstallJumpClock();
         try
         {
-            yield return BuildRig(new RigOptions { realPart = true, prewarm = 1, maxAgents = 1, npcSpeed = 0.3f, npcCaptureEnabled = false }, r => rig = r);
+            yield return BuildRig(new RigOptions { realPart = true, prewarm = 1, maxAgents = 1, npcSpeed = 0.3f, npcCaptureEnabled = false,
+                emSetup = em => { Set(em, "part1Duration", 5f); Set(em, "npcWarmupDuration", 0f); } }, r => rig = r);
             var ui = MakeUi("part1StartPanelTemplate", "part1EndPanelTemplate");
             Set(rig.em, "uiManager", ui); Set(rig.em, "playerRig", Make("PlayerRig").transform); Set(rig.em, "spawner", rig.spawner);
-            Set(rig.em, "part1Duration", 5f); Set(rig.em, "npcWarmupDuration", 0f);
             double startedAt = double.NaN, endedAt = double.NaN; int starts = 0, ends = 0;
             var emType = rig.em.GetType();
             emType.GetEvent("OnTrialStart").AddEventHandler(rig.em, (Action)(() => { starts++; startedAt = (double)ClockType.GetProperty("TAbs").GetValue(null); }));
@@ -255,7 +255,8 @@ public partial class NpcLifecycleTests
     {
         var camGo = new GameObject("Cam"); camGo.tag = "MainCamera"; camGo.AddComponent<Camera>(); _spawned.Add(camGo);
         var p = new P3();
-        yield return BuildRig(new RigOptions { selectedPartFallback = true, realPart = true, prewarm = 1, maxAgents = 1, npcSpeed = 0.3f, npcCaptureEnabled = false }, r => p.rig = r);
+        yield return BuildRig(new RigOptions { selectedPartFallback = true, realPart = true, prewarm = 1, maxAgents = 1, npcSpeed = 0.3f, npcCaptureEnabled = false,
+            emSetup = em => { Set(em, "allowWrongCandidateSelection", true); Set(em, "part3Destination1MaxSeconds", d1Max); Set(em, "part3TotalMaxSeconds", total); Set(em, "npcWarmupDuration", 0f); } }, r => p.rig = r);
         p.ui = MakeUi("part3StartPanelTemplate", "part3Dest1FullTemplate", "part3Dest2FullTemplate", "part3EndPanelTemplate");
         var zoneType = Type.GetType("ExperimentManager+Part3ZoneTargets, Assembly-CSharp");
         GameObject B(string n, float x) { var go = MakeBuilding(n, new Vector3(x, 2f, 30f), true, false); ((Behaviour)go.GetComponent(T("TargetSelectable"))).enabled = false; Set(go.GetComponent(T("TargetSelectable")), "experimentManager", p.rig.em); p.all.Add(go); return go; }
@@ -263,9 +264,7 @@ public partial class NpcLifecycleTests
         Set(gu, "buildingA", B("BAT_GU_A", 0f)); Set(gu, "buildingB", B("BAT_GU_B", 10f)); Set(oe, "buildingA", B("BAT_OE_A", 20f)); Set(oe, "buildingB", B("BAT_OE_B", 30f));
         p.other = B("BAT_OTHER", 40f);
         Set(p.rig.em, "part3ZoneGU", gu); Set(p.rig.em, "part3ZoneOE", oe); Set(p.rig.em, "part3StartGE", Make("StartGE").transform);
-        Set(p.rig.em, "allowWrongCandidateSelection", true);
         Set(p.rig.em, "uiManager", p.ui); Set(p.rig.em, "playerRig", Make("PlayerRig").transform); Set(p.rig.em, "spawner", p.rig.spawner);
-        Set(p.rig.em, "part3Destination1MaxSeconds", d1Max); Set(p.rig.em, "part3TotalMaxSeconds", total); Set(p.rig.em, "npcWarmupDuration", 0f);
         yield return null;
         Call(p.rig.em, "StartPart3");
         done(p);

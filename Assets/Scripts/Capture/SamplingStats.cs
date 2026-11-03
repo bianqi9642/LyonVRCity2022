@@ -31,6 +31,8 @@ public sealed class SamplingStats
     public long Intervals { get; private set; }
     public long NonMonotonic { get; private set; }
     public long UnexpectedGaps { get; private set; }
+    /// <summary>Subset of UnexpectedGaps whose interval is mostly explained by ONE long frame (the frame in which the sample was taken lasted at least half of the interval): the sampler could not run any sooner.</summary>
+    public long GapsFrameLimited { get; private set; }
     public long IntentionalBreaks { get; private set; }
     public int Epochs { get; private set; }
     public double FirstT { get; private set; } = double.NaN;
@@ -47,7 +49,10 @@ public sealed class SamplingStats
     public void SetNominalHz(double hz) { NominalHz = hz; }
 
     /// <summary>Registers one successfully written sample at monotonic time <paramref name="tAbs"/> (seconds).</summary>
-    public void OnSample(double tAbs)
+    public void OnSample(double tAbs) => OnSampleWithFrame(tAbs, double.NaN);
+
+    /// <summary>As OnSample (a distinct name: the tests reach OnSample by reflection), with the duration of the frame the sample was taken in (unscaled delta time) so a gap can be attributed to frame time.</summary>
+    public void OnSampleWithFrame(double tAbs, double frameDt)
     {
         Samples++;
         if (double.IsNaN(FirstT)) FirstT = tAbs;
@@ -60,7 +65,7 @@ public sealed class SamplingStats
             {
                 Intervals++; SumInterval += dt;
                 if (double.IsNaN(MaxInterval) || dt > MaxInterval) MaxInterval = dt;
-                if (dt > GapThreshold) UnexpectedGaps++;
+                if (dt > GapThreshold) { UnexpectedGaps++; if (!double.IsNaN(frameDt) && frameDt >= 0.5 * dt) GapsFrameLimited++; }
                 _ring[_ringHead] = dt; _ringHead = (_ringHead + 1) % BufferSize; if (_ringCount < BufferSize) _ringCount++;
             }
         }

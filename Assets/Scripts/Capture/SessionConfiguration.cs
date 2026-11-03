@@ -1,0 +1,561 @@
+// SessionConfiguration.cs
+// The ONE place where an experiment session's configuration is parsed, validated and resolved into an immutable snapshot. Pure C# (Newtonsoft.Json.Linq
+// and System.IO only; no UnityEngine), so every rule below is unit-testable outside Unity.
+//
+// Two sources, never mixed:
+//   * Internal  (ExternalSessionController.useExternalJson == false): the saved Inspector values are the source of truth.
+//   * External  (useExternalJson == true): a successfully validated session_config.json is the source of truth. Any failure (missing file, malformed
+//     JSON, missing/invalid field) yields an INVALID snapshot: nothing from the file is applied, there is no fallback to Inspector values, and the
+//     rest of the system (ExperimentManager.IdentityAllowsStart, DataCaptureManager preflight) refuses to start/record.
+//
+// The snapshot is created once per run (ExternalSessionController.Resolved). Its identity/selection values and the optional JSON overrides are immutable
+// (get-only, defensive copies). The EFFECTIVE settings (JSON overrides merged with the Scene-owned values, each tagged with where it came from) are frozen
+// exactly once by the first FreezeEffective(SceneSettings) call (ExperimentManager.EnsureSessionOverridesApplied) and never change afterwards: later
+// Inspector edits or file changes do not affect the running session.
+//
+// External schema (schemaVersion 1). Unknown keys are rejected so that a typo can never silently fall back to a default.
+//   required : participantId (string), selectedPart ("Part1"|"Part2"|"Part3"), part2GroupIndex (integer), part3GroupIndex (integer)
+//   optional : schemaVersion (integer, 1; absent = legacy file, treated as 1), autoStart (bool, default false),
+//              timing    { part1Duration, part2FirstDuration, part2SecondDuration, part3Destination1MaxSeconds, part3TotalMaxSeconds, npcWarmupDuration },
+//              partConfig{ part1|part2|part3 : { npcEnabled, npcDirectedMovement, npcCaptureEnabled, gazeCaptureEnabled, trajectoryCaptureEnabled } }
+//   Optional experimental overrides that are absent keep the ExperimentManager values authored in the saved scene (documented default); they are never
+//   taken from the Inspector of the session controller. Only the group index of the SELECTED Part is range-checked; the other index must still be an integer.
+// All comments in English per project convention.
+
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text;
+using Newtonsoft.Json.Linq;
+
+/// <summary>Where an effective setting came from.</summary>
+public static class SettingSource
+{
+    public const string ExternalJson = "EXTERNAL_JSON";
+    public const string SceneInherited = "SCENE_INHERITED";
+    public const string Inspector = "INSPECTOR";
+    public const string DocumentedDefault = "DOCUMENTED_DEFAULT";
+}
+
+/// <summary>NPC / capture flags of one Part (value copy).</summary>
+public struct PartFlagValues
+{
+    public bool NpcEnabled { get; private set; }
+    public bool NpcDirectedMovement { get; private set; }
+    public bool NpcCaptureEnabled { get; private set; }
+    public bool GazeCaptureEnabled { get; private set; }
+    public bool TrajectoryCaptureEnabled { get; private set; }
+
+    public PartFlagValues(bool npcEnabled, bool npcDirectedMovement, bool npcCaptureEnabled, bool gazeCaptureEnabled, bool trajectoryCaptureEnabled)
+        : this()
+    {
+        NpcEnabled = npcEnabled; NpcDirectedMovement = npcDirectedMovement; NpcCaptureEnabled = npcCaptureEnabled;
+        GazeCaptureEnabled = gazeCaptureEnabled; TrajectoryCaptureEnabled = trajectoryCaptureEnabled;
+    }
+}
+
+/// <summary>
+/// The Scene-owned values read ONCE by ExperimentManager when the effective settings are frozen. A plain input object: it is copied into the immutable
+/// EffectiveSettings and never retained. Part flag index 0..2 = Part1..Part3.
+/// </summary>
+public sealed class SceneSettings
+{
+    public float Part1Duration, Part2FirstDuration, Part2SecondDuration, Part3Destination1MaxSeconds, Part3TotalMaxSeconds, NpcWarmupDuration;
+    public PartFlagValues[] PartFlags = new PartFlagValues[3];
+    public bool AllowWrongCandidateSelection, RestrictRiverTeleportToPart3;
+    public int SpawnerMaxAgents, SpawnerPoolPrewarm;
+    public float SpawnerSpawnInterval, SpawnerDwellTimeMin, SpawnerDwellTimeMax;
+    public string AgentProfileName = "", AgentProfileHash = "";
+}
+
+/// <summary>One effective setting with its value (invariant-culture text) and provenance.</summary>
+public sealed class SettingEntry
+{
+    public string Key { get; private set; }
+    public string Value { get; private set; }
+    public string Source { get; private set; }
+    internal SettingEntry(string key, string value, string source) { Key = key; Value = value; Source = source; }
+}
+
+/// <summary>Optional experimental overrides from the external JSON (read-only). A null value = "not specified, keep the Scene value".</summary>
+public sealed class SessionConfigOverrides
+{
+    /// <summary>Optional per-Part flag overrides (null = not specified).</summary>
+    public struct PartFlags
+    {
+        public bool? npcEnabled, npcDirectedMovement, npcCaptureEnabled, gazeCaptureEnabled, trajectoryCaptureEnabled;
+    }
+
+    internal sealed class Builder
+    {
+        public float? part1Duration, part2FirstDuration, part2SecondDuration, part3Destination1MaxSeconds, part3TotalMaxSeconds, npcWarmupDuration;
+        public readonly PartFlags[] partConfig = new PartFlags[3];
+        public readonly List<string> applied = new List<string>();
+    }
+
+    public float? Part1Duration { get; private set; }
+    public float? Part2FirstDuration { get; private set; }
+    public float? Part2SecondDuration { get; private set; }
+    public float? Part3Destination1MaxSeconds { get; private set; }
+    public float? Part3TotalMaxSeconds { get; private set; }
+    public float? NpcWarmupDuration { get; private set; }
+    readonly PartFlags[] _partConfig;
+    /// <summary>"key=value" for every override that was specified, in a stable order (provenance for the session manifest).</summary>
+    public System.Collections.ObjectModel.ReadOnlyCollection<string> Applied { get; private set; }
+    public bool Any => Applied.Count > 0;
+
+    /// <summary>Flags of Part 1..3 (copy).</summary>
+    public PartFlags GetPartFlags(int partNumber) => _partConfig[partNumber - 1];
+
+    internal SessionConfigOverrides() { _partConfig = new PartFlags[3]; Applied = new List<string>().AsReadOnly(); }
+
+    internal SessionConfigOverrides(Builder b)
+    {
+        Part1Duration = b.part1Duration; Part2FirstDuration = b.part2FirstDuration; Part2SecondDuration = b.part2SecondDuration;
+        Part3Destination1MaxSeconds = b.part3Destination1MaxSeconds; Part3TotalMaxSeconds = b.part3TotalMaxSeconds; NpcWarmupDuration = b.npcWarmupDuration;
+        _partConfig = (PartFlags[])b.partConfig.Clone();
+        Applied = new List<string>(b.applied).AsReadOnly();
+    }
+}
+
+/// <summary>
+/// The frozen effective settings of the session: every value the running session actually uses, with its provenance. Built once, never mutated
+/// (get-only members, private copies; Entries is a read-only list).
+/// </summary>
+public sealed class EffectiveSettings
+{
+    public float Part1Duration { get; private set; }
+    public float Part2FirstDuration { get; private set; }
+    public float Part2SecondDuration { get; private set; }
+    public float Part3Destination1MaxSeconds { get; private set; }
+    public float Part3TotalMaxSeconds { get; private set; }
+    public float NpcWarmupDuration { get; private set; }
+    public bool AllowWrongCandidateSelection { get; private set; }
+    public bool RestrictRiverTeleportToPart3 { get; private set; }
+    public int SpawnerMaxAgents { get; private set; }
+    public int SpawnerPoolPrewarm { get; private set; }
+    public float SpawnerSpawnInterval { get; private set; }
+    public float SpawnerDwellTimeMin { get; private set; }
+    public float SpawnerDwellTimeMax { get; private set; }
+    public string AgentProfileName { get; private set; }
+    public string AgentProfileHash { get; private set; }
+    /// <summary>Every effective setting (key, value text, source) in a stable order.</summary>
+    public System.Collections.ObjectModel.ReadOnlyCollection<SettingEntry> Entries { get; private set; }
+
+    PartFlagValues[] _parts;
+    /// <summary>Flags of Part 1..3 (copy).</summary>
+    public PartFlagValues GetPartFlags(int partNumber) => _parts[partNumber - 1];
+
+    static string F(float v) => v.ToString("R", CultureInfo.InvariantCulture);
+    static string B(bool v) => v ? "true" : "false";
+
+    internal static EffectiveSettings Build(SessionConfigSnapshot s, SceneSettings sc)
+    {
+        bool ext = s.Source == SessionConfigCore.SourceExternal;
+        SessionConfigOverrides ov = s.Overrides;
+        string scene = ext ? SettingSource.SceneInherited : SettingSource.Inspector;
+        Func<bool, string> Src = overridden => ext && overridden ? SettingSource.ExternalJson : scene;
+
+        var e = new EffectiveSettings();
+        var list = new List<SettingEntry>();
+        Action<string, string, string> Add = (key, value, source) => list.Add(new SettingEntry(key, value, source));
+
+        e.Part1Duration = ov.Part1Duration ?? sc.Part1Duration; Add("part1_duration_seconds", F(e.Part1Duration), Src(ov.Part1Duration.HasValue));
+        e.Part2FirstDuration = ov.Part2FirstDuration ?? sc.Part2FirstDuration; Add("part2_first_duration_seconds", F(e.Part2FirstDuration), Src(ov.Part2FirstDuration.HasValue));
+        e.Part2SecondDuration = ov.Part2SecondDuration ?? sc.Part2SecondDuration; Add("part2_second_duration_seconds", F(e.Part2SecondDuration), Src(ov.Part2SecondDuration.HasValue));
+        e.Part3Destination1MaxSeconds = ov.Part3Destination1MaxSeconds ?? sc.Part3Destination1MaxSeconds; Add("part3_destination1_max_seconds", F(e.Part3Destination1MaxSeconds), Src(ov.Part3Destination1MaxSeconds.HasValue));
+        e.Part3TotalMaxSeconds = ov.Part3TotalMaxSeconds ?? sc.Part3TotalMaxSeconds; Add("part3_total_max_seconds", F(e.Part3TotalMaxSeconds), Src(ov.Part3TotalMaxSeconds.HasValue));
+        e.NpcWarmupDuration = ov.NpcWarmupDuration ?? sc.NpcWarmupDuration; Add("npc_warmup_duration_seconds", F(e.NpcWarmupDuration), Src(ov.NpcWarmupDuration.HasValue));
+
+        e._parts = new PartFlagValues[3];
+        for (int i = 0; i < 3; i++)
+        {
+            PartFlagValues b = sc.PartFlags != null && sc.PartFlags.Length == 3 ? sc.PartFlags[i] : default(PartFlagValues);
+            SessionConfigOverrides.PartFlags o = ov.GetPartFlags(i + 1);
+            e._parts[i] = new PartFlagValues(o.npcEnabled ?? b.NpcEnabled, o.npcDirectedMovement ?? b.NpcDirectedMovement, o.npcCaptureEnabled ?? b.NpcCaptureEnabled,
+                                             o.gazeCaptureEnabled ?? b.GazeCaptureEnabled, o.trajectoryCaptureEnabled ?? b.TrajectoryCaptureEnabled);
+            string p = "part" + (i + 1) + "_";
+            Add(p + "npc_enabled", B(e._parts[i].NpcEnabled), Src(o.npcEnabled.HasValue));
+            Add(p + "npc_directed_movement", B(e._parts[i].NpcDirectedMovement), Src(o.npcDirectedMovement.HasValue));
+            Add(p + "npc_capture_enabled", B(e._parts[i].NpcCaptureEnabled), Src(o.npcCaptureEnabled.HasValue));
+            Add(p + "gaze_capture_enabled", B(e._parts[i].GazeCaptureEnabled), Src(o.gazeCaptureEnabled.HasValue));
+            Add(p + "trajectory_capture_enabled", B(e._parts[i].TrajectoryCaptureEnabled), Src(o.trajectoryCaptureEnabled.HasValue));
+        }
+
+        // Scene-owned conditions (not controllable from the JSON): always the Scene / Inspector value.
+        e.AllowWrongCandidateSelection = sc.AllowWrongCandidateSelection; Add("allow_wrong_candidate_selection", B(e.AllowWrongCandidateSelection), scene);
+        e.RestrictRiverTeleportToPart3 = sc.RestrictRiverTeleportToPart3; Add("restrict_river_teleport_to_part3", B(e.RestrictRiverTeleportToPart3), scene);
+        e.SpawnerMaxAgents = sc.SpawnerMaxAgents; Add("spawner_max_agents", e.SpawnerMaxAgents.ToString(CultureInfo.InvariantCulture), scene);
+        e.SpawnerPoolPrewarm = sc.SpawnerPoolPrewarm; Add("spawner_pool_prewarm", e.SpawnerPoolPrewarm.ToString(CultureInfo.InvariantCulture), scene);
+        e.SpawnerSpawnInterval = sc.SpawnerSpawnInterval; Add("spawner_spawn_interval_seconds", F(e.SpawnerSpawnInterval), scene);
+        e.SpawnerDwellTimeMin = sc.SpawnerDwellTimeMin; Add("spawner_dwell_time_min_seconds", F(e.SpawnerDwellTimeMin), scene);
+        e.SpawnerDwellTimeMax = sc.SpawnerDwellTimeMax; Add("spawner_dwell_time_max_seconds", F(e.SpawnerDwellTimeMax), scene);
+        e.AgentProfileName = sc.AgentProfileName ?? ""; Add("agent_profile_name", e.AgentProfileName, scene);
+        e.AgentProfileHash = sc.AgentProfileHash ?? ""; Add("agent_profile_hash", e.AgentProfileHash, scene);
+
+        // Session-level operational flag
+        Add("auto_start", B(s.AutoStart), !ext ? SettingSource.Inspector : s.AutoStartDeclared ? SettingSource.ExternalJson : SettingSource.DocumentedDefault);
+
+        e.Entries = list.AsReadOnly();
+        return e;
+    }
+}
+
+/// <summary>The resolved session configuration. Identity/selection values are immutable; Effective is write-once (see FreezeEffective).</summary>
+public sealed class SessionConfigSnapshot
+{
+    public string Source { get; internal set; } = SessionConfigCore.SourceInspector;
+    /// <summary>Full path of the external file (external source only; logged locally, never written to the manifest).</summary>
+    public string SourcePath { get; internal set; } = "";
+    /// <summary>Hash of the external JSON text that was applied; "" for the Inspector source or when none was applied.</summary>
+    public string Hash { get; internal set; } = "";
+    public int SchemaVersion { get; internal set; } = SessionConfigCore.SchemaVersion;
+    /// <summary>False for the Inspector source and for legacy external files without a schemaVersion key.</summary>
+    public bool SchemaVersionDeclared { get; internal set; }
+    public string ParticipantId { get; internal set; } = "";
+    /// <summary>1, 2 or 3.</summary>
+    public int PartNumber { get; internal set; } = 1;
+    public int Part2GroupIndex { get; internal set; }
+    public int Part3GroupIndex { get; internal set; }
+    public bool AutoStart { get; internal set; }
+    /// <summary>True when the external JSON contained an autoStart key (false: DOCUMENTED_DEFAULT false).</summary>
+    public bool AutoStartDeclared { get; internal set; }
+    public SessionConfigOverrides Overrides { get; internal set; } = new SessionConfigOverrides();
+    public SessionIdentity.Result Identity { get; internal set; }
+    public System.Collections.ObjectModel.ReadOnlyCollection<string> Warnings { get; internal set; } = new List<string>().AsReadOnly();
+
+    public bool IsValid => Identity.IsValid;
+    public string PartName => "Part" + PartNumber;
+    /// <summary>Zero-based index of the group that is ACTIVE for the selected Part (Part 1 has none: -1). Group Number == Group Index.</summary>
+    public int ActiveGroupIndex => PartNumber == 2 ? Part2GroupIndex : PartNumber == 3 ? Part3GroupIndex : -1;
+
+    readonly object _freezeLock = new object();
+
+    /// <summary>The frozen effective settings, or null until the first successful FreezeEffective call (and always null for an invalid configuration).</summary>
+    public EffectiveSettings Effective { get; private set; }
+
+    /// <summary>
+    /// Freeze the effective settings from the given Scene values. Write-once: the first call on a VALID snapshot builds and stores them, every later call
+    /// returns the same object and ignores its argument. Returns null for an invalid configuration (nothing is exposed).
+    /// </summary>
+    public EffectiveSettings FreezeEffective(SceneSettings scene)
+    {
+        if (!IsValid) return null;
+        lock (_freezeLock)
+        {
+            if (Effective == null) Effective = EffectiveSettings.Build(this, scene ?? new SceneSettings());
+            return Effective;
+        }
+    }
+}
+
+public static class SessionConfigCore
+{
+    public const int SchemaVersion = 1;
+    public const string SourceInspector = "inspector";
+    public const string SourceExternal = "external_json";
+
+    /// <summary>What the scene offers; used to range-check the group index of the selected Part. 0 = unknown / not configured: the upper bound is then not checked here.</summary>
+    public struct Limits
+    {
+        public int Part2GroupCount;
+        public int Part3GroupCount;
+        /// <summary>Scene-authored Part 3 maxima (seconds), used to cross-check an overridden pair. NaN/0 = unknown.</summary>
+        public float BaselinePart3Destination1Max, BaselinePart3TotalMax;
+    }
+
+    static readonly string[] TopLevelKeys = { "schemaVersion", "participantId", "selectedPart", "part2GroupIndex", "part3GroupIndex", "autoStart", "timing", "partConfig" };
+    static readonly string[] RequiredKeys = { "participantId", "selectedPart", "part2GroupIndex", "part3GroupIndex" };
+    static readonly string[] TimingKeys = { "part1Duration", "part2FirstDuration", "part2SecondDuration", "part3Destination1MaxSeconds", "part3TotalMaxSeconds", "npcWarmupDuration" };
+    static readonly string[] PartKeys = { "part1", "part2", "part3" };
+    static readonly string[] FlagKeys = { "npcEnabled", "npcDirectedMovement", "npcCaptureEnabled", "gazeCaptureEnabled", "trajectoryCaptureEnabled" };
+
+    // ------------------------------------------------------------------------------------------------------------------------------ internal source
+
+    /// <summary>Resolve the Inspector configuration. Same participant/part/index rules as the external source; no overrides.</summary>
+    public static SessionConfigSnapshot ResolveInternal(string participantId, int partNumber, int part2GroupIndex, int part3GroupIndex, bool autoStart, Limits limits)
+    {
+        var s = new SessionConfigSnapshot
+        {
+            Source = SourceInspector, PartNumber = partNumber, Part2GroupIndex = part2GroupIndex, Part3GroupIndex = part3GroupIndex, AutoStart = autoStart,
+        };
+        SessionIdentity.Result idr = SessionIdentity.ValidateParticipantId(participantId);
+        if (idr.IsValid)
+        {
+            s.ParticipantId = idr.participantId;
+            var errors = new List<string>();
+            var warnings = new List<string>();
+            if (partNumber < 1 || partNumber > 3) errors.Add("selectedPart: expected Part1, Part2 or Part3, got value " + partNumber + ".");
+            else CheckIndices(partNumber, part2GroupIndex, part3GroupIndex, limits, errors, warnings);
+            s.Warnings = warnings.AsReadOnly();
+            if (errors.Count > 0) idr = new SessionIdentity.Result { status = SessionIdentity.Status.Invalid, message = string.Join(" ", errors) };
+        }
+        s.Identity = idr;
+        return s;
+    }
+
+    // ------------------------------------------------------------------------------------------------------------------------------ external source
+
+    /// <summary>Read and resolve the external file. A missing/unreadable file is an INVALID snapshot (never an Inspector fallback).</summary>
+    public static SessionConfigSnapshot ResolveExternalFromFile(string path, Limits limits, Func<string, string> hasher)
+    {
+        string text;
+        try
+        {
+            if (!File.Exists(path)) return Invalid("External session configuration not found. Expected file: " + path, path);
+            text = File.ReadAllText(path);
+        }
+        catch (Exception ex)
+        {
+            return Invalid("External session configuration could not be read (" + ex.GetType().Name + "). File: " + path, path);
+        }
+        return ResolveExternalFromText(text, path, limits, hasher);
+    }
+
+    /// <summary>Parse + validate the whole document, then build the snapshot. Nothing is returned partially: any error gives an invalid snapshot.</summary>
+    public static SessionConfigSnapshot ResolveExternalFromText(string json, string path, Limits limits, Func<string, string> hasher)
+    {
+        var errors = new List<string>();
+        var warnings = new List<string>();
+        JObject root;
+        try
+        {
+            var settings = new JsonLoadSettings { DuplicatePropertyNameHandling = DuplicatePropertyNameHandling.Error, CommentHandling = CommentHandling.Ignore };
+            root = JObject.Parse(json ?? "", settings);
+        }
+        catch (Exception ex)
+        {
+            return Invalid("External session configuration is not valid JSON (" + FirstLine(ex.Message) + "). File: " + path, path);
+        }
+
+        foreach (var p in root.Properties())
+            if (Array.IndexOf(TopLevelKeys, p.Name) < 0) errors.Add("unknown field '" + p.Name + "' (allowed: " + string.Join(", ", TopLevelKeys) + ").");
+        foreach (string key in RequiredKeys)
+            if (!root.ContainsKey(key)) errors.Add("missing required field '" + key + "'.");
+
+        var s = new SessionConfigSnapshot { Source = SourceExternal, SourcePath = path };
+
+        // schemaVersion (optional: legacy files have none)
+        if (root.TryGetValue("schemaVersion", out JToken sv))
+        {
+            if (sv.Type != JTokenType.Integer) errors.Add("schemaVersion: expected the integer " + SchemaVersion + ", got " + Describe(sv) + ".");
+            else if ((long)sv != SchemaVersion) errors.Add("schemaVersion: unsupported version " + (long)sv + " (this build supports " + SchemaVersion + ").");
+            else { s.SchemaVersion = SchemaVersion; s.SchemaVersionDeclared = true; }
+        }
+
+        // participantId: must be a JSON string (a number would lose leading zeros / be silently converted)
+        string pidRaw = null;
+        if (root.TryGetValue("participantId", out JToken pt))
+        {
+            if (pt.Type != JTokenType.String) errors.Add("participantId: expected a JSON string such as \"P001\", got " + Describe(pt) + ".");
+            else pidRaw = (string)pt;
+        }
+        SessionIdentity.Result idr = default(SessionIdentity.Result);
+        if (pidRaw != null)
+        {
+            idr = SessionIdentity.ValidateParticipantId(pidRaw);
+            if (!idr.IsValid) errors.Add("participantId: " + idr.message);
+        }
+
+        // selectedPart
+        int part = 0;
+        if (root.TryGetValue("selectedPart", out JToken spt))
+        {
+            string name = spt.Type == JTokenType.String ? ((string)spt).Trim() : null;
+            if (name != null && name.Equals("Part1", StringComparison.OrdinalIgnoreCase)) part = 1;
+            else if (name != null && name.Equals("Part2", StringComparison.OrdinalIgnoreCase)) part = 2;
+            else if (name != null && name.Equals("Part3", StringComparison.OrdinalIgnoreCase)) part = 3;
+            else errors.Add("selectedPart: expected \"Part1\", \"Part2\" or \"Part3\", got " + Describe(spt) + ".");
+        }
+
+        // group indices: both must be integers; only the SELECTED Part's index is range-checked
+        bool g2ok = ReadInt(root, "part2GroupIndex", errors, out int g2);
+        bool g3ok = ReadInt(root, "part3GroupIndex", errors, out int g3);
+        if (part != 0 && g2ok && g3ok) CheckIndices(part, g2, g3, limits, errors, warnings);
+
+        // autoStart (optional, default false)
+        bool autoStart = false;
+        if (root.TryGetValue("autoStart", out JToken at))
+        {
+            if (at.Type != JTokenType.Boolean) errors.Add("autoStart: expected true or false, got " + Describe(at) + ".");
+            else autoStart = (bool)at;
+        }
+
+        var ov = new SessionConfigOverrides.Builder();
+        ReadTiming(root, ov, errors);
+        ReadPartConfig(root, ov, errors);
+        CheckTimingPair(part, ov, limits, errors);
+
+        if (errors.Count > 0)
+            return Invalid("External session configuration is invalid. File: " + path + " | " + string.Join(" | ", errors), path);
+
+        s.ParticipantId = idr.participantId;
+        s.PartNumber = part; s.Part2GroupIndex = g2; s.Part3GroupIndex = g3; s.AutoStart = autoStart; s.AutoStartDeclared = root.ContainsKey("autoStart");
+        s.Overrides = new SessionConfigOverrides(ov); s.Warnings = warnings.AsReadOnly();
+        s.Hash = hasher != null ? hasher(json) : "";
+        s.Identity = idr;   // Valid
+        return s;
+    }
+
+    static SessionConfigSnapshot Invalid(string message, string path)
+        => new SessionConfigSnapshot
+        {
+            Source = SourceExternal, SourcePath = path,
+            Identity = new SessionIdentity.Result { status = SessionIdentity.Status.UnresolvedConfig, message = message },
+        };
+
+    // ------------------------------------------------------------------------------------------------------------------------------ rules shared by both sources
+
+    static void CheckIndices(int part, int g2, int g3, Limits limits, List<string> errors, List<string> warnings)
+    {
+        if (part == 2)
+        {
+            if (g2 < 0 || (limits.Part2GroupCount > 0 && g2 >= limits.Part2GroupCount))
+                errors.Add("part2GroupIndex: expected an integer in 0.." + (limits.Part2GroupCount > 0 ? (limits.Part2GroupCount - 1).ToString(CultureInfo.InvariantCulture) : "(number of Part 2 groups - 1)")
+                           + " (zero-based; Group Number = Group Index; the scene has " + (limits.Part2GroupCount > 0 ? limits.Part2GroupCount.ToString(CultureInfo.InvariantCulture) : "an unknown number of") + " Part 2 groups), got " + g2 + ".");
+        }
+        else if (part == 3)
+        {
+            if (g3 < 0 || (limits.Part3GroupCount > 0 && g3 >= limits.Part3GroupCount))
+                errors.Add("part3GroupIndex: expected an integer in 0.." + (limits.Part3GroupCount > 0 ? (limits.Part3GroupCount - 1).ToString(CultureInfo.InvariantCulture) : "(number of Part 3 groups - 1)")
+                           + " (zero-based; Group Number = Group Index), got " + g3 + ".");
+        }
+        // The index of a Part that is not selected cannot affect this session: never an error, only a note.
+        if (part != 2 && limits.Part2GroupCount > 0 && (g2 < 0 || g2 >= limits.Part2GroupCount)) warnings.Add("part2GroupIndex " + g2 + " is outside 0.." + (limits.Part2GroupCount - 1) + " but Part 2 is not selected; ignored.");
+        if (part != 3 && limits.Part3GroupCount > 0 && (g3 < 0 || g3 >= limits.Part3GroupCount)) warnings.Add("part3GroupIndex " + g3 + " is outside 0.." + (limits.Part3GroupCount - 1) + " but Part 3 is not selected; ignored.");
+    }
+
+    static bool ReadInt(JObject root, string key, List<string> errors, out int value)
+    {
+        value = 0;
+        if (!root.TryGetValue(key, out JToken t)) return false;   // "missing" already reported
+        if (t.Type != JTokenType.Integer) { errors.Add(key + ": expected an integer such as 0, got " + Describe(t) + "."); return false; }
+        long v = (long)t;
+        if (v < int.MinValue || v > int.MaxValue) { errors.Add(key + ": integer out of range, got " + v + "."); return false; }
+        value = (int)v;
+        return true;
+    }
+
+    static void ReadTiming(JObject root, SessionConfigOverrides.Builder ov, List<string> errors)
+    {
+        if (!root.TryGetValue("timing", out JToken tt)) return;
+        if (tt.Type != JTokenType.Object) { errors.Add("timing: expected an object, got " + Describe(tt) + "."); return; }
+        foreach (var p in ((JObject)tt).Properties())
+        {
+            if (Array.IndexOf(TimingKeys, p.Name) < 0) { errors.Add("timing: unknown field '" + p.Name + "' (allowed: " + string.Join(", ", TimingKeys) + ")."); continue; }
+            if (p.Value.Type != JTokenType.Integer && p.Value.Type != JTokenType.Float) { errors.Add("timing." + p.Name + ": expected a number of seconds, got " + Describe(p.Value) + "."); continue; }
+            double d = (double)p.Value;
+            bool allowZero = p.Name == "npcWarmupDuration";   // 0 = skip the warm-up wait (existing semantics)
+            if (double.IsNaN(d) || double.IsInfinity(d) || d < 0 || (!allowZero && d <= 0) || d > 86400)
+            { errors.Add("timing." + p.Name + ": expected a finite number of seconds " + (allowZero ? ">= 0" : "> 0") + " and <= 86400, got " + Describe(p.Value) + "."); continue; }
+            float f = (float)d;
+            switch (p.Name)
+            {
+                case "part1Duration": ov.part1Duration = f; break;
+                case "part2FirstDuration": ov.part2FirstDuration = f; break;
+                case "part2SecondDuration": ov.part2SecondDuration = f; break;
+                case "part3Destination1MaxSeconds": ov.part3Destination1MaxSeconds = f; break;
+                case "part3TotalMaxSeconds": ov.part3TotalMaxSeconds = f; break;
+                case "npcWarmupDuration": ov.npcWarmupDuration = f; break;
+            }
+            ov.applied.Add("timing." + p.Name + "=" + f.ToString("R", CultureInfo.InvariantCulture));
+        }
+    }
+
+    static void ReadPartConfig(JObject root, SessionConfigOverrides.Builder ov, List<string> errors)
+    {
+        if (!root.TryGetValue("partConfig", out JToken pc)) return;
+        if (pc.Type != JTokenType.Object) { errors.Add("partConfig: expected an object, got " + Describe(pc) + "."); return; }
+        foreach (var part in ((JObject)pc).Properties())
+        {
+            int idx = Array.IndexOf(PartKeys, part.Name);
+            if (idx < 0) { errors.Add("partConfig: unknown field '" + part.Name + "' (allowed: part1, part2, part3)."); continue; }
+            if (part.Value.Type != JTokenType.Object) { errors.Add("partConfig." + part.Name + ": expected an object, got " + Describe(part.Value) + "."); continue; }
+            var flags = new SessionConfigOverrides.PartFlags();
+            foreach (var f in ((JObject)part.Value).Properties())
+            {
+                if (Array.IndexOf(FlagKeys, f.Name) < 0) { errors.Add("partConfig." + part.Name + ": unknown field '" + f.Name + "' (allowed: " + string.Join(", ", FlagKeys) + ")."); continue; }
+                if (f.Value.Type != JTokenType.Boolean) { errors.Add("partConfig." + part.Name + "." + f.Name + ": expected true or false, got " + Describe(f.Value) + "."); continue; }
+                bool b = (bool)f.Value;
+                switch (f.Name)
+                {
+                    case "npcEnabled": flags.npcEnabled = b; break;
+                    case "npcDirectedMovement": flags.npcDirectedMovement = b; break;
+                    case "npcCaptureEnabled": flags.npcCaptureEnabled = b; break;
+                    case "gazeCaptureEnabled": flags.gazeCaptureEnabled = b; break;
+                    case "trajectoryCaptureEnabled": flags.trajectoryCaptureEnabled = b; break;
+                }
+                ov.applied.Add("partConfig." + part.Name + "." + f.Name + "=" + (b ? "true" : "false"));
+            }
+            ov.partConfig[idx] = flags;
+        }
+    }
+
+    // Part 3 only: Destination 1's maximum can never exceed the total budget (ExperimentManager tooltip). Checked on the EFFECTIVE pair when an override takes part.
+    static void CheckTimingPair(int part, SessionConfigOverrides.Builder ov, Limits limits, List<string> errors)
+    {
+        if (part != 3 || (!ov.part3Destination1MaxSeconds.HasValue && !ov.part3TotalMaxSeconds.HasValue)) return;
+        float d1 = ov.part3Destination1MaxSeconds ?? limits.BaselinePart3Destination1Max;
+        float total = ov.part3TotalMaxSeconds ?? limits.BaselinePart3TotalMax;
+        if (d1 > 0 && total > 0 && d1 > total)
+            errors.Add("timing: part3Destination1MaxSeconds (" + d1.ToString("R", CultureInfo.InvariantCulture) + ") must not exceed part3TotalMaxSeconds (" + total.ToString("R", CultureInfo.InvariantCulture) + ").");
+    }
+
+    // ------------------------------------------------------------------------------------------------------------------------------ helpers
+
+    static string Describe(JToken t)
+    {
+        if (t == null) return "nothing";
+        string v = t.Type == JTokenType.String ? "\"" + (string)t + "\"" : t.Type == JTokenType.Object || t.Type == JTokenType.Array ? "" : t.ToString(Newtonsoft.Json.Formatting.None);
+        if (v.Length > 40) v = v.Substring(0, 40) + "...";
+        return t.Type.ToString().ToLowerInvariant() + (v.Length > 0 ? " " + v : "");
+    }
+
+    static string FirstLine(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        int i = s.IndexOfAny(new[] { '\r', '\n' });
+        return i < 0 ? s : s.Substring(0, i);
+    }
+
+    /// <summary>Concise, human-readable resolution summary. extraLines (e.g. the Part 3 zone assignment) are appended before the status line.</summary>
+    public static string FormatSummary(SessionConfigSnapshot s, IEnumerable<string> extraLines)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("========== SESSION CONFIGURATION ==========");
+        sb.AppendLine("Source: " + (s.Source == SourceExternal ? "External JSON" : "Internal / Inspector"));
+        if (s.Source == SourceExternal) sb.AppendLine("File: " + s.SourcePath);
+        if (!s.IsValid)
+        {
+            sb.AppendLine("Status: INVALID (" + s.Identity.status + ") - recording and Part start are BLOCKED");
+            sb.AppendLine(s.Identity.message);
+            sb.Append("===========================================");
+            return sb.ToString();
+        }
+        if (s.Source == SourceExternal) sb.AppendLine("Schema Version: " + s.SchemaVersion + (s.SchemaVersionDeclared ? "" : " (not declared: legacy file)"));
+        sb.AppendLine("Participant ID: " + s.ParticipantId);
+        sb.AppendLine("Selected Part: " + s.PartName);
+        if (s.PartNumber == 2) sb.AppendLine("Part 2 Group: " + s.Part2GroupIndex);
+        if (s.PartNumber == 3) sb.AppendLine("Part 3 Group: " + s.Part3GroupIndex);
+        sb.AppendLine("Auto Start: " + (s.AutoStart ? "true" : "false"));
+        if (extraLines != null) foreach (string l in extraLines) sb.AppendLine(l);
+        if (s.Overrides.Any) sb.AppendLine("Overrides: " + string.Join("; ", s.Overrides.Applied));
+        foreach (string w in s.Warnings) sb.AppendLine("Note: " + w);
+        sb.AppendLine("Status: VALID");
+        sb.Append("===========================================");
+        return sb.ToString();
+    }
+
+    /// <summary>One-per-line listing of the frozen effective settings with their provenance (logged once when they are frozen).</summary>
+    public static string FormatEffective(SessionConfigSnapshot s)
+    {
+        EffectiveSettings e = s.Effective;
+        var sb = new StringBuilder();
+        sb.AppendLine("========== EFFECTIVE SESSION SETTINGS (frozen) ==========");
+        if (e == null) sb.AppendLine("(not frozen)");
+        else foreach (SettingEntry en in e.Entries) sb.AppendLine(en.Key + " = " + en.Value + "  [" + en.Source + "]");
+        sb.Append("=========================================================");
+        return sb.ToString();
+    }
+}

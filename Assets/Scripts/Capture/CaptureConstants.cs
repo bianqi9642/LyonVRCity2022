@@ -175,7 +175,13 @@ public static class CaptureConstants
         "the npc_id / npc_spawn_instance_id columns of events.csv are kept for compatibility and are always blank from schema_version 4";
 
     // Identity / schema metadata written to session_manifest.json.
-    public const int    SchemaVersion   = 7;
+    // 8: Group Number == Group Index everywhere (zero-based: Part 2 0..1, Part 3 0..11); part3_group_number / events.csv 'group=' are zero-based, part3_group_number = -1 when
+    //    not applicable; manifest adds the frozen effective settings with provenance (setting_entries) and session_config.used.json. Earlier schemas are not interpreted.
+    // 9: eye-tracking acquisition. gaze.csv appends eye_tracking_state, left_provider_valid, right_provider_valid; the manifest adds the eye_tracking block (lifecycle state,
+    //    permission / capability / runtime path, startup counters, provider-level valid-sample counters, bounded transition log with the states at each transition),
+    //    gaze_writer_status vs gaze_acquisition_status (+ reason), frame_timing and per-stream limit diagnosis (rate_gaze / rate_trajectory gain gaps_frame_limited,
+    //    limit_diagnosis, frame_mean_hz). Existing fields keep their names, types and meaning.
+    public const int    SchemaVersion   = 9;
     public const string NpcIdScheme     = "agent-lifetime-v1: npc_id=AgentID (stable pooled GameObject); npc_spawn_instance_id=<AgentID>-S<n> (n = per-AgentID lifetime index, from 1)";
     public const string NpcCaptureModeText =
         "master_switch: npc_state.csv holds every active NPC lifetime of a Part whose npcCaptureEnabled is true, from the moment NPCs exist (warm-up, " +

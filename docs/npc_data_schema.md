@@ -1,4 +1,4 @@
-# Capture schema reference (schema_version 7): NPC streams, events, gaze, trajectory, phases, timing, reliability, manifest
+# Capture schema reference (schema_version 9): NPC streams, events, gaze, trajectory, phases, timing, reliability, manifest
 
 Reference for `npc_state.csv`, `npc_events.csv`, `npc_lifetimes.csv` and `npc_profiles.csv`, derived from the write paths in
 `Assets/Scripts/Capture/DataCaptureManager.cs` (`SampleNpcs`, `AppendNpcEventLine`, `WriteLifetimeRow`, `WriteProfileRegistryRow`) and the headers in
@@ -12,6 +12,10 @@ Reference for `npc_state.csv`, `npc_events.csv`, `npc_lifetimes.csv` and `npc_pr
 **v5 -> v6** (`events.csv` / timing; see §17-§19): `events.csv` + trailing `interaction_id`; `value_num` now distinguishes a real 0 from "no value"; Parts 1 and 2 timers use the same monotonic clock as Part 3.
 **v6 -> v7** (reliability; see §20-§23): `npc_state.csv` + trailing `los_status` and a corrected `los_clear_to_participant`; `session_id` / folder name no longer contain the participant ID (`<UTC>_<12 hex of run_guid>`); new diagnostic file `capture_errors.csv`;
 `StreamHealth` blocks gain failure diagnostics; the manifest gains `manifest_revision`, identity/config fields and LOS counts and is written atomically.
+**v7 -> v8** (session configuration, uncommitted at the time of v9): Group Number == Group Index (zero-based); the manifest adds the frozen effective settings with provenance and `session_config.used.json`.
+**v8 -> v9** (eye-tracking acquisition, sampling-rate diagnostics; see §24): `gaze.csv` +3 trailing columns (`eye_tracking_state`, `left_provider_valid`, `right_provider_valid`); the manifest gains `eye_tracking` (acquisition lifecycle),
+`gaze_writer_status` vs `gaze_acquisition_status` (+ `gaze_acquisition_reason`), `frame_timing`, and `rate_*` gain `limit_diagnosis`, `gaps_frame_limited`, `frame_mean_hz`, `scheduler_*`. No existing column or field was renamed, retyped or reordered.
+`schema_version` < 9 files: nothing says whether the eye tracker ever started - `health_gaze.status = ok` only means the gaze.csv WRITER worked. Their `eye_tracking_*` booleans are start-up/late snapshots, not observations.
 `schema_version` < 7 files: `los_clear_to_participant` was 0 for most rows because the query ran from the participant to a point inside the NPC's own colliders (treat it as uninformative); folders are `<participant>_<UTC>[-rN]`; no `capture_errors.csv`; a failed stream stayed silently disabled.
 `schema_version` < 6 files: no `interaction_id` column (match a click to its outcome by order/target/time only, with the ambiguity that implies), and a numeric 0 in `value_num` was written as blank (zero and missing are indistinguishable - `app_pause`/`app_focus`
 resume/loss rows, zero elapsed times; treat a blank `value_num` on those event types as 0).
@@ -416,3 +420,39 @@ install with `File.Move` (no final yet) or `File.Replace(tmp, final, null)` (a s
 The final file is never deleted before its replacement exists, and a failure at any step leaves the previous valid manifest untouched. Writes are serialised (main thread only); `manifest_revision` increases per attempt; failures are counted (`manifest_write_failures`, `manifest_last_error`), logged once per failure episode, listed in `capture_errors.csv` (`session_manifest`) and retried at the next checkpoint.
 **Recovery** (`ManifestFileWriter.Recover`): among the final, the `.bak` and any `*.tmp`, the valid file with the highest `manifest_revision` wins (ties: final > backup > tmp); an invalid final is preserved as `.corrupt-*`; a newer valid generation is never replaced by an older one; an incomplete temp file is never a candidate.
 **Durability**: the replace makes the swap atomic with respect to process termination on POSIX/NTFS, and `Flush(true)` asks the OS to write through; neither is a guarantee against sudden power loss, and the Android IL2CPP behaviour of `File.Replace` was not tested (hence the explicit fallback).
+
+## 24. Eye-tracking acquisition (schema v9) - `eye_tracking`, `gaze_acquisition_status`, `gaze.csv` columns 67-69
+
+**Two different facts.** `gaze_writer_status` (= `health_gaze.status`) says whether `gaze.csv` was written. `gaze_acquisition_status` says whether the eye tracker delivered eyes. A recorder that writes head-fallback rows all session is `writer ok` and, say, `initialization_failed`.
+Likewise `gaze_left_present` / `gaze_right_present` only say that an `OVREyeGaze` component is assigned, and `health_gaze.status = ok` is not evidence that eye tracking works. The legacy booleans `eye_tracking_supported/enabled/permission_granted` are unchanged (and were a single early snapshot; `*_state` strings are refreshed at checkpoints).
+
+`gaze_acquisition_status` is one of `unknown | not_applicable | not_enabled | unsupported | permission_required | permission_denied | initializing | initialization_failed | running | tracking_unavailable | stopped`
+(`not_applicable` = no `OVREyeGaze` assigned; `not_enabled` = lifecycle switched off in the Inspector; `running` = components started AND the provider reports valid eyes; `tracking_unavailable` = started, but no valid provider sample for `trackingUnavailableAfterSeconds`, default 3 s).
+`gaze_acquisition_reason` is the last lifecycle reason (for example `xr_not_initialized`, `capability_unsupported_on_windows_editor_openxr`, `permission_denied_by_user`, `component_self_disabled:right`, `retries_exhausted`); it is prefixed `gaze_host_conflict:` when an `OVREyeGaze` sits on an `OVRCameraRig` eye anchor.
+
+**`eye_tracking` block** (all observations taken at manifest checkpoints; unknown is the string `"unknown"`, never a default `false`):
+
+| Field | Meaning |
+|---|---|
+| `runtime_path`, `permission_applicable` | `windows_editor_openxr` / `mac_editor` / `android_standalone` / `player_*`; the Android runtime permission exists only on `android_standalone`. An Editor/Link result says nothing about a standalone build. |
+| `lifecycle_state` | `idle, not_applicable, waiting_for_xr, checking_capability, requesting_permission, waiting_for_permission, starting, running, start_failed, permission_denied, unsupported, tracking_unavailable, stopped` |
+| `permission_state` | `unknown, not_applicable, not_requested, requested, granted, denied, error` (`not_applicable` off-device) |
+| `capability_state` | `unknown, supported, unsupported` (`OVRPlugin.eyeTrackingSupported`; `unsupported` is only declared after `capabilityMaxChecks` = 6 checks with backoff) |
+| `tracking_enabled_state` | `"true"/"false"/"unknown"` from `OVRPlugin.eyeTrackingEnabled` at the checkpoint |
+| `left_component_state`, `right_component_state` | `absent / disabled / enabled` (`OVREyeGaze` disables itself when its start fails) |
+| `startup_attempts / successes / failures`, `last_startup_result` | start attempts of the OVREyeGaze components (not permission dialogs); `last_startup_result` is `none / success / failure` |
+| `permission_requests`, `ignored_late_callbacks`, `capability_checks`, `recovery_episodes`, `resume_retries` | counters; a request is made at most once per episode and never while one is outstanding |
+| `provider_samples`, `provider_*_valid_samples`, `provider_any_valid_samples` | counted ONCE per NEW provider sample (timestamp advanced), independent of the CSV row rate |
+| `first/last_valid_provider_t_abs`, `seconds_since_last_valid_provider` | -1 = never / not running |
+| `rows_valid_combined`, `rows_fallback`, `rows_fallback_not_acquiring`, `rows_left/right_valid` | from `gaze.csv` rows actually written; `rows_fallback_not_acquiring` = fallback rows written while the lifecycle was NOT `running` |
+| `rows_stale_confidence_rejected` | per-eye readings whose confidence passed the threshold but whose provider flag said invalid (the SDK leaves `OVREyeGaze.Confidence` untouched on invalid samples) - recorded as invalid |
+| `rows_host_conflict_blocked`, `gaze_host_conflict` | readings suppressed because an `OVREyeGaze` is on an `OVRCameraRig` eye anchor (the rig overwrites that transform every frame) |
+| `first/last_valid_row_t_abs`, `longest_no_valid_eye_s` | first/last row with a valid eye; longest stretch without one inside a capture epoch |
+| `transitions[]` | bounded log (96, the first kept): `{t_abs, event_name, from, to, reason, permission_state, capability_state, tracking_enabled}` - the state AT each transition (`begin, xr_ready, permission_request, permission_result, start_success, start_failure, retries_exhausted, first_valid_provider_sample, tracking_lost, tracking_unavailable, tracking_resumed, application_paused/resumed, resume_recheck, manual_retry, shutdown`) |
+
+**`gaze.csv` columns 67-69** (appended): `eye_tracking_state` (lifecycle state at the sample; blank without a lifecycle), `left_provider_valid` / `right_provider_valid` (`1/0` = the provider's own per-eye `IsValid` at the sample; **blank** when no provider probe was available, never a guessed 0).
+`left_valid` / `right_valid` / `combined_valid` now require `confidence >= minConfidenceForValid` AND, when the probe is available, the provider flag. A head-forward fallback row is still `gaze_ray_source = head_fallback`, `ray_is_eye_gaze = 0`, `combined_valid = 0`, with blank eye vectors - no eye vector is ever fabricated.
+
+**Sampling-rate diagnosis** (`rate_gaze`, `rate_trajectory`, `frame_timing`): `observed_hz` is measured from the rows' own `t_abs` and is never assumed equal to the nominal rate. `limit_diagnosis`: `nominal_achieved` (>= 90 % of nominal), `frame_rate_limited` (one sample per frame and the frame rate itself is below nominal - a coroutine cannot sample more often than frames are produced),
+`scheduling_or_io_limited` (below both nominal and the frame rate: blocked work, hitches or a scheduling defect), `insufficient_samples`. `frame_mean_hz` is measured only while a capture window is open. `unexpected_gaps` keeps its definition (interval > max(3 x nominal interval, 0.1 s)); `gaps_frame_limited` is the subset whose sampling frame lasted at least half the interval.
+`scheduler_ticks / scheduler_skipped_ticks / scheduler_max_lateness_s`: the loops now follow an absolute deadline grid (no per-sample drift below nominal); missed ticks are only counted - no catch-up samples are produced.

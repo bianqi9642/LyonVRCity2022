@@ -19,7 +19,11 @@ using System.Globalization;
 public struct FaceReading
 {
     public bool Queried;                 // a face-expression source was read at all (false = no component / no seam)
-    public bool ExpressionsValid;        // OVRFaceExpressions.ValidExpressions (GetFaceState2 succeeded AND Status.IsValid)
+    public bool Started;                 // schema v17: OVRPlugin.faceTracking2Enabled read in THIS frame (not a <=1 s old cache). Seams that leave it false are treated as started.
+    public bool ApiOk;                   // schema v17: GetFaceState2 returned a state in this frame (says nothing about Status.IsValid)
+    public string DataSource;            // schema v17: "visual" | "audio" | "" of THIS frame's state (never of an older probe); null/"" = unknown
+    public double ProviderTime;          // schema v17: FaceState.Time of this frame's state (OVRPlugin clock, NOT CaptureClock.TAbs); 0 = unknown
+    public bool ExpressionsValid;        // GetFaceState2 succeeded AND Status.IsValid (the OVRFaceExpressions.ValidExpressions rule, evaluated on the same state the weights come from)
     public bool EyeFollowingValid;       // OVRFaceExpressions.EyeFollowingBlendshapesValid
     public float ClosedL, ClosedR;       // raw FaceExpression.EyesClosedL / R as delivered by the SDK
     public float LookDownL, LookDownR;   // FaceExpression.EyesLookDownL / R (meaningful only when EyeFollowingValid)
@@ -62,6 +66,77 @@ public static class FaceClosure
         float add = r.EyeFollowingValid ? Math.Min(r.LookDownL, r.LookDownR) : 0f;
         left = r.ClosedL + add; right = r.ClosedR + add;
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------- startup readiness (schema v17)
+
+/// <summary>What must be true before the first formal gaze row can carry a visual eyelid measurement. Every flag is read live (no cached probe).</summary>
+public struct FaceReadinessFacts
+{
+    public bool OvrInit, Supported, PermissionGranted, ComponentCreated, ComponentEnabled, Started, ApiOk, StatusValid, EyeClosureAvailable;
+    public string DataSource;   // "visual" | "audio" | "" (unknown)
+}
+
+public enum FaceReadinessStage
+{
+    NoRuntime, Unsupported, PermissionNotGranted, ComponentMissing, ComponentDisabled, NotStarted, ApiNotResponding, FrameInvalid, AudioOnlySource, DataSourceUnknown, EyeClosureUnavailable, Ready
+}
+
+public static class FaceReadiness
+{
+    /// <summary>The FIRST unmet requirement, in the order a start-up goes through them. "A component exists" is the weakest stage, never sufficient: Ready needs a valid Visual frame with eyelid weights.</summary>
+    public static FaceReadinessStage Evaluate(in FaceReadinessFacts f)
+    {
+        if (!f.OvrInit) return FaceReadinessStage.NoRuntime;
+        if (!f.Supported) return FaceReadinessStage.Unsupported;
+        if (!f.PermissionGranted) return FaceReadinessStage.PermissionNotGranted;
+        if (!f.ComponentCreated) return FaceReadinessStage.ComponentMissing;
+        if (!f.ComponentEnabled) return FaceReadinessStage.ComponentDisabled;
+        if (!f.Started) return FaceReadinessStage.NotStarted;
+        if (!f.ApiOk) return FaceReadinessStage.ApiNotResponding;
+        if (!f.StatusValid) return FaceReadinessStage.FrameInvalid;
+        if (f.DataSource == "audio") return FaceReadinessStage.AudioOnlySource;
+        if (f.DataSource != "visual") return FaceReadinessStage.DataSourceUnknown;
+        if (!f.EyeClosureAvailable) return FaceReadinessStage.EyeClosureUnavailable;
+        return FaceReadinessStage.Ready;
+    }
+
+    public static string Name(FaceReadinessStage s)
+    {
+        switch (s)
+        {
+            case FaceReadinessStage.NoRuntime: return "no_runtime";
+            case FaceReadinessStage.Unsupported: return "unsupported";
+            case FaceReadinessStage.PermissionNotGranted: return "permission_not_granted";
+            case FaceReadinessStage.ComponentMissing: return "component_missing";
+            case FaceReadinessStage.ComponentDisabled: return "component_disabled";
+            case FaceReadinessStage.NotStarted: return "not_started";
+            case FaceReadinessStage.ApiNotResponding: return "api_not_responding";
+            case FaceReadinessStage.FrameInvalid: return "frame_invalid";
+            case FaceReadinessStage.AudioOnlySource: return "audio_only_source";
+            case FaceReadinessStage.DataSourceUnknown: return "data_source_unknown";
+            case FaceReadinessStage.EyeClosureUnavailable: return "eye_closure_unavailable";
+            default: return "ready";
+        }
+    }
+
+    /// <summary>Stages that waiting cannot change (the runtime is absent or reports no support): the gate gives up at once instead of burning its timeout.</summary>
+    public static bool IsPermanent(FaceReadinessStage s) => s == FaceReadinessStage.NoRuntime || s == FaceReadinessStage.Unsupported;
+}
+
+/// <summary>Outcome of the bounded start-up wait (manifest eye_tracking.blink.startup_*). Nothing here is a gaze or eyelid value.</summary>
+[Serializable]
+public sealed class FaceStartupInfo
+{
+    public bool attempted;               // the start-up gate ran for this session
+    public bool ready;                   // a valid Visual frame with eyelid weights was observed before the first formal gaze row
+    public string stage = "not_attempted";   // the stage reached (FaceReadiness.Name): "ready" or the first unmet requirement when the wait ended
+    public string failure_reason = "";   // "" when ready; else the unmet requirement and why the wait ended (timeout | permanent)
+    public double requested_t_abs = -1, ready_t_abs = -1, wait_s = -1, max_wait_s = -1;
+    public long frames_polled;
+    public string data_source_at_ready = "";
+    public string start_point = "";      // preflight | after_start_click
+    public bool component_created_by_gate;
 }
 
 /// <summary>The v16 gaze.csv face columns, appended after origin_fallback_reason. Blank = not measured; 0.0000 = a valid zero.</summary>

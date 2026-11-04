@@ -362,12 +362,38 @@ public sealed class AudioClockMap
     public readonly List<Segment> Segments = new List<Segment>();
     int _nextAnchorId;
     public int AnchorCount { get; private set; }
+    /// <summary>
+    /// True after Freeze(): the map is final. No anchor or segment can be added any more, every segment holds the fit of ALL its anchors, and TimeOf / TimeOfIn are pure functions of
+    /// the sample index. Index timestamps are written only from a frozen map, so two rows sharing a sample boundary can never see two different mappings.
+    /// </summary>
+    public bool Frozen { get; private set; }
 
     public AudioClockMap(double nominalRate) { NominalRate = nominalRate; }
+
+    /// <summary>Stops anchor collection and fits every segment once from its complete anchor list (the same estimator the live map used). Idempotent.</summary>
+    public void Freeze()
+    {
+        if (Frozen) return;
+        for (int i = 0; i < Segments.Count; i++) Fit(Segments[i]);
+        Frozen = true;
+    }
+
+    /// <summary>The segment with this id, or null.</summary>
+    public Segment SegmentById(int id) => id >= 0 && id < Segments.Count ? Segments[id] : null;
+
+    /// <summary>t_abs of the START of frame sampleIndex under the mapping of ONE named segment (NaN when that segment has no fit). Used for chunk boundaries, so the exclusive end of the last chunk of a
+    /// segment is mapped by the same function as its own start - never by the next segment that happens to begin at that sample.</summary>
+    public double TimeOfIn(int segmentId, long sampleIndex)
+    {
+        var s = SegmentById(segmentId);
+        if (s == null || !s.fitted) return double.NaN;
+        return s.t0 + (sampleIndex - s.s0) * s.secondsPerSample;
+    }
 
     /// <summary>Starts a new continuous segment whose first frame has index firstSample (after an interruption / overrun). Returns the segment.</summary>
     public Segment BeginSegment(long firstSample)
     {
+        if (Frozen) throw new InvalidOperationException("the audio clock map is frozen");
         var s = new Segment { id = Segments.Count, firstSample = firstSample, lastSample = firstSample, nominalRate = NominalRate };
         Segments.Add(s); return s;
     }
@@ -377,13 +403,14 @@ public sealed class AudioClockMap
     /// <summary>Adds an anchor to the current segment: the frame BOUNDARY sampleIndex (the start of frame sampleIndex) was reached at tAbs.</summary>
     public Anchor AddAnchor(long sampleIndex, double tAbs, int micPosition, double dspTime)
     {
+        if (Frozen) throw new InvalidOperationException("the audio clock map is frozen");
         var seg = Current ?? BeginSegment(sampleIndex);
         var a = new Anchor { id = _nextAnchorId++, segment = seg.id, sampleIndex = sampleIndex, tAbs = tAbs, micPosition = micPosition, dspTime = dspTime };
         seg.anchors.Add(a); seg.lastSample = Math.Max(seg.lastSample, sampleIndex); AnchorCount++;
         Fit(seg); return a;
     }
 
-    public void ExtendSegment(long lastSample) { var s = Current; if (s != null) s.lastSample = Math.Max(s.lastSample, lastSample); }
+    public void ExtendSegment(long lastSample) { if (Frozen) return; var s = Current; if (s != null) s.lastSample = Math.Max(s.lastSample, lastSample); }
 
     void Fit(Segment s)
     {

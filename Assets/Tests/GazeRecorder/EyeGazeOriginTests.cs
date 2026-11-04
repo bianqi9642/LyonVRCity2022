@@ -162,17 +162,15 @@ public partial class NpcLifecycleTests
         yield return new WaitForSecondsRealtime(0.3f);
         Call(rec, "StopRecording");
         var csv = Csv.Load(path);
-        const int v16 = 10;   // the schema-v16 face columns are appended after origin_fallback_reason; every older column keeps its position relative to the v14 tail
-        Assert.AreEqual("gaze_origin_source", csv.Header[csv.Header.Count - v16 - 4 - 60], "the v10 column sits right after the v9 columns; the three v11 blink columns and the 23 v13 view-frame and 37 v14 pipeline columns follow");
-        Assert.AreEqual("right_provider_valid", csv.Header[csv.Header.Count - v16 - 5 - 60], "existing trailing columns did not move");
-        Assert.AreEqual("blink_state", csv.Header[csv.Header.Count - v16 - 1 - 60]); Assert.AreEqual("origin_fallback_reason", csv.Header[csv.Header.Count - v16 - 1]); Assert.AreEqual("right_eye_height_above_ground", csv.Header[csv.Header.Count - v16 - 38]);
-        Assert.AreEqual("face_state", csv.Header[csv.Header.Count - v16]); Assert.AreEqual("face_data_source", csv.Header[csv.Header.Count - 1]);
+        // schema v17: gaze_origin_source is one of the four compact provenance columns of gaze.csv (combined_valid, gaze_ray_source, gaze_origin_source, eye_tracking_state); the verbose fallback reason lives in gaze_diagnostics.csv
+        Assert.IsTrue(csv.MergedV17); Assert.AreEqual("gaze_origin_source", csv.PrimaryHeader[10]); Assert.AreEqual("origin_fallback_reason", csv.DiagnosticHeader[40]); Assert.AreEqual("blink_state", csv.DiagnosticHeader[78]);
+        Assert.AreEqual("eyes_closed_left_recovered", csv.PrimaryHeader[58]); Assert.AreEqual("face_closure_valid", csv.PrimaryHeader[60]);
         Assert.Greater(csv.Rows.Count, 2);
         foreach (var row in csv.Rows)
         {
             Assert.AreEqual(csv.Header.Count, row.Count, "header / row lockstep");
             Assert.AreEqual("provider_unchecked", csv.Get(row, "gaze_origin_source"), "injected samples have no rig anchor: the provider origin is passed through and says so");
         }
-        Assert.AreEqual(16, GetStatic<int>(T("CaptureConstants"), "SchemaVersion"));
+        Assert.AreEqual(17, GetStatic<int>(T("CaptureConstants"), "SchemaVersion"));
     }
 }

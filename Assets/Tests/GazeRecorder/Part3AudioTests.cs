@@ -215,18 +215,107 @@ public class Part3AudioPureTests
         Assert.AreEqual(100.0 - 2400.0 / 48000.0, (double)CallStatic(Map, "FirstSampleTime", 100.0, 2400, 48000), 1e-12);
     }
 
+    // ---- index writer helpers shared by the checker tests ----
+    const string IdxHdr = "session_id,part_id,audio_recording_id,chunk_index,sample_index_start,sample_index_end_exclusive,t_abs_start_est,t_abs_end_est,sample_rate_hz,channels,frames_written,duration_sec,microphone_position,clock_anchor_id,dropped_frames,buffer_overrun_count,write_status,segment";
+    static string D6(double v) => v.ToString("F6", CultureInfo.InvariantCulture);
+    static string IRow(int idx, long s, long e, double t0, double t1, string status = "ok", int seg = 0) => $"S,Part3,R,{idx},{s},{e},{D6(t0)},{D6(t1)},48000,1,{e - s},0,0,0,0,0,{status},{seg}";
+    string WriteIdx(params string[] rows) { string p = Path.Combine(_dir, Guid.NewGuid().ToString("N") + ".csv"); File.WriteAllLines(p, new[] { IdxHdr }.Concat(rows)); return p; }
+    object Chk(string p, long frames, string anchors = null) => CallStatic(IdxCheck, "Check", p, frames, anchors);
+
     [Test]
     public void IndexCheck_AcceptsAContiguousIndex_AndRejectsGapsOverlapsAndFrameMismatches()
     {
-        string hdr = "session_id,part_id,audio_recording_id,chunk_index,sample_index_start,sample_index_end_exclusive,t_abs_start_est,t_abs_end_est,sample_rate_hz,channels,frames_written,duration_sec,microphone_position,clock_anchor_id,dropped_frames,buffer_overrun_count,write_status,segment";
-        string Row(long s, long e, double t0, double t1) => $"S,Part3,R,0,{s},{e},{t0.ToString(CultureInfo.InvariantCulture)},{t1.ToString(CultureInfo.InvariantCulture)},48000,1,{e - s},0,0,0,0,0,ok,0";
-        string Write(params string[] rows) { string p = Path.Combine(_dir, Guid.NewGuid().ToString("N") + ".csv"); File.WriteAllLines(p, new[] { hdr }.Concat(rows)); return p; }
-        object Chk(string p, long frames) => CallStatic(IdxCheck, "Check", p, frames);
-        Assert.IsTrue(Get<bool>(Chk(Write(Row(0, 100, 1, 2), Row(100, 250, 2, 3)), 250), "consistent"));
-        Assert.IsFalse(Get<bool>(Chk(Write(Row(0, 100, 1, 2), Row(120, 250, 2, 3)), 250), "consistent"), "a sample-index gap");
-        Assert.IsFalse(Get<bool>(Chk(Write(Row(0, 100, 1, 2), Row(90, 250, 2, 3)), 250), "consistent"), "an overlap");
-        Assert.IsFalse(Get<bool>(Chk(Write(Row(0, 100, 1, 2), Row(100, 250, 1.5, 3)), 250), "consistent"), "time going backwards");
-        var bad = Chk(Write(Row(0, 100, 1, 2)), 250); Assert.IsFalse(Get<bool>(bad, "consistent")); StringAssert.Contains("differ_from_wav", Get<string>(bad, "problem"));
+        Assert.IsTrue(Get<bool>(Chk(WriteIdx(IRow(0, 0, 100, 1, 2), IRow(1, 100, 250, 2, 3)), 250), "consistent"));
+        Assert.IsFalse(Get<bool>(Chk(WriteIdx(IRow(0, 0, 100, 1, 2), IRow(1, 120, 250, 2, 3)), 250), "consistent"), "a sample-index gap");
+        Assert.IsFalse(Get<bool>(Chk(WriteIdx(IRow(0, 0, 100, 1, 2), IRow(1, 90, 250, 2, 3)), 250), "consistent"), "a sample-index overlap");
+        Assert.IsFalse(Get<bool>(Chk(WriteIdx(IRow(0, 0, 100, 1, 2), IRow(1, 100, 250, 1.5, 3)), 250), "consistent"), "time going backwards");
+        var bad = Chk(WriteIdx(IRow(0, 0, 100, 1, 2)), 250); Assert.IsFalse(Get<bool>(bad, "consistent")); StringAssert.Contains("differ_from_wav", Get<string>(bad, "problem"));
+    }
+
+    [Test]
+    public void IndexCheck_ClassifiesDiscrepancies_FloatFormattingIsAccepted_ButAnyRealOverlapIsAMappingDefect_NotUncertainty()
+    {
+        // 1 microsecond difference = formatting of two 6-decimal numbers: accepted, classified float_representation
+        var f = Chk(WriteIdx(IRow(0, 0, 100, 1, 2.000001), IRow(1, 100, 250, 2.000000, 3)), 250);
+        Assert.IsTrue(Get<bool>(f, "consistent")); Assert.AreEqual("float_representation", Get<string>(f, "classification"));
+        // the audited defect: adjacent chunks whose shared boundary was mapped twice (a 4.13 ms overlap) - this MUST fail now, whatever the clock uncertainty is
+        var o = Chk(WriteIdx(IRow(0, 0, 100, 1, 2.00413), IRow(1, 100, 250, 2.0, 3)), 250);
+        Assert.IsFalse(Get<bool>(o, "consistent")); StringAssert.Contains("time_overlap_at_row_2", Get<string>(o, "problem")); Assert.AreEqual("timestamp_mapping_defect", Get<string>(o, "classification"));
+        // a time gap between contiguous chunks of one segment is equally a defect (it would mean two mappings)
+        var g = Chk(WriteIdx(IRow(0, 0, 100, 1, 2.0), IRow(1, 100, 250, 2.004, 3)), 250);
+        Assert.IsFalse(Get<bool>(g, "consistent")); StringAssert.Contains("time_gap_at_row_2", Get<string>(g, "problem"));
+        // a reversed interval inside one row
+        Assert.IsFalse(Get<bool>(Chk(WriteIdx(IRow(0, 0, 100, 2, 1)), 100), "consistent"));
+        // chunk indices must be consecutive
+        var ci = Chk(WriteIdx(IRow(0, 0, 100, 1, 2), IRow(2, 100, 250, 2, 3)), 250); StringAssert.Contains("chunk_index_not_consecutive", Get<string>(ci, "problem"));
+        // a segment change needs an explicit gap row; with the gap row the discontinuity is accepted and classified as such
+        var noGap = Chk(WriteIdx(IRow(0, 0, 100, 1, 2), IRow(1, 100, 250, 2, 3, "ok", 1)), 250); StringAssert.Contains("segment_change_without_gap_row", Get<string>(noGap, "problem"));
+        var withGap = Chk(WriteIdx(IRow(0, 0, 100, 1, 2), IRow(1, 100, 100, 2, 5, "gap_interruption", 1), IRow(2, 100, 250, 5, 6, "ok", 1)), 250);
+        Assert.IsTrue(Get<bool>(withGap, "consistent"), Get<string>(withGap, "problem")); Assert.AreEqual("actual_discontinuity", Get<string>(withGap, "classification")); Assert.AreEqual(1, Get<int>(withGap, "gapRows"));
+        // a gap row that contains samples, or a non-gap row that is empty, is wrong
+        Assert.IsFalse(Get<bool>(Chk(WriteIdx(IRow(0, 0, 100, 1, 2), IRow(1, 100, 150, 2, 3, "gap_overrun", 1)), 150), "consistent"));
+        Assert.IsFalse(Get<bool>(Chk(WriteIdx(IRow(0, 0, 100, 1, 2), IRow(1, 100, 100, 2, 2)), 100), "consistent"));
+    }
+
+    [Test]
+    public void ClockMap_Freeze_FinalisesTheFit_RefusesLateAnchors_AndGivesAdjacentChunksTheSameBoundaryTime()
+    {
+        double drift = 1.0 - 90e-6, off = 500.0; var rnd = new System.Random(3);
+        var live = Activator.CreateInstance(Map, 48000.0); Call(live, "BeginSegment", 0L);
+        var provisional = new List<double>();   // what the live map said about sample 48000 each time a new anchor arrived
+        for (int i = 0; i <= 30; i++)
+        {
+            long smp = i * 24000L; double t = off + smp / (48000.0 * drift) + (rnd.NextDouble() - 0.5) * 0.010;
+            Call(live, "AddAnchor", smp, t, 0, 0.0);
+            if (i >= 8) provisional.Add((double)Call(live, "TimeOf", 48000L));
+        }
+        Assert.Greater(provisional.Max() - provisional.Min(), 1e-4, "the live map is a moving target: the same boundary gets different times while anchors keep arriving (the audited defect)");
+        Assert.IsFalse(Get<bool>(live, "Frozen")); Call(live, "Freeze"); Assert.IsTrue(Get<bool>(live, "Frozen"));
+        double endOfChunk1 = (double)Call(live, "TimeOfIn", 0, 48000L), startOfChunk2 = (double)Call(live, "TimeOfIn", 0, 48000L);
+        Assert.AreEqual(endOfChunk1, startOfChunk2, "one frozen function: identical for the exclusive end of chunk 1 and the start of chunk 2");
+        Assert.AreEqual(endOfChunk1, (double)Call(live, "TimeOf", 48000L), "TimeOf and TimeOfIn agree inside a segment");
+        var ex = Assert.Throws<System.Reflection.TargetInvocationException>(() => Call(live, "AddAnchor", 99L, 1.0, 0, 0.0)); Assert.IsInstanceOf<InvalidOperationException>(ex.InnerException);
+        Assert.Throws<System.Reflection.TargetInvocationException>(() => Call(live, "BeginSegment", 99L));
+        Assert.AreEqual(-90.0, Get<double>(Get<object>(live, "Current"), "DriftPpm"), 25.0, "the final fit recovers the injected negative drift to within what 10 ms of anchor jitter over 15 s allows");
+    }
+
+    [Test]
+    public void ClockMap_InjectedPositiveAndNegativeDrift_AreEstimatedPerSegment_AndMultiSegmentBoundariesAreExplicit()
+    {
+        foreach (double ppm in new[] { 150.0, -150.0 })
+        {
+            var m = Activator.CreateInstance(Map, 48000.0); Call(m, "BeginSegment", 0L);
+            for (int i = 0; i <= 40; i++) { long s = i * 48000L; Call(m, "AddAnchor", s, 10.0 + s / (48000.0 * (1.0 + ppm * 1e-6)), 0, 0.0); }
+            Call(m, "Freeze"); Assert.AreEqual(ppm, Get<double>(Get<object>(m, "Current"), "DriftPpm"), 1.0, "noise-free anchors: the drift is recovered exactly");
+        }
+        // two segments with different offsets and rates: each chunk end is mapped inside its own segment, the time jump is only in the gap
+        var mm = Activator.CreateInstance(Map, 48000.0); Call(mm, "BeginSegment", 0L);
+        for (int i = 0; i <= 20; i++) Call(mm, "AddAnchor", i * 48000L, 100.0 + i * 1.0000, 0, 0.0);
+        Call(mm, "BeginSegment", 960000L);
+        for (int i = 0; i <= 20; i++) Call(mm, "AddAnchor", 960000L + i * 48000L, 130.0 + i * 1.0001, 0, 0.0);
+        Call(mm, "Freeze");
+        Assert.AreEqual(120.0, (double)Call(mm, "TimeOfIn", 0, 960000L), 1e-6, "the exclusive end of the last chunk of segment 0 is mapped by segment 0");
+        Assert.AreEqual(130.0, (double)Call(mm, "TimeOfIn", 1, 960000L), 1e-6, "the first chunk of segment 1 is mapped by segment 1: the 10 s difference is the explicit gap");
+        Assert.AreEqual(2, Get<System.Collections.IList>(mm, "Segments").Count);
+    }
+
+    [Test]
+    public void IndexCheck_ReproducesEveryChunkTimeFromThePersistedAnchors_AndDetectsATamperedTime()
+    {
+        var m = Activator.CreateInstance(Map, 48000.0); Call(m, "BeginSegment", 0L); var rnd = new System.Random(11);
+        var anchors = new List<string> { "session_id,audio_recording_id,clock_anchor_id,segment,sample_index,t_abs,microphone_buffer_position,sample_rate_hz,dsp_time" };
+        for (int i = 0; i <= 12; i++) { long s = i * 48000L; double t = 50.0 + s / (48000.0 * 1.0001) + (rnd.NextDouble() - 0.5) * 0.006; Call(m, "AddAnchor", s, t, 0, 0.0); anchors.Add($"S,R,{i},0,{s},{t.ToString("F9", CultureInfo.InvariantCulture)},0,48000,0"); }
+        Call(m, "Freeze");
+        string ap = Path.Combine(_dir, "anch.csv"); File.WriteAllLines(ap, anchors);
+        var rows = new List<string>(); for (int c = 0; c < 12; c++) rows.Add(IRow(c, c * 48000L, (c + 1) * 48000L, (double)Call(m, "TimeOfIn", 0, c * 48000L), (double)Call(m, "TimeOfIn", 0, (c + 1) * 48000L)));
+        var ok = Chk(WriteIdx(rows.ToArray()), 12 * 48000L, ap); Assert.IsTrue(Get<bool>(ok, "consistent"), Get<string>(ok, "problem")); Assert.Less(Get<double>(ok, "maxReproErrorSec"), 2e-6);
+        // shift every time by 3 ms (still perfectly chained rows): the index is internally consistent but is NOT the frozen mapping of the persisted anchors
+        var shifted = new List<string>(); for (int c = 0; c < 12; c++) shifted.Add(IRow(c, c * 48000L, (c + 1) * 48000L, (double)Call(m, "TimeOfIn", 0, c * 48000L) + 0.003, (double)Call(m, "TimeOfIn", 0, (c + 1) * 48000L) + 0.003));
+        var bad = Chk(WriteIdx(shifted.ToArray()), 12 * 48000L, ap); Assert.IsFalse(Get<bool>(bad, "consistent")); StringAssert.Contains("not_reproducible_from_anchors", Get<string>(bad, "problem"));
+        // a missing first anchor (the audited defect) breaks the id sequence and is refused
+        var noFirst = new List<string>(anchors); noFirst.RemoveAt(1); string ap2 = Path.Combine(_dir, "anch2.csv"); File.WriteAllLines(ap2, noFirst);
+        var nf = Chk(WriteIdx(rows.ToArray()), 12 * 48000L, ap2); Assert.IsFalse(Get<bool>(nf, "consistent")); StringAssert.Contains("anchor_ids_not_consecutive_from_0", Get<string>(nf, "problem"));
+        Assert.IsFalse(Get<bool>(Chk(WriteIdx(rows.ToArray()), 12 * 48000L, Path.Combine(_dir, "nope.csv")), "consistent"), "missing anchors file");
     }
 }
 
@@ -236,10 +325,10 @@ public class Part3AudioRecorderTests
 {
     sealed class FakeMic
     {
-        public double clock = 1000.0; public int rate = 48000, channels = 1, ring = 48000 * 3;
+        public double clock = 1000.0, driftPpm = 0; public int rate = 48000, channels = 1, ring = 48000 * 3;
         public double startedAt = -1; public double startDelay = 0.05; public bool failStart, running, stalled, permissionOk = true, requestResult = true; public string[] devices = { "Fake Headset Mic" };
         public int startCalls, endCalls; public double stalledAt = -1; public long frozenProduced = -1;
-        public long Produced() { if (!running) return 0; if (stalled) { if (frozenProduced < 0) frozenProduced = Math.Max(0L, (long)((stalledAt - startedAt - startDelay) * rate)); return frozenProduced; } return Math.Max(0L, (long)((clock - startedAt - startDelay) * rate)); }
+        public long Produced() { if (!running) return 0; if (stalled) { if (frozenProduced < 0) frozenProduced = Math.Max(0L, (long)((stalledAt - startedAt - startDelay) * rate)); return frozenProduced; } return Math.Max(0L, (long)((clock - startedAt - startDelay) * rate * (1.0 + driftPpm * 1e-6))); }
         public static float At(long abs) => ((abs % 977) - 488) / 1000f;
         public object Api()
         {
@@ -350,6 +439,72 @@ public class Part3AudioRecorderTests
         long truth = (long)Math.Round((tq - (_m.startedAt + _m.startDelay)) * 48000);
         Assert.AreEqual(truth, expected, 480, "the fitted mapping lands within 10 ms of the device's real frame for an arbitrary t_abs");
         Assert.Less(Get<double>(man, "timing_uncertainty_ms"), 30.0); StringAssert.Contains("input latency", Get<string>(man, "timing_uncertainty_note"));
+    }
+
+    List<string[]> AnchorRows() { var l = File.ReadAllLines(Path.Combine(AudioDir, "audio_anchors.csv")); return l.Skip(1).Where(x => x.Length > 0).Select(x => x.Split(',')).ToList(); }
+
+    [Test]
+    public void FrozenIndex_EveryAdjacentRowChainsExactly_OnOneMapping_AndTheStopBoundaryIsUnchanged()
+    {
+        Ready(); StartOk(); Step(12.0); double tEnd = _m.clock;
+        Assert.IsTrue((bool)Call(_rec, "StopAtBoundary", tEnd, "part3_trial_end"));
+        var rows = Index(); Assert.Greater(rows.Count, 10);
+        for (int i = 1; i < rows.Count; i++) Assert.AreEqual(rows[i - 1][7], rows[i][6], "row " + i + ": the exclusive end of chunk n and the start of chunk n+1 are the same string (same sample, same frozen mapping)");
+        for (int i = 0; i < rows.Count; i++) Assert.AreEqual(i.ToString(), rows[i][3], "chunk indices are consecutive");
+        Assert.IsTrue(Get<bool>(Man, "index_consistent"), Get<string>(Man, "index_validation"));
+        Assert.AreEqual("final_frozen_affine_per_segment_v1", Get<string>(Man, "time_mapping")); Assert.IsTrue(Get<bool>(Man, "time_mapping_frozen"));
+        Assert.AreEqual(0.0, Get<double>(Man, "index_max_boundary_mismatch_s"), 1e-12); Assert.AreEqual("none", Get<string>(Man, "index_timestamp_classification"));
+        // the audio stop boundary is untouched by the mapping work: end_t_abs is the requested boundary and the file ends there to within the drain granularity
+        Assert.AreEqual(tEnd, Get<double>(Man, "end_t_abs")); Assert.AreEqual(tEnd, double.Parse(rows.Last()[7], CultureInfo.InvariantCulture), 0.03);
+        Assert.IsFalse(File.Exists(Path.Combine(AudioDir, "audio_index.csv.partial")), "the journal is superseded by the final index once it validated");
+        Assert.AreEqual("Closed", StateName);
+    }
+
+    [Test]
+    public void FirstAnchor_IsPersisted_TheCountsAgree_AndEveryRowIsReproducibleFromTheAnchorsFile()
+    {
+        Ready(); StartOk(); Step(10.0); Call(_rec, "StopAtBoundary", _m.clock, "end");
+        var an = AnchorRows(); Assert.Greater(an.Count, 5);
+        Assert.AreEqual("0", an[0][2], "the first anchor has id 0 and is in the file"); Assert.AreEqual("0", an[0][4], "...at sample index 0");
+        for (int i = 0; i < an.Count; i++) Assert.AreEqual(i.ToString(), an[i][2], "anchor ids are consecutive from 0: nothing is held back in memory");
+        Assert.AreEqual(an.Count, Get<int>(Man, "clock_anchor_count"), "the manifest count is the number of persisted rows");
+        var meta = JObject.Parse(File.ReadAllText(Path.Combine(AudioDir, "audio_metadata.json"))); Assert.AreEqual(an.Count, (int)meta["clock_anchor_count"], "audio_metadata.json agrees with the anchors file");
+        int segAnchors = ((JArray)meta["segments"]).Sum(x => (int)x["anchors"]); Assert.AreEqual(an.Count, segAnchors, "the per-segment fit used exactly the persisted anchors");
+        var chk = CallStatic(T("AudioIndexCheck"), "Check", Path.Combine(AudioDir, "audio_index.csv"), Get<long>(Man, "total_frames"), Path.Combine(AudioDir, "audio_anchors.csv"));
+        Assert.IsTrue(Get<bool>(chk, "consistent"), Get<string>(chk, "problem")); Assert.Less(Get<double>(chk, "maxReproErrorSec"), 2e-6);
+        Assert.AreEqual(Get<string>(Man, "failure_reason"), (string)meta["failure_reason"], "metadata and manifest tell the same story");
+    }
+
+    [Test]
+    public void ClockDrift_Positive_And_Negative_AreEstimated_AndNeverProduceAnOverlap([Values(200.0, -200.0)] double ppm)
+    {
+        _m.driftPpm = ppm;   // the microphone's sample clock runs fast / slow relative to CaptureClock
+        Ready(); StartOk(); Step(40.0); Call(_rec, "StopAtBoundary", _m.clock, "end");
+        var seg = ((JArray)JObject.Parse(JsonUtility.ToJson(Man))["segments"])[0];
+        Assert.AreEqual(ppm, (double)seg["drift_ppm"], 40.0, "the final fit recovers the injected drift (anchors have a few ms of read granularity)");
+        var rows = Index(); for (int i = 1; i < rows.Count; i++) Assert.AreEqual(rows[i - 1][7], rows[i][6], "no overlap and no hole, whatever the drift");
+        Assert.IsTrue(Get<bool>(Man, "index_consistent"), Get<string>(Man, "index_validation")); Assert.AreEqual("Closed", StateName);
+    }
+
+    [Test]
+    public void AnchorPersistenceFailure_IsAGenuineFinalizationFailure_NotHidden()
+    {
+        Ready(); StartOk(); Step(4.0);
+        Set(_rec, "_anchorRowsPersisted", Get<long>(_rec, "_anchorRowsPersisted") - 1);   // one anchor never reached the file
+        Assert.IsFalse((bool)Call(_rec, "StopAtBoundary", _m.clock, "end"));
+        Assert.AreEqual("FinalizationFailed", StateName); StringAssert.Contains("anchors_persisted_", Get<string>(_rec, "FailureReason"));
+        Assert.IsTrue(Get<bool>(Man, "finalization_success"), "the WAV itself is valid; only the anchor persistence failed"); Assert.AreEqual("incomplete", Get<string>(Man, "status"));
+        CollectionAssert.Contains(_events.Select(e => e.type).ToList(), "audio_recording_failed");
+    }
+
+    [Test]
+    public void GenuineTimeReversalInTheIndexFile_IsDetectedByTheChecker_AfterAValidRecording()
+    {
+        Ready(); StartOk(); Step(6.0); Call(_rec, "StopAtBoundary", _m.clock, "end");
+        string path = Path.Combine(AudioDir, "audio_index.csv"); var lines = File.ReadAllLines(path).ToList(); var f = lines[3].Split(','); f[6] = (double.Parse(f[6], CultureInfo.InvariantCulture) - 0.004).ToString("F6", CultureInfo.InvariantCulture); lines[3] = string.Join(",", f);
+        string tampered = Path.Combine(_dir, "tampered_index.csv"); File.WriteAllLines(tampered, lines);
+        var r = CallStatic(T("AudioIndexCheck"), "Check", tampered, Get<long>(Man, "total_frames"), Path.Combine(AudioDir, "audio_anchors.csv"));
+        Assert.IsFalse(Get<bool>(r, "consistent")); Assert.AreEqual("timestamp_mapping_defect", Get<string>(r, "classification"));
     }
 
     [Test]
@@ -593,7 +748,7 @@ public partial class NpcLifecycleTests
 
         Call(rig.dcm, "OnSessionEnded");                                           // End panel confirmed: the existing finalisation
         var m = JObject.Parse(File.ReadAllText(rig.File("session_manifest.json")));
-        Assert.AreEqual(16, (int)m["schema_version"]);
+        Assert.AreEqual(17, (int)m["schema_version"]);
         Assert.AreEqual("Closed", (string)m["capture_lifecycle_state"], "the session closed with the audio stream finalised");
         CollectionAssert.Contains(((JArray)m["capture_streams_closed"]).Select(t => (string)t).ToList(), "audio"); Assert.AreEqual(0, ((JArray)m["capture_streams_failed"]).Count);
         var a = m["audio_capture"]; Assert.AreEqual("completed", (string)a["status"]); Assert.IsTrue((bool)a["finalization_success"]); Assert.IsTrue((bool)a["index_consistent"]);

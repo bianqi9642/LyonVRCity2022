@@ -503,7 +503,7 @@ public partial class NpcLifecycleTests
         Assert.IsTrue(sawBlinkState && sawOpen); Assert.IsTrue(gaze.Rows.Any(r => gaze.Get(r, "eyes_closed_left") != ""), "raw closure weights are recorded");
         var m = ManifestOf(rig);
         Assert.AreEqual("available", (string)m["eye_tracking"]["blink"]["status"]); Assert.AreEqual(1L, (long)m["eye_tracking"]["blink"]["blinks_detected"]);
-        Assert.IsTrue((bool)m["eye_tracking"]["blink"]["absence_of_blink_events_is_evidence_of_no_blinks"]);
+        Assert.IsFalse((bool)m["eye_tracking"]["blink"]["absence_of_blink_events_is_evidence_of_no_blinks"], "schema v17: zero detected blinks is never evidence of no blinks (uncalibrated thresholds, both eyes required)"); StringAssert.Contains("does NOT mean the participant did not blink", (string)m["eye_tracking"]["blink"]["blink_detection_note"]);
     }
 
     public sealed class ClosureHolder

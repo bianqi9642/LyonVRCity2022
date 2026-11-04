@@ -757,4 +757,10 @@ public class BlinkManifest
     public double longest_gap_s = 0;
     public string closure_basis = "eyes_closed_left/right = raw SDK EyesClosedL/R; blink detection uses eyes_closed_*_recovered = raw + min(EyesLookDownL, EyesLookDownR) when EyeFollowingBlendshapesValid, else raw";
     public string audio_source_note = "A valid frame whose data source is Audio only (documented: 'estimate face expressions using audio data only') is not an eyelid measurement: recorded as face_state=audio_only_source with blank closure";
+    // ---- schema v17 ----
+    public bool startup_attempted, startup_ready; public string startup_stage = "not_attempted", startup_failure_reason = "", startup_point = "", startup_data_source_at_ready = "";
+    public double startup_wait_s = -1, startup_max_wait_s = -1, startup_requested_t_abs = -1, startup_ready_t_abs = -1; public long startup_frames_polled; public bool startup_component_created_by_gate;
+    public string blink_detection_status = "uncalibrated_thresholds_not_a_validated_blink_measurement";
+    public string blink_detection_note = "blinks_detected = 0 does NOT mean the participant did not blink: the detector needs BOTH eyes at or above the close threshold and the thresholds are uncalibrated. Use eyes_closed_left/right_recovered (gaze.csv) as the signal; blink_state lives only in gaze_diagnostics.csv.";
+    public string closure_columns = "gaze.csv: eyes_closed_left/right_recovered + face_closure_valid; gaze_diagnostics.csv: raw eyes_closed_left/right, eyes_look_down_left/right, face_state, face_data_source, face_provider_time_s, blink_state";
 }

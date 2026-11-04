@@ -575,3 +575,10 @@ Additive only. `gaze.csv` appends **10** columns after `origin_fallback_reason`;
 | `face_data_source` | `visual` / `audio` from the ≤1 s `GetFaceState2` probe; blank when unknown |
 
 Manifest `eye_tracking.blink` gains: `auto_create_enabled`, `component_auto_created`, `permission_requested`, `start_attempts`, `state_api_probed/ok`, `state_status_valid`, `data_source_last`, `provider_time_last_s`, `face_state_last`, `rows_face_current`, `rows_face_not_current`, `rows_eye_following_valid`, `rows_audio_only_source`, `interruptions`, `recoveries`, `longest_gap_s`, `closure_basis`, `audio_source_note`. Behaviour change: `GazeRecorder` creates `OVRFaceExpressions` at run time when the runtime supports face tracking and none exists (`autoCreateFaceExpressions`, default true), and reads the signal live per row instead of gating on the 1 Hz cached status. Details and the diagnostic procedure: `docs/face_tracking_diagnostic.md`.
+
+## 32. Schema v17: analysis gaze.csv + gaze_diagnostics.csv; frozen audio mapping; terrain layers; face start-up
+
+`gaze.csv` shrinks to 61 columns; the QA / reproduction columns move to the new `gaze_diagnostics.csv` (85 columns, one row per gaze row, keys `session_id`, `frame_index`, `t_abs`). Every v16 column's disposition, the complete v17 data dictionary of both files and the reasons are in `docs/gaze_schema_v17_dictionary.md`;
+the four fixes of the same work package (frozen audio time mapping, terrain collider layers, face tracking start-up, reader compatibility) are in `docs/schema_v17_changes.md`.
+Manifest: `schema_version = 17`; `file_list` gains `gaze_diagnostics.csv`; `eye_tracking.blink` gains `startup_*` and the blink honesty fields (`absence_of_blink_events_is_evidence_of_no_blinks` is always false); `audio_capture` gains `time_mapping`, `time_mapping_frozen`, `index_rows`, `index_max_boundary_mismatch_s`, `index_timestamp_classification`, and `clock_anchor_count` is the number of persisted anchor rows.
+Historical v11-v16 files are never rewritten; read them with `docs/tools/gaze_reader.py`.

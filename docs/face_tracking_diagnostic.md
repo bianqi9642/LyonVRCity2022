@@ -34,3 +34,10 @@ Prerequisites (Quest Link): Quest Pro with eye tracking **and** Natural Facial E
 * Provider timestamp (`FaceState.Time`) is only available from the 1 Hz probe / diagnostic, not per row (`OVRFaceExpressions` keeps it private). `face_sample_frame` is the Unity frame of the read.
 * No blink threshold was calibrated (`blinkCloseThreshold` 0.7 / `blinkOpenThreshold` 0.5 remain uncalibrated defaults).
 * Enabling face tracking makes the runtime process facial data — a data-protection decision for the study.
+
+
+## Update (schema v17): start-up before the first gaze row, live per-row source
+
+The 1.02 s `not_started` gap of the first real v16 session came from creating `OVRFaceExpressions` lazily in the first row and from `face_tracking_started` / `face_data_source` being <= 1 s old probes. v17 creates the component at the start of Part 2 / 3 and waits (bounded, 5 s) for a valid Visual frame before the Start panel;
+each row reads started / valid / source / provider time / weights from ONE live `GetFaceState2` state. See `docs/schema_v17_changes.md` (section C). Raw weights and all face diagnostics are in `gaze_diagnostics.csv`; `gaze.csv` carries `eyes_closed_left/right_recovered` and `face_closure_valid`.
+Open question from the audit (unchanged by this work): in ~20 % of rows `EyesClosedR` equalled `EyesLookDownR` exactly and the left eye's closure stayed far below the right's; whether that is the provider or the headset can only be decided with the controlled closure sequence on hardware.

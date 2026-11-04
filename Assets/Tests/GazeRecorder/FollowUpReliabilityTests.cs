@@ -958,7 +958,7 @@ public partial class NpcLifecycleTests
         Set(rec, "testLeftEye", Inj(0.9f, view.position, Vector3.forward)); Set(rec, "testRightEye", Inj(0.9f, view.position, Vector3.forward));
         Call(rec, "StartRecording"); yield return new WaitForSecondsRealtime(0.3f); Call(rec, "StopRecording");
         var csv = Csv.Load(Get<string>(rec, "outputPathOverride"));
-        Assert.AreEqual(143, csv.Header.Count);   // 133 + 10 schema-v16 face columns
+        AssertV17Header(csv);   // schema v17: 61 + 85 documented columns
         Assert.Greater(csv.Rows.Count, 2);
         foreach (var row in csv.Rows)
         {
@@ -1073,7 +1073,7 @@ public partial class NpcLifecycleTests
         SetConstDelegate(rec, "testRuntimeIpd", 0.0642f);
         Call(rec, "StartRecording"); yield return new WaitForSecondsRealtime(0.35f); Call(rec, "StopRecording");
         var csv = Csv.Load(Get<string>(rec, "outputPathOverride")); Assert.Greater(csv.Rows.Count, 3);
-        Assert.AreEqual("provider_time_s", csv.Header[csv.Header.Count - 37 - 10]); Assert.AreEqual("origin_fallback_reason", csv.Header[csv.Header.Count - 1 - 10]); Assert.AreEqual("face_data_source", csv.Header[csv.Header.Count - 1]);   // 10 schema-v16 face columns follow
+        Assert.AreEqual("provider_time_s", csv.DiagnosticHeader[4]); Assert.AreEqual("origin_fallback_reason", csv.DiagnosticHeader[40]); Assert.AreEqual("blink_state", csv.DiagnosticHeader[78]);   // schema v17: the 37 v14 pipeline columns are columns 5..41 of gaze_diagnostics.csv
         foreach (var row in csv.Rows)
         {
             Assert.AreEqual(csv.Header.Count, row.Count);
@@ -1178,7 +1178,7 @@ public partial class NpcLifecycleTests
         Assert.AreEqual(0.0674, Num(ep["view_anchor_separation_m"]["mean"]), 2e-4, "measured from the anchors given, not a constant");
         Assert.AreEqual(0.06, Num(ep["gaze_head_separation_m"]["mean"]), 2e-4);
         StringAssert.StartsWith("not_exposed", (string)ep["eye_tracking_calibration"]); StringAssert.StartsWith("not_measured", (string)ep["physical_pupil_position"]);
-        Assert.AreEqual(16, (int)ManifestOf(rig)["schema_version"]);
+        Assert.AreEqual(17, (int)ManifestOf(rig)["schema_version"]);
     }
 
     // ---------------------------------------------------------------------------------------------- G1

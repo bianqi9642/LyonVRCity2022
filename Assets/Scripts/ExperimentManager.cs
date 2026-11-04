@@ -201,6 +201,17 @@ public class ExperimentManager : MonoBehaviour
     [Tooltip("If true (default) Part 3 cannot start while the microphone recording cannot be established: the participant is shown why and the Start is retried. If false the failure is recorded in the manifest and Part 3 continues WITHOUT audio.")]
     public bool part3AudioRequired = true;
 
+    [Header("Face tracking start-up (schema v17; Parts 2 and 3, i.e. the Parts whose gaze capture is enabled)")]
+    [Tooltip("Start OVRFaceExpressions at the beginning of the Part and wait (bounded) until a valid Visual eyelid frame exists BEFORE the Start panel, so the first formal gaze row already carries eyelid data. " +
+             "Nothing is recorded by this step: the gaze file only opens at the participant's Start click. Off = face tracking is started by the legacy lazy path (first rows of the trial may lack eyelid data).")]
+    public bool faceTrackingPreflight = true;
+    [Tooltip("Instead of before the Start panel, wait for face tracking after the participant's Start click and before the trial begins (use when starting the face camera before the Start click is not acceptable for the study).")]
+    public bool faceTrackingStartAfterStartClick = false;
+    [Tooltip("Upper bound (seconds) of the readiness wait. A runtime without face tracking support ends it immediately.")]
+    public float faceTrackingMaxWaitSeconds = 5f;
+    [Tooltip("true = a failed start-up shows a retry panel (like the microphone gate); false (default) = the Part continues, the failure is recorded in the manifest and eyelid fields stay blank.")]
+    public bool faceTrackingRequired = false;
+
     [Header("River teleport availability")]
     [Tooltip("Participant-facing river teleport points (visuals, anchors, instruction signs) exist and work ONLY while Part 3 " +
              "is running (part_start until its trial ends / End Panel). Part 1, Part 2 and idle: hidden and rejected. " +
@@ -757,6 +768,34 @@ public class ExperimentManager : MonoBehaviour
             yield return Part3AudioBlockedWait("The audio recording could not start (" + audio.FailureReason + "). Please inform the experimenter, then press to retry.");
             clickT = CaptureClock.TAbs;   // the retry is a new Start click
             if (audio.State != AudioCaptureState.Ready) yield return audio.RunPreflight();
+        }
+    }
+
+    // ---- face tracking start-up (schema v17): creates OVRFaceExpressions early and waits (bounded) for the first valid Visual frame. Records nothing. ----
+    private GazeRecorder FaceGaze()
+    {
+        if (CurrentPartConfig == null || !CurrentPartConfig.gazeCaptureEnabled) return null;
+        return FindObjectOfType<GazeRecorder>();
+    }
+
+    // At the start of a Part: only creates / starts the component (no wait), so the runtime has the whole NPC warm-up to start tracking.
+    private void FaceTrackingBegin()
+    {
+        if (!faceTrackingPreflight || faceTrackingStartAfterStartClick) return;
+        GazeRecorder g = FaceGaze(); if (g == null) return;
+        try { g.BeginFaceTrackingStartup("preflight"); } catch (Exception ex) { Debug.LogError("[ExperimentManager] face tracking start-up threw: " + ex.Message, this); }
+    }
+
+    private IEnumerator FaceTrackingReadyGate(string startPoint)
+    {
+        bool wanted = startPoint == "preflight" ? (faceTrackingPreflight && !faceTrackingStartAfterStartClick) : (faceTrackingPreflight && faceTrackingStartAfterStartClick);
+        if (!wanted) yield break;
+        GazeRecorder g = FaceGaze(); if (g == null) yield break;
+        while (!SessionEnded)
+        {
+            yield return g.AwaitFaceTrackingReady(Mathf.Max(0.1f, faceTrackingMaxWaitSeconds), startPoint);
+            if (g.FaceStartup.ready || !faceTrackingRequired) yield break;
+            yield return Part3AudioBlockedWait("Face tracking is not available (" + g.FaceStartup.failure_reason + "). Please inform the experimenter, then press to retry.");
         }
     }
 
@@ -1333,17 +1372,21 @@ public class ExperimentManager : MonoBehaviour
         Transform chosenTeleport = ChooseRandomFromArray(group.teleportPositions);
 
         TeleportPlayerTo(chosenStart);
+        FaceTrackingBegin();   // schema v17: see Part 3
 
         yield return RunNpcWarmup(CurrentPartConfig, "Part2");
         if (AbortPartIfNpcPreparationFailed("Part2")) yield break;
 
         yield return WaitForHeadsetBeforeStartPanel();
+        yield return FaceTrackingReadyGate("preflight");
         // Phase labels for Part 2 (metadata only - no timing or flow depends on them): the Start panel is being read until the participant confirms.
         SetPhase("p2_start_pending", "Part2");
         bool started = false;
         RaiseEvt("panel_shown", "Part2", label: "part2_start");
         uiManager.ShowPart2StartPanel(() => { started = true; RaiseEvt("panel_confirmed", "Part2", label: "part2_start"); });
         yield return new WaitUntil(() => started);
+        yield return FaceTrackingReadyGate("after_start_click");
+        if (SessionEnded) yield break;
 
         // The phase is set BEFORE the trial opens: recorders start sampling inside BeginTrial() (the first gaze row is written synchronously), so the very first
         // sample of the trial already carries the correct phase instead of the previous one.
@@ -1461,6 +1504,7 @@ public class ExperimentManager : MonoBehaviour
 
         // --- 5. Move the participant to the fixed start point (existing mechanism). ---
         TeleportPlayerTo(startPoint);
+        FaceTrackingBegin();   // schema v17: face tracking starts now, during the NPC warm-up (nothing is recorded)
 
         // --- 6. Persist the assignment immediately via the capture event (legacy CSV removed). ---
         AppendPart3Log("assigned", groupIndex, def, startPoint, destination1Building, destination2Building,
@@ -1477,6 +1521,7 @@ public class ExperimentManager : MonoBehaviour
 
         // --- 7. Phase 3 Start panel. (All candidates are still non-interactable ordinary buildings.) ---
         yield return WaitForHeadsetBeforeStartPanel();
+        yield return FaceTrackingReadyGate("preflight");   // schema v17: bounded wait for the first valid Visual eyelid frame; a no-op when disabled / not applicable
         bool started = false;
         double startClickT = double.NaN;
         RaiseEvt("panel_shown", "Part3", label: "part3_start");
@@ -1485,6 +1530,8 @@ public class ExperimentManager : MonoBehaviour
 
         // --- 7b. The microphone must be delivering samples BEFORE the participant may act: the Start click starts the recording, BeginTrial() waits for the first sample. ---
         if (_part3Audio != null) yield return Part3AudioStartGate(_part3Audio, startClickT);
+        if (SessionEnded) yield break;
+        yield return FaceTrackingReadyGate("after_start_click");   // only when faceTrackingStartAfterStartClick; the trial (and the first gaze row) has not begun yet
         if (SessionEnded) yield break;
 
         // Phase first, then the trial: the first sample written inside BeginTrial() must already be labelled d1_pending (panel reading), not 'idle'.

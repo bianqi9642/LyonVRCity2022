@@ -182,10 +182,10 @@ public class GazeRecorderTests
 
     static readonly string[] FractionalColumns =
     {
-        "head_pos_x", "head_pos_y", "head_pos_z", "head_rot_x", "head_rot_y", "head_rot_z", "head_rot_w",
-        "ray_origin_x", "ray_origin_y", "ray_origin_z", "ray_dir_x", "ray_dir_y", "ray_dir_z",
         "hit_point_x", "hit_point_y", "hit_point_z"
     };
+    // schema v17: the head columns live in gaze_diagnostics.csv (same writer, same formatting rules)
+    static readonly string[] FractionalDiagnosticColumns = { "head_pos_x", "head_pos_y", "head_pos_z", "head_rot_x", "head_rot_y", "head_rot_z", "head_rot_w" };
     static readonly Regex Fixed4 = new Regex(@"^-?\d+\.\d{4}$");
 
     // Runs the real recorder for a few frames under the given culture and returns the parsed CSV (header + rows).
@@ -218,9 +218,9 @@ public class GazeRecorderTests
         {
             Assert.GreaterOrEqual(rows.Count, 3, "expected a header plus several rows");
             int width = rows[0].Count;
-            Assert.AreEqual(143, width, "header width: 55 columns at HEAD + 11 appended in schema v5 + 3 in v9 + 1 in v10 + 3 in v11 + 23 in v13 + 37 in v14 + 10 in v16 (existing columns must never move)");
-            Assert.AreEqual("hit_is_interactable", rows[0][54], "the first 55 columns are unchanged");
-            Assert.AreEqual("part", rows[0][55]);
+            Assert.AreEqual(61, width, "schema v17: the primary gaze.csv has 61 columns (v16: 143; the rest is in gaze_diagnostics.csv)");
+            CollectionAssert.AreEqual((string[])Reflect.T("GazeRecorder").GetField("PrimaryColumns").GetValue(null), rows[0], "the header is exactly GazeRecorder.PrimaryColumns");
+            Assert.AreEqual("t_abs", rows[0][0]);
             for (int i = 1; i < rows.Count; i++)
                 Assert.AreEqual(width, rows[i].Count, "row " + i + " width differs from header");
         }
@@ -242,18 +242,26 @@ public class GazeRecorderTests
             int ci = hdr.IndexOf(col);
             for (int i = 1; i < fr.Count; i++) Assert.IsTrue(Fixed4.IsMatch(fr[i][ci]), col + " = '" + fr[i][ci] + "'");
         }
-        Assert.AreEqual("1.2346", fr[1][hdr.IndexOf("head_pos_x")]);
+        var dEn = Csv.LoadRaw(Path.Combine(_dir, "en_diagnostics.csv")); var dFr = Csv.LoadRaw(Path.Combine(_dir, "fr_diagnostics.csv"));
+        Assert.IsTrue(dEn.Exists && dFr.Exists, "gaze_diagnostics.csv is written next to every gaze file");
+        Assert.AreEqual(fr.Count - 1, dFr.Rows.Count, "one diagnostics row per gaze row");
+        foreach (var col in FractionalDiagnosticColumns)
+            for (int i = 0; i < dFr.Rows.Count; i++)
+            {
+                Assert.IsTrue(Fixed4.IsMatch(dFr.Rows[i][dFr.Col(col)]), "fr-FR diagnostics " + col + " = '" + dFr.Rows[i][dFr.Col(col)] + "'");
+                Assert.AreEqual(dEn.Rows[0][dEn.Col(col)], dFr.Rows[0][dFr.Col(col)], col + " identical for en-US and fr-FR");
+            }
+        Assert.AreEqual("1.2346", dFr.Rows[0][dFr.Col("head_pos_x")]);
         Assert.AreEqual("1", fr[1][hdr.IndexOf("ray_did_hit")]);
         Assert.AreEqual("", fr[1][hdr.IndexOf("roi_hit_distance")], "legacy missing-value convention: blank when eye gaze invalid");
         Assert.AreEqual("0", fr[1][hdr.IndexOf("combined_valid")]);
         foreach (var col in new[] { "combined_origin_x", "combined_origin_y", "combined_origin_z", "combined_dir_x", "combined_dir_y", "combined_dir_z",
                                     "left_origin_x", "left_dir_z", "right_origin_y", "right_dir_x" })
             Assert.AreEqual("", fr[1][hdr.IndexOf(col)], col + ": an invalid eye / combined vector is blank (schema v5)");
-        Assert.AreEqual("0", fr[1][hdr.IndexOf("ray_is_eye_gaze")], "the fallback ray is marked as not eye gaze");
-        Assert.AreEqual("head_fallback", fr[1][hdr.IndexOf("gaze_ray_source")]);
-        Assert.AreEqual("", fr[1][hdr.IndexOf("left_confidence")], "schema v11: an eye with no provider measurement has a BLANK confidence (it used to be written as 0.000)");
+        Assert.AreEqual("head_fallback", fr[1][hdr.IndexOf("gaze_ray_source")], "the fallback ray is marked (v17: ray_is_eye_gaze = combined_valid = 0)");
+        Assert.AreEqual("", dFr.Rows[1][dFr.Col("left_confidence")], "schema v11: an eye with no provider measurement has a BLANK confidence (it used to be written as 0.000); v17: in gaze_diagnostics.csv");
         foreach (var col in new[] { "left_confidence", "right_confidence", "combined_confidence" })
-            Assert.IsFalse(fr[1][hdr.IndexOf(col)].Contains(","));
+            Assert.IsFalse(dFr.Rows[1][dFr.Col(col)].Contains(","));
     }
 
     [UnityTest]
@@ -336,7 +344,7 @@ public class GazeRecorderTests
         var rows = ReadRows(rig.path);
         var h = rows[0];
         int headerLines = 0;
-        foreach (var line in File.ReadAllLines(rig.path)) if (line.StartsWith("time_since_start_s,")) headerLines++;
+        foreach (var line in File.ReadAllLines(rig.path)) if (line.StartsWith("t_abs,")) headerLines++;
         Assert.AreEqual(1, headerLines, "exactly one header line");
 
         int iFrame = h.IndexOf("frame_index"), iAbs = h.IndexOf("t_abs"), iRel = h.IndexOf("time_since_start_s");

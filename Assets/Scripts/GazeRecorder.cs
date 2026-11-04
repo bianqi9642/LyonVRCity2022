@@ -39,10 +39,16 @@
 //  two tracking origins when the rig is EyeLevel and the eye pose is not (observed: constant +1.361 m vertical offset); an implausible provider origin is replaced by the rig eye anchor
 //  and labelled in the appended column gaze_origin_source. Direction, per-eye validity, confidence and the head-forward fallback are unchanged. See docs/gaze_origin_verification.md.
 //
+// Revision 5 (schema v17, NOT additive - an explicitly requested reorganisation): gaze.csv is the 61-column ANALYSIS table (PrimaryColumns); everything that exists to QA or reproduce it is written to gaze_diagnostics.csv
+//  (DiagnosticColumns, 85 columns, one row per gaze row, keys session_id + frame_index + t_abs). Both rows are built from the SAME values of one sample. Removed / moved / derivable columns and the reasons:
+//  docs/gaze_schema_v17_dictionary.md. The face signal is read LIVE per row from one GetFaceState2 state (started, source, validity, provider time, weights); the readiness gate (BeginFaceTrackingStartup /
+//  AwaitFaceTrackingReady) starts face tracking before the first row and records nothing. No gaze origin / direction / ViewFrame / sampling-rate logic changed. See docs/schema_v17_changes.md.
+//
 // All comments in English per project convention.
 
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using UnityEngine;
@@ -86,6 +92,10 @@ public class GazeRecorder : MonoBehaviour
              "can never be measured. No scene is edited. Set false to keep face tracking off (the blink capability then stays not_configured, nothing is recorded). " +
              "Enabling it makes the runtime process facial data about the participant - a data-protection decision for the study.")]
     public bool autoCreateFaceExpressions = true;
+
+    [Header("Diagnostics stream (schema v17)")]
+    [Tooltip("Write gaze_diagnostics.csv next to gaze.csv: provider pipeline, validity / confidence, legacy head anchor, view anchors, raw face weights, face source / validity and the uncalibrated blink state, one row per gaze row. Off = the main gaze.csv alone.")]
+    public bool recordDiagnostics = true;
 
     [Tooltip("Both eyes' closure weight (0..1) at or above this starts a blink. UNCALIBRATED default - calibrate on a Quest Pro before analysing blink durations.")]
     [Range(0.05f, 1f)] public float blinkCloseThreshold = 0.7f;
@@ -270,7 +280,9 @@ public class GazeRecorder : MonoBehaviour
     double _noValidSince = double.NaN;
     /// <summary>The CSV writer (shared failure/recovery policy and counters); null until the first StartRecording.</summary>
     public CaptureCsvWriter Writer => gazeWriter;
-    CaptureCsvWriter gazeWriter;
+    CaptureCsvWriter gazeWriter, diagWriter;
+    /// <summary>The gaze_diagnostics.csv writer (schema v17); null until the first StartRecording or when recordDiagnostics is off.</summary>
+    public CaptureCsvWriter DiagnosticsWriter => diagWriter;
     public long WriteErrors => gazeWriter != null ? gazeWriter.WriteErrors : 0;
     public string LastWriteError => gazeWriter != null ? gazeWriter.LastError : "";
     public double FirstRowT { get; private set; } = double.NaN;
@@ -512,6 +524,15 @@ public class GazeRecorder : MonoBehaviour
             gazeWriter = new CaptureCsvWriter(fullPath, GetCsvHeader(), "gaze");
             if (dataCapture != null) gazeWriter.Transition += dataCapture.OnWriterTransition;
         }
+        if (recordDiagnostics)
+        {
+            string dpath = DiagnosticsPathFor(fullPath);
+            if (diagWriter == null || diagWriter.Path != dpath)
+            {
+                diagWriter = new CaptureCsvWriter(dpath, GetDiagnosticsHeader(), "gaze_diagnostics");
+                if (dataCapture != null) diagWriter.Transition += dataCapture.OnWriterTransition;
+            }
+        }
         recordingStartRealtime = CaptureClock.TAbs;
         isRecording = true;
         RecordingStarts++;
@@ -539,6 +560,13 @@ public class GazeRecorder : MonoBehaviour
         isRecording = false;
     }
 
+    /// <summary>gaze.csv -> gaze_diagnostics.csv (same folder); any other name gets "_diagnostics" before the extension.</summary>
+    public static string DiagnosticsPathFor(string gazePath)
+    {
+        string dir = Path.GetDirectoryName(gazePath) ?? "", name = Path.GetFileNameWithoutExtension(gazePath);
+        return Path.Combine(dir, (name == "gaze" ? "gaze" : name) + "_diagnostics.csv");
+    }
+
     string BuildFullPath()
     {
         if (!string.IsNullOrEmpty(outputPathOverride)) return outputPathOverride;
@@ -562,100 +590,57 @@ public class GazeRecorder : MonoBehaviour
         return s;
     }
 
-    string GetCsvHeader()
-    {
-        return string.Join(",", new string[]
-        {
-            // ----- existing columns (DO NOT reorder / rename) -----
-            "time_since_start_s",
-            "unix_time_ms",
-            "subject_id",
-            "trial_id",
-            "left_confidence",
-            "left_valid",
-            "left_origin_x", "left_origin_y", "left_origin_z",
-            "left_dir_x", "left_dir_y", "left_dir_z",
-            "right_confidence",
-            "right_valid",
-            "right_origin_x", "right_origin_y", "right_origin_z",
-            "right_dir_x", "right_dir_y", "right_dir_z",
-            "combined_valid",
-            "combined_confidence",
-            "combined_origin_x", "combined_origin_y", "combined_origin_z",
-            "combined_dir_x", "combined_dir_y", "combined_dir_z",
-            "head_pos_x", "head_pos_y", "head_pos_z",
-            "head_rot_x", "head_rot_y", "head_rot_z", "head_rot_w",
-            "roi_hit_name",
-            "roi_hit_distance",
-            // ----- Revision 2 appended columns -----
-            "t_abs",
-            "session_id",
-            "frame_index",
-            "gaze_ray_source",
-            "ray_did_hit",
-            "hit_point_x", "hit_point_y", "hit_point_z",
-            "hit_collider_name",
-            "hit_object_name",
-            "hit_instance_id",
-            "hit_layer",
-            "hit_tag",
-            "hit_semantic_class",
-            "hit_building_id",
-            "hit_npc_id",
-            "hit_npc_spawn_instance_id",
-            "hit_is_interactable",
-            // ----- schema v5 appended columns -----
-            "part",
-            "phase",
-            "ray_is_eye_gaze",
-            "ray_origin_x", "ray_origin_y", "ray_origin_z",
-            "ray_dir_x", "ray_dir_y", "ray_dir_z",
-            "hit_is_current_target",
-            "hit_assigned_destination",
-            // ----- schema v8 appended columns (eye-tracking acquisition) -----
-            // eye_tracking_state: lifecycle state at the sample (waiting_for_xr | ... | running | tracking_unavailable ...), blank without a lifecycle controller.
-            // left/right_provider_valid: the provider's own per-eye IsValid at the sample (1/0), blank when no provider probe is available (never a guessed 0).
-            "eye_tracking_state",
-            "left_provider_valid", "right_provider_valid",
-            // ----- schema v10 appended column (gaze origin) -----
-            // gaze_origin_source: where the recorded eye origin(s) came from - provider | eye_anchor | provider_unchecked | mixed (two valid eyes disagree); blank for the head-fallback ray.
-            "gaze_origin_source",
-            // ----- schema v11 appended columns (blink signal; ALWAYS blank unless the face-tracking eye-closure signal is available - blank means "not measured", never "eyes open") -----
-            // eyes_closed_left / eyes_closed_right: raw FaceExpression.EyesClosedL / R weights 0..1; blink_state: 1 = inside a detected blink, 0 = not, blank = no valid measurement for both eyes.
-            "eyes_closed_left", "eyes_closed_right", "blink_state",
-            // ----- schema v13 appended columns (view frame; ALL blank when the rendered view / OVR anchors are not resolved, ground columns blank when no ground surface is found) -----
-            // hmd_world_*: the RENDERED camera (centre-eye / HMD reference the participant sees from) in Unity world coordinates; hmd_world_rot_*: its rotation.
-            // *_eye_head_local_*: the eye anchors in the OVR centre-eye (head) frame - independent of any world height. *_eye_world_*: the eyes in the rendered view frame = view pos + view rot * head-local.
-            // ground_y: world Y of the walkable ground surface below the rendered camera; *_height_above_ground = world Y - ground_y (never an assumed eye height).
-            "hmd_world_x", "hmd_world_y", "hmd_world_z", "hmd_world_rot_x", "hmd_world_rot_y", "hmd_world_rot_z", "hmd_world_rot_w",
-            "left_eye_head_local_x", "left_eye_head_local_y", "left_eye_head_local_z", "right_eye_head_local_x", "right_eye_head_local_y", "right_eye_head_local_z",
-            "left_eye_world_x", "left_eye_world_y", "left_eye_world_z", "right_eye_world_x", "right_eye_world_y", "right_eye_world_z",
-            "ground_y", "hmd_height_above_ground", "left_eye_height_above_ground", "right_eye_height_above_ground",
-            // ----- schema v14 appended columns (per-eye provider pipeline; blank when unavailable, never estimated) -----
-            // provider_time_s: OVRPlugin EyeGazesState.Time; provider_time_changed: 1 = a newer provider sample than the previous row, 0 = the previous sample reused.
-            // *_raw_tracking_*: the provider eye pose in OVRPlugin tracking space (position, forward direction). *_gaze_head_*: the same pose in the head frame (SDK head-space conversion; independent of the tracking origin,
-            // the Camera Offset and the world). The recorded gaze ray (left_/right_/combined_origin, _dir) remains the OVREyeGaze WorldSpace result.
-            "provider_time_s", "provider_time_changed",
-            "left_raw_tracking_pos_x", "left_raw_tracking_pos_y", "left_raw_tracking_pos_z", "left_raw_tracking_dir_x", "left_raw_tracking_dir_y", "left_raw_tracking_dir_z",
-            "right_raw_tracking_pos_x", "right_raw_tracking_pos_y", "right_raw_tracking_pos_z", "right_raw_tracking_dir_x", "right_raw_tracking_dir_y", "right_raw_tracking_dir_z",
-            "left_gaze_head_pos_x", "left_gaze_head_pos_y", "left_gaze_head_pos_z", "left_gaze_head_dir_x", "left_gaze_head_dir_y", "left_gaze_head_dir_z",
-            "right_gaze_head_pos_x", "right_gaze_head_pos_y", "right_gaze_head_pos_z", "right_gaze_head_dir_x", "right_gaze_head_dir_y", "right_gaze_head_dir_z",
-            // provider eye position minus the stereo VIEW anchor, both in head space (metres); WorldSpace result vs (rendered camera * head-space eye): origin metres / direction degrees (should be ~0 within one frame).
-            "left_gaze_vs_view_anchor_head_m", "right_gaze_vs_view_anchor_head_m",
-            "left_worldspace_vs_composed_origin_m", "right_worldspace_vs_composed_origin_m", "left_worldspace_vs_composed_dir_deg", "right_worldspace_vs_composed_dir_deg",
-            // stereo VIEW anchor separation, provider eye separation (head space, both eyes valid), the IPD the runtime holds (OVRPlugin.ipd) - three different quantities, none is a pupil measurement.
-            "view_anchor_separation_m", "gaze_head_separation_m", "runtime_user_ipd_m",
-            // Unity frame of the last OVRCameraRig.UpdatedAnchors; why the recorded origin is not the provider's (no_valid_eye | provider_exceeds_deviation_gate | provider_origin_non_finite | mixed).
-            "anchors_updated_frame", "origin_fallback_reason",
-            // ----- schema v16 appended columns (face-tracking eyelid signal; blank = not measured, 0.0000 = a valid zero) -----
-            // face_state: no_runtime | unsupported | no_component | not_started | invalid_frame | audio_only_source | current (only "current" rows carry values). face_tracking_started / face_data_source come from a <=1 s old probe.
-            // face_expressions_valid / eye_following_valid: OVRFaceExpressions.ValidExpressions / EyeFollowingBlendshapesValid read live in the row's frame. eyes_look_down_*: only while eye_following_valid = 1.
-            // eyes_closed_*_recovered = SDK EyesClosedX + min(EyesLookDownL, EyesLookDownR) when eye_following_valid = 1, else the raw EyesClosedX (eyes_closed_left/right stay the raw SDK weights). face_sample_frame: Unity frame of the read.
-            "face_state", "face_tracking_started", "face_expressions_valid", "eye_following_valid",
-            "eyes_look_down_left", "eyes_look_down_right", "eyes_closed_left_recovered", "eyes_closed_right_recovered",
-            "face_sample_frame", "face_data_source"
-        });
-    }
+    // =================================================================================================================================
+    // SCHEMA v17: the main gaze.csv is an ANALYSIS table (61 columns); everything that exists to QA / reproduce it lives in gaze_diagnostics.csv (one row per gaze row, joinable by session_id + frame_index + t_abs).
+    // The columns below are the single source of truth for both files (tests, docs and the offline reader use these arrays).
+    // =================================================================================================================================
+    static string[] Xyz(string p) => new[] { p + "_x", p + "_y", p + "_z" };
+    static string[] Quat(string p) => new[] { p + "_x", p + "_y", p + "_z", p + "_w" };
+    static string[] Cat(params object[] parts) { var l = new List<string>(); foreach (var o in parts) { if (o is string str) l.Add(str); else l.AddRange((string[])o); } return l.ToArray(); }
+
+    /// <summary>The v17 main gaze.csv header, in file order.</summary>
+    public static readonly string[] PrimaryColumns = Cat(
+        // identification and time (t_abs is the canonical CaptureClock time; time_since_start_s is t_abs minus the recording start)
+        "t_abs", "time_since_start_s", "frame_index", "session_id", "subject_id", "trial_id", "part", "phase",
+        // validity / provenance of the gaze ray (compact): combined_valid 0 = no valid eye (the ray_* columns of v16 are derivable: see docs), origin source, lifecycle state
+        "combined_valid", "gaze_ray_source", "gaze_origin_source", "eye_tracking_state",
+        // per-eye gaze rays (WorldSpace; blank when that eye is not valid) and the combined binocular ray
+        Xyz("left_origin"), Xyz("left_dir"), Xyz("right_origin"), Xyz("right_dir"), Xyz("combined_origin"), Xyz("combined_dir"),
+        // the rendered camera (view reference)
+        Xyz("hmd_world"), Quat("hmd_world_rot"),
+        // the physical gaze-ray interaction (Physics.Raycast along the combined ray, or the head-forward fallback ray when combined_valid = 0)
+        "ray_did_hit", Xyz("hit_point"), "roi_hit_distance",
+        "hit_collider_name", "hit_object_name", "hit_instance_id", "hit_layer", "hit_tag", "hit_semantic_class", "hit_building_id", "hit_npc_id", "hit_npc_spawn_instance_id", "hit_is_interactable", "hit_is_current_target", "hit_assigned_destination",
+        // ground reference (blank when no Ground-layer surface lies within the ground ray)
+        "ground_y", "hmd_height_above_ground", "left_eye_height_above_ground", "right_eye_height_above_ground",
+        // eyelid closure: the RECOVERED weights (EyesClosed + min(EyesLookDown) when eye-following is valid, else the raw weight) and a compact validity flag (1 = measured this row from a valid Visual frame)
+        "eyes_closed_left_recovered", "eyes_closed_right_recovered", "face_closure_valid");
+
+    /// <summary>The v17 gaze_diagnostics.csv header, in file order. Keys first, then the groups documented in docs/schema_v17_changes.md.</summary>
+    public static readonly string[] DiagnosticColumns = Cat(
+        "t_abs", "frame_index", "session_id",
+        "unix_time_ms",
+        // v14 provider pipeline (37)
+        "provider_time_s", "provider_time_changed",
+        Xyz("left_raw_tracking_pos"), Xyz("left_raw_tracking_dir"), Xyz("right_raw_tracking_pos"), Xyz("right_raw_tracking_dir"),
+        Xyz("left_gaze_head_pos"), Xyz("left_gaze_head_dir"), Xyz("right_gaze_head_pos"), Xyz("right_gaze_head_dir"),
+        "left_gaze_vs_view_anchor_head_m", "right_gaze_vs_view_anchor_head_m",
+        "left_worldspace_vs_composed_origin_m", "right_worldspace_vs_composed_origin_m", "left_worldspace_vs_composed_dir_deg", "right_worldspace_vs_composed_dir_deg",
+        "view_anchor_separation_m", "gaze_head_separation_m", "runtime_user_ipd_m", "anchors_updated_frame", "origin_fallback_reason",
+        // per-eye validity and provider confidence
+        "left_confidence", "left_valid", "left_provider_valid", "right_confidence", "right_valid", "right_provider_valid", "combined_confidence",
+        // legacy OVR-side head anchor (rig frame, WITHOUT the Camera Floor Offset)
+        Xyz("head_pos"), Quat("head_rot"),
+        // stereo view anchors (head frame / rendered view frame): NOT gaze origins
+        Xyz("left_eye_head_local"), Xyz("right_eye_head_local"), Xyz("left_eye_world"), Xyz("right_eye_world"),
+        // face tracking: state, live per-row source / validity, raw weights and correction inputs, uncalibrated blink state
+        "face_state", "face_tracking_started", "face_expressions_valid", "eye_following_valid", "eyes_look_down_left", "eyes_look_down_right", "eyes_closed_left", "eyes_closed_right",
+        "face_sample_frame", "face_data_source", "face_provider_time_s", "blink_state",
+        // the ray that was actually cast when combined_valid = 0 (head-forward fallback); blank on eye-gaze rows (there the cast ray is combined_origin / combined_dir). Keeps every hit reconstructible even without a resolved view frame.
+        Xyz("fallback_ray_origin"), Xyz("fallback_ray_dir"));
+
+    string GetCsvHeader() => string.Join(",", PrimaryColumns);
+    string GetDiagnosticsHeader() => string.Join(",", DiagnosticColumns);
 
     struct EyeSample
     {
@@ -936,7 +921,7 @@ public class GazeRecorder : MonoBehaviour
         }
         catch (Exception) { }
         if (faceExpressions == null && !_faceSearched) { _faceSearched = true; faceExpressions = FindObjectOfType<OVRFaceExpressions>(); }   // searched once: a scene-wide search every second would cost frames
-        EnsureFaceExpressions(ref f);
+        EnsureFaceExpressions(ref f, allowCreate: !FaceStartup.attempted);   // schema v17: lazy creation only when NO start-up gate ran (standalone use); otherwise the gate created it before the first row
         f.ComponentPresent = faceExpressions != null && faceExpressions.isActiveAndEnabled;
         f.SignalValid = f.ComponentPresent && faceExpressions.ValidExpressions;
         ProbeFaceState(ref f);
@@ -944,7 +929,7 @@ public class GazeRecorder : MonoBehaviour
     }
 
     // Creates the face-tracking component when the project asked for none but the runtime supports it, and re-starts an auto-created one a bounded number of times. About once per second (RefreshBlinkCapability).
-    void EnsureFaceExpressions(ref BlinkFacts f)
+    void EnsureFaceExpressions(ref BlinkFacts f, bool allowCreate = true)
     {
         if (!autoCreateFaceExpressions || !f.OvrPluginInitialized || !f.FaceTrackingSupported) return;
         double now = CaptureClock.TAbs;
@@ -952,6 +937,7 @@ public class GazeRecorder : MonoBehaviour
         {
             if (faceExpressions == null)
             {
+                if (!allowCreate) return;   // a start-up gate ran: creation belongs to it, never to the data path of the first gaze row
                 if (!f.PermissionGranted && !FacePermissionRequested)
                 {
                     FacePermissionRequested = true;
@@ -987,11 +973,13 @@ public class GazeRecorder : MonoBehaviour
         catch (Exception) { f.StateApiProbed = false; }
     }
 
-    // One live face reading for the current Unity frame. OVRFaceExpressions.Update (same frame, before this coroutine resumes) refreshed ValidExpressions; nothing is cached across rows.
+    // One live face reading for the current Unity frame (schema v17): ONE OVRPlugin.GetFaceState2 call per row supplies, from the same state, the API result, Status.IsValid, the data source, the provider
+    // time and every weight - so the data source recorded with a closure value is the source of exactly that sample, and nothing is cached across rows. OVRFaceExpressions still owns STARTING face
+    // tracking (OnEnable) and the permission flow; this read does not depend on its per-frame Update having run.
     FaceReading ReadFace()
     {
         if (testFaceReading != null) { var t = testFaceReading(); t.Queried = true; return t; }
-        var r = new FaceReading { Frame = Time.frameCount };
+        var r = new FaceReading { Frame = Time.frameCount, DataSource = "" };
         if (testEyeClosure != null)   // legacy seam: closure pair only
         {
             var c = testEyeClosure(); r.Queried = true;
@@ -1000,16 +988,113 @@ public class GazeRecorder : MonoBehaviour
         }
         if (faceExpressions == null || !faceExpressions.isActiveAndEnabled) return r;
         r.Queried = true;
-        if (!faceExpressions.ValidExpressions) return r;
-        r.ExpressionsValid = true; r.EyeFollowingValid = faceExpressions.EyeFollowingBlendshapesValid;
-        if (!faceExpressions.TryGetFaceExpressionWeight(OVRFaceExpressions.FaceExpression.EyesClosedL, out r.ClosedL) ||
-            !faceExpressions.TryGetFaceExpressionWeight(OVRFaceExpressions.FaceExpression.EyesClosedR, out r.ClosedR)) { r.ExpressionsValid = false; return r; }
-        if (r.EyeFollowingValid)
+        try
         {
-            faceExpressions.TryGetFaceExpressionWeight(OVRFaceExpressions.FaceExpression.EyesLookDownL, out r.LookDownL);
-            faceExpressions.TryGetFaceExpressionWeight(OVRFaceExpressions.FaceExpression.EyesLookDownR, out r.LookDownR);
+            if (!OVRPlugin.initialized || !OVRPlugin.faceTracking2Enabled) return r;   // Started stays false: face_state = not_started
+            r.Started = true;
+            r.ApiOk = OVRPlugin.GetFaceState2(OVRPlugin.Step.Render, -1, ref _faceRowState);
+            if (!r.ApiOk) return r;
+            r.ProviderTime = _faceRowState.Time;
+            if (!_faceRowState.Status.IsValid) return r;
+            r.DataSource = _faceRowState.DataSource == OVRPlugin.FaceTrackingDataSource.Audio ? "audio" : "visual";
+            float[] w = _faceRowState.ExpressionWeights;
+            int iCL = (int)OVRFaceExpressions.FaceExpression.EyesClosedL, iCR = (int)OVRFaceExpressions.FaceExpression.EyesClosedR, iDL = (int)OVRFaceExpressions.FaceExpression.EyesLookDownL, iDR = (int)OVRFaceExpressions.FaceExpression.EyesLookDownR;
+            if (w == null || w.Length <= Math.Max(Math.Max(iCL, iCR), Math.Max(iDL, iDR))) return r;   // no eyelid weights in this state: not a measurement
+            r.ExpressionsValid = true; r.EyeFollowingValid = _faceRowState.Status.IsEyeFollowingBlendshapesValid;
+            r.ClosedL = w[iCL]; r.ClosedR = w[iCR];
+            if (r.EyeFollowingValid) { r.LookDownL = w[iDL]; r.LookDownR = w[iDR]; }
         }
+        catch (Exception) { r.ExpressionsValid = false; }
         return r;
+    }
+
+    // ---- face-tracking start-up (schema v17): the component exists and the first valid Visual frame has been seen BEFORE the first formal gaze row ----
+    /// <summary>Outcome of the bounded start-up wait; written to manifest eye_tracking.blink.startup_*.</summary>
+    public FaceStartupInfo FaceStartup { get; } = new FaceStartupInfo();
+    /// <summary>Test seam (never set in production): replaces the live readiness facts.</summary>
+    [NonSerialized] public Func<FaceReadinessFacts> testFaceReadiness;
+    OVRPlugin.FaceState _faceRowState, _faceReadyState;
+
+    /// <summary>Creates / starts the face-tracking component without waiting (idempotent). Called at the start of a Part so the runtime has the whole warm-up to start tracking.</summary>
+    public void BeginFaceTrackingStartup(string startPoint = "preflight")
+    {
+        if (!FaceStartup.attempted) { FaceStartup.attempted = true; FaceStartup.requested_t_abs = CaptureClock.TAbs; FaceStartup.start_point = startPoint; }
+        if (testFaceReadiness != null) return;
+        bool had = faceExpressions != null;
+        EnsureFaceExpressionsLive();
+        if (!had && faceExpressions != null && FaceAutoCreated) FaceStartup.component_created_by_gate = true;
+    }
+
+    void EnsureFaceExpressionsLive()
+    {
+        var f = new BlinkFacts();
+        try
+        {
+            f.OvrPluginInitialized = OVRPlugin.initialized;
+            if (f.OvrPluginInitialized) { f.FaceTrackingSupported = OVRPlugin.faceTracking2Supported; f.FaceTrackingEnabled = OVRPlugin.faceTracking2Enabled; }
+            f.PermissionGranted = OVRPermissionsRequester.IsPermissionGranted(OVRPermissionsRequester.Permission.FaceTracking);
+        }
+        catch (Exception) { }
+        if (faceExpressions == null && !_faceSearched) { _faceSearched = true; faceExpressions = FindObjectOfType<OVRFaceExpressions>(); }
+        EnsureFaceExpressions(ref f);
+    }
+
+    /// <summary>All readiness facts, read live (no 1 Hz cache).</summary>
+    FaceReadinessFacts ReadFaceReadiness()
+    {
+        if (testFaceReadiness != null) return testFaceReadiness();
+        var f = new FaceReadinessFacts { DataSource = "" };
+        try
+        {
+            f.OvrInit = OVRPlugin.initialized;
+            if (f.OvrInit) { f.Supported = OVRPlugin.faceTracking2Supported; f.Started = OVRPlugin.faceTracking2Enabled; }
+            f.PermissionGranted = OVRPermissionsRequester.IsPermissionGranted(OVRPermissionsRequester.Permission.FaceTracking);
+        }
+        catch (Exception) { }
+        f.ComponentCreated = faceExpressions != null; f.ComponentEnabled = f.ComponentCreated && faceExpressions.isActiveAndEnabled;
+        if (f.OvrInit && f.Started)
+        {
+            try
+            {
+                f.ApiOk = OVRPlugin.GetFaceState2(OVRPlugin.Step.Render, -1, ref _faceReadyState);
+                if (f.ApiOk)
+                {
+                    f.StatusValid = _faceReadyState.Status.IsValid;
+                    if (f.StatusValid)
+                    {
+                        f.DataSource = _faceReadyState.DataSource == OVRPlugin.FaceTrackingDataSource.Audio ? "audio" : "visual";
+                        float[] w = _faceReadyState.ExpressionWeights; int i1 = (int)OVRFaceExpressions.FaceExpression.EyesClosedL, i2 = (int)OVRFaceExpressions.FaceExpression.EyesClosedR;
+                        f.EyeClosureAvailable = w != null && w.Length > Math.Max(i1, i2);
+                    }
+                }
+            }
+            catch (Exception) { f.ApiOk = false; }
+        }
+        return f;
+    }
+
+    /// <summary>
+    /// Bounded readiness wait: ends when a valid Visual frame with eyelid weights is observed, when the runtime is permanently unable (no runtime / unsupported), or after maxWaitSeconds - never unbounded.
+    /// Writes NOTHING (no gaze row, no face sample): it only observes. The outcome (including the precise unmet requirement) is in FaceStartup; the policy for a failure (continue / block) is the caller's.
+    /// </summary>
+    public IEnumerator AwaitFaceTrackingReady(float maxWaitSeconds, string startPoint = "preflight")
+    {
+        BeginFaceTrackingStartup(startPoint);
+        FaceStartup.max_wait_s = maxWaitSeconds; FaceStartup.ready = false; FaceStartup.failure_reason = "";
+        double t0 = CaptureClock.TAbs, nextEnsure = t0 + 0.5; FaceReadinessStage stage;
+        while (true)
+        {
+            FaceReadinessFacts f = ReadFaceReadiness(); stage = FaceReadiness.Evaluate(in f); FaceStartup.frames_polled++;
+            double now = CaptureClock.TAbs;
+            if (stage == FaceReadinessStage.Ready) { FaceStartup.ready = true; FaceStartup.ready_t_abs = now; FaceStartup.data_source_at_ready = f.DataSource ?? ""; break; }
+            if (FaceReadiness.IsPermanent(stage)) { FaceStartup.failure_reason = FaceReadiness.Name(stage) + ":permanent"; break; }
+            if (now - t0 >= maxWaitSeconds) { FaceStartup.failure_reason = FaceReadiness.Name(stage) + ":timeout_after_" + (now - t0).ToString("F2", CultureInfo.InvariantCulture) + "s"; break; }
+            if (now >= nextEnsure) { nextEnsure = now + 0.5; if (testFaceReadiness == null) EnsureFaceExpressionsLive(); }   // bounded re-start of a component that disabled itself (permission pending)
+            yield return null;
+        }
+        FaceStartup.stage = FaceReadiness.Name(stage); FaceStartup.wait_s = CaptureClock.TAbs - t0;
+        if (!FaceStartup.ready) Debug.LogWarning("[GazeRecorder] face tracking is NOT ready before the first gaze row: " + FaceStartup.failure_reason + " (no eyelid values will be recorded until it becomes available; blanks, never zeros)");
+        else if (enableDebugLogs) Debug.Log("[GazeRecorder] face tracking ready after " + FaceStartup.wait_s.ToString("F2", CultureInfo.InvariantCulture) + " s (" + FaceStartup.data_source_at_ready + ")");
     }
 
     IEnumerator SamplingLoop()
@@ -1143,8 +1228,10 @@ public class GazeRecorder : MonoBehaviour
             FaceReading fr = ReadFace();
             BlinkFacts bfNow = BlinkFactsLast;
             bool seam = testFaceReading != null || testEyeClosure != null;   // tests inject a live reading: the runtime facts do not apply to it
-            bool fInit = seam || bfNow.OvrPluginInitialized, fSupported = seam || bfNow.FaceTrackingSupported, fStarted = seam || bfNow.FaceTrackingEnabled;
-            string faceState = FaceClosure.Classify(fInit, fSupported, fStarted, bfNow.DataSource, in fr);
+            // Schema v17: "started" and the data source are read LIVE in this row's frame (ReadFace), not taken from the <=1 s old probe: a source switch Visual -> Audio is seen on the row it happens.
+            bool fInit = seam || bfNow.OvrPluginInitialized, fSupported = seam || bfNow.FaceTrackingSupported, fStarted = seam || fr.Started;
+            string fSource = !string.IsNullOrEmpty(fr.DataSource) ? fr.DataSource : (seam ? (bfNow.DataSource ?? "") : "");
+            string faceState = FaceClosure.Classify(fInit, fSupported, fStarted, fSource, in fr);
             FaceStateLast = faceState;
             LastRowFrame = Time.frameCount;
             bool faceCurrent = FaceClosure.IsCurrent(faceState);
@@ -1164,7 +1251,7 @@ public class GazeRecorder : MonoBehaviour
                 }
                 blinkState = (rl.HasValue && rr.HasValue) ? (Blink.InBlink ? "1" : "0") : "";
             }
-            string[] faceCols = FaceColumns.Values(faceState, fInit, fStarted, bfNow.DataSource, in fr);
+            string[] faceCols = FaceColumns.Values(faceState, fInit, fStarted, fSource, in fr);
             double tRel = tAbs - recordingStartRealtime;
             long unixMs = CaptureClock.TUnixMs;
             string sessionId = (dataCapture != null && !string.IsNullOrEmpty(dataCapture.SessionId))
@@ -1175,77 +1262,51 @@ public class GazeRecorder : MonoBehaviour
             TrySubscribeAnchors();
             string pipelineCols = PipelineColumns(tAbs, vfOk, in vf, in left, in right, gazeRaySource);
 
+            // ---------------- schema v17: the primary row (PrimaryColumns, 61) and the diagnostics row (DiagnosticColumns, 85) are built from the SAME values of this sample ----------------
+            string rayState = lc != null ? EyeTrackingNames.Of(lc.State) : "";
+            string originSource = EyeGazeOrigin.CombinedName(left.valid, left.originSource, right.valid, right.originSource);
             string row = string.Join(",", new string[]
             {
-                // ----- existing columns -----
-                F4(tRel),
-                Inv(unixMs),
-                SafeCsvField(subjectId),
-                SafeCsvField(trialId),
-                GazeConfidence.Format(left.confidence, left.confidenceAvailable),
-                left.valid ? "1" : "0",
-                V3(left.valid, left.origin), V3(left.valid, left.direction),
-                GazeConfidence.Format(right.confidence, right.confidenceAvailable),
-                right.valid ? "1" : "0",
-                V3(right.valid, right.origin), V3(right.valid, right.direction),
-                combinedValid ? "1" : "0",
-                GazeConfidence.Format(combinedConfOut, combinedConfAvailable),
-                // schema v5 (F-16): an invalid / unavailable vector is BLANK, never a fabricated default. Validity is decided ONLY by the *_valid flags
-                // (a valid vector may legitimately contain zeros). The head-forward fallback ray is not written here; see ray_* below.
+                // identification and time
+                F4(tAbs), F4(tRel), Inv(Time.frameCount), SafeCsvField(sessionId), SafeCsvField(subjectId), SafeCsvField(trialId),
+                dataCapture != null ? SafeCsvField(dataCapture.CurrentPart) : "", dataCapture != null ? SafeCsvField(dataCapture.CurrentPhase) : "",
+                // validity / provenance (an invalid / unavailable vector is BLANK, never a fabricated default; validity is decided ONLY by combined_valid / the blanks)
+                combinedValid ? "1" : "0", gazeRaySource, originSource, rayState,
+                V3(left.valid, left.origin), V3(left.valid, left.direction), V3(right.valid, right.origin), V3(right.valid, right.direction),
                 V3(combinedValid, combinedOrigin), V3(combinedValid, combinedDirection),
-                F4(headPos.x), F4(headPos.y), F4(headPos.z),
-                F4(headRot.x), F4(headRot.y), F4(headRot.z), F4(headRot.w),
-                roiName,
-                float.IsNaN(roiDistance) ? "" : F3(roiDistance),
-                // ----- Revision 2 appended columns -----
-                F4(tAbs),
-                SafeCsvField(sessionId),
-                Inv(Time.frameCount),
-                gazeRaySource,
-                didHit ? "1" : "0",
-                didHit ? F4(hp.x) : "", didHit ? F4(hp.y) : "", didHit ? F4(hp.z) : "",
-                SafeCsvField(aoi.colliderName),
-                SafeCsvField(aoi.objectName),
-                didHit ? Inv(aoi.instanceId) : "",
-                aoi.layer >= 0 ? Inv(aoi.layer) : "",
-                SafeCsvField(aoi.tag),
-                aoi.semanticClass,
-                SafeCsvField(aoi.buildingId),
-                SafeCsvField(aoi.npcId),
-                SafeCsvField(aoi.npcSpawnInstanceId),
-                aoi.isInteractable,
-                // ----- schema v5 appended columns -----
-                dataCapture != null ? SafeCsvField(dataCapture.CurrentPart) : "",
-                dataCapture != null ? SafeCsvField(dataCapture.CurrentPhase) : "",
-                rayIsEye ? "1" : "0",
-                F4(combinedOrigin.x), F4(combinedOrigin.y), F4(combinedOrigin.z),
-                F4(combinedDirection.x), F4(combinedDirection.y), F4(combinedDirection.z),
-                aoi.isCurrentTarget,
-                SafeCsvField(aoi.assignedDestination),
-                // ----- schema v8 appended columns -----
-                lc != null ? EyeTrackingNames.Of(lc.State) : "",
-                (probeKnown && !leftInjected) ? (lc.LeftProviderValid ? "1" : "0") : "",
-                (probeKnown && !rightInjected) ? (lc.RightProviderValid ? "1" : "0") : "",
-                // ----- schema v10 appended column -----
-                EyeGazeOrigin.CombinedName(left.valid, left.originSource, right.valid, right.originSource),
-                // ----- schema v11 appended columns -----
-                cl.HasValue ? F4(cl.Value) : "", cr.HasValue ? F4(cr.Value) : "", blinkState,
-                // ----- schema v13 appended columns -----
+                // rendered camera
                 V3(vfOk, vf.hmdPos), vfOk ? F4(vf.hmdRot.x) : "", vfOk ? F4(vf.hmdRot.y) : "", vfOk ? F4(vf.hmdRot.z) : "", vfOk ? F4(vf.hmdRot.w) : "",
-                V3(vfOk, vf.leftLocal), V3(vfOk, vf.rightLocal),
-                V3(vfOk, vf.leftWorld), V3(vfOk, vf.rightWorld),
-                (vfOk && vf.groundOk) ? F4(vf.groundY) : "",
-                (vfOk && vf.groundOk) ? F4(vf.hmdPos.y - vf.groundY) : "",
-                (vfOk && vf.groundOk) ? F4(vf.leftWorld.y - vf.groundY) : "",
-                (vfOk && vf.groundOk) ? F4(vf.rightWorld.y - vf.groundY) : "",
-                // ----- schema v14 appended columns (37, pre-joined) -----
-                pipelineCols,
-                // ----- schema v16 appended columns (10, pre-formatted) -----
-                string.Join(",", faceCols)
+                // gaze-ray interaction
+                didHit ? "1" : "0", didHit ? F4(hp.x) : "", didHit ? F4(hp.y) : "", didHit ? F4(hp.z) : "", float.IsNaN(roiDistance) ? "" : F3(roiDistance),
+                SafeCsvField(aoi.colliderName), SafeCsvField(aoi.objectName), didHit ? Inv(aoi.instanceId) : "", aoi.layer >= 0 ? Inv(aoi.layer) : "", SafeCsvField(aoi.tag), aoi.semanticClass,
+                SafeCsvField(aoi.buildingId), SafeCsvField(aoi.npcId), SafeCsvField(aoi.npcSpawnInstanceId), aoi.isInteractable, aoi.isCurrentTarget, SafeCsvField(aoi.assignedDestination),
+                // ground reference
+                (vfOk && vf.groundOk) ? F4(vf.groundY) : "", (vfOk && vf.groundOk) ? F4(vf.hmdPos.y - vf.groundY) : "",
+                (vfOk && vf.groundOk) ? F4(vf.leftWorld.y - vf.groundY) : "", (vfOk && vf.groundOk) ? F4(vf.rightWorld.y - vf.groundY) : "",
+                // eyelid closure (recovered) + compact validity
+                faceCols[6], faceCols[7], FaceClosure.IsCurrent(faceState) ? "1" : "0"
             });
+
+            string diagRow = recordDiagnostics ? string.Join(",", new string[]
+            {
+                F4(tAbs), Inv(Time.frameCount), SafeCsvField(sessionId),
+                Inv(unixMs),
+                pipelineCols,   // the 37 v14 provider-pipeline columns, pre-joined
+                GazeConfidence.Format(left.confidence, left.confidenceAvailable), left.valid ? "1" : "0", (probeKnown && !leftInjected) ? (lc.LeftProviderValid ? "1" : "0") : "",
+                GazeConfidence.Format(right.confidence, right.confidenceAvailable), right.valid ? "1" : "0", (probeKnown && !rightInjected) ? (lc.RightProviderValid ? "1" : "0") : "",
+                GazeConfidence.Format(combinedConfOut, combinedConfAvailable),
+                F4(headPos.x), F4(headPos.y), F4(headPos.z), F4(headRot.x), F4(headRot.y), F4(headRot.z), F4(headRot.w),
+                V3(vfOk, vf.leftLocal), V3(vfOk, vf.rightLocal), V3(vfOk, vf.leftWorld), V3(vfOk, vf.rightWorld),
+                faceCols[0], faceCols[1], faceCols[2], faceCols[3], faceCols[4], faceCols[5],
+                cl.HasValue ? F4(cl.Value) : "", cr.HasValue ? F4(cr.Value) : "",   // RAW SDK EyesClosedL / R (not recovered)
+                faceCols[8], faceCols[9], (FaceClosure.IsCurrent(faceState) && fr.ProviderTime > 0) ? fr.ProviderTime.ToString("F6", CultureInfo.InvariantCulture) : "",
+                blinkState,
+                combinedValid ? ",," : V3(true, combinedOrigin), combinedValid ? ",," : V3(true, combinedDirection)
+            }) : null;
 
             if (WriteRow(row))
             {
+                if (diagRow != null) WriteDiagRow(diagRow);
                 RowsWritten++;
                 if (double.IsNaN(FirstRowT)) FirstRowT = tAbs;
                 LastRowT = tAbs;
@@ -1278,6 +1339,13 @@ public class GazeRecorder : MonoBehaviour
     // Blank when the vector is invalid / unavailable; otherwise three fixed-4 components (zeros are valid values).
     static string V3(bool valid, Vector3 v) => valid ? F4(v.x) + "," + F4(v.y) + "," + F4(v.z) : ",,";
 
+    // The diagnostics row of an accepted gaze row (one-to-one). A failure here never stops the primary stream; it is counted by the writer and reported in the manifest.
+    void WriteDiagRow(string row)
+    {
+        if (diagWriter == null || _closedForSession) return;
+        diagWriter.WriteLine(row);
+    }
+
     // Rows go through the shared CaptureCsvWriter: lazy header, failure state + counters + bounded recovery (F-13). Returns true only if the row reached the file.
     bool WriteRow(string row)
     {
@@ -1299,6 +1367,7 @@ public class GazeRecorder : MonoBehaviour
         StopRecording();
         _closedForSession = true;
         if (gazeWriter != null) gazeWriter.Close();
+        if (diagWriter != null) diagWriter.Close();
     }
 
     // F-02: every number in gaze.csv is formatted with the invariant culture. The row is comma-joined without quoting, so a

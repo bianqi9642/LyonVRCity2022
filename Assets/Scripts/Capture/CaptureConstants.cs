@@ -229,7 +229,15 @@ public static class CaptureConstants
     //    eyes_look_down_left/right, eyes_closed_left/right_recovered, face_sample_frame, face_data_source. eyes_closed_left/right/blink_state keep their meaning (raw SDK weights / detector state); blink detection now
     //    uses the recovered closure and the signal is read live per row. GazeRecorder creates OVRFaceExpressions at run time when missing (autoCreateFaceExpressions). Manifest eye_tracking.blink gains the
     //    fields listed in BlinkManifest (schema v16). No existing column, field or file changes.
-    public const int    SchemaVersion   = 16;
+    // 17: gaze.csv is reduced to a 61-column analysis table and a NEW stream gaze_diagnostics.csv (85 columns, one row per gaze row, keys session_id + frame_index + t_abs) carries the QA / reproduction columns.
+    //    Removed from gaze.csv (moved to gaze_diagnostics.csv unless noted): unix_time_ms, left/right/combined_confidence, left/right_valid, left/right_provider_valid, head_pos_*, head_rot_*, left/right_eye_head_local_*,
+    //    left/right_eye_world_*, all v14 provider-pipeline columns, origin_fallback_reason, face_state, face_tracking_started, face_data_source, face_expressions_valid, eye_following_valid, eyes_look_down_*,
+    //    raw eyes_closed_left/right, face_sample_frame, blink_state; removed outright (derivable, see docs/schema_v17_changes.md): ray_origin_*, ray_dir_*, ray_is_eye_gaze, roi_hit_name.
+    //    New in gaze.csv: face_closure_valid (and the explicit eyes_closed_left/right_recovered kept from v16). New in gaze_diagnostics.csv: face_provider_time_s, fallback_ray_origin_* / fallback_ray_dir_* (the cast ray of head-fallback rows). No column keeps a name with a different meaning.
+    //    Audio: audio_index.csv is written once at finalisation from ONE frozen clock map (t_abs columns identical in meaning, no longer provisional); audio_anchors.csv holds every anchor including the first.
+    //    Manifest: eye_tracking.blink gains startup_* and the blink-detection honesty fields; audio_capture gains time_mapping*, index_* classification fields. Readers of v11-v16 files are unchanged.
+    public const int    SchemaVersion   = 17;
+    public const string GazeDiagnosticsFile = "gaze_diagnostics.csv";
     public const string NpcIdScheme     = "agent-lifetime-v1: npc_id=AgentID (stable pooled GameObject); npc_spawn_instance_id=<AgentID>-S<n> (n = per-AgentID lifetime index, from 1)";
     public const string NpcCaptureModeText =
         "master_switch: npc_state.csv holds every active NPC lifetime of a Part whose npcCaptureEnabled is true, from the moment NPCs exist (warm-up, " +

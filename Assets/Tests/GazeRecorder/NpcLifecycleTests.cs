@@ -307,6 +307,16 @@ public partial class NpcLifecycleTests
     Csv NpcState(Rig r) => Csv.Load(r.File("npc_state.csv"));
     Csv Lifetimes(Rig r) => Csv.Load(r.File("npc_lifetimes.csv"));
 
+    // schema v17: the gaze file pair has exactly the documented columns, in the documented order (the arrays are the production single source of truth)
+    static void AssertV17Header(Csv csv)
+    {
+        Assert.IsTrue(csv.MergedV17, "a v17 gaze.csv with its gaze_diagnostics.csv beside it");
+        CollectionAssert.AreEqual((string[])T("GazeRecorder").GetField("PrimaryColumns").GetValue(null), csv.PrimaryHeader, "gaze.csv header");
+        CollectionAssert.AreEqual((string[])T("GazeRecorder").GetField("DiagnosticColumns").GetValue(null), csv.DiagnosticHeader, "gaze_diagnostics.csv header");
+        Assert.AreEqual(61, csv.PrimaryHeader.Count); Assert.AreEqual(85, csv.DiagnosticHeader.Count);
+        Assert.AreEqual(csv.PrimaryHeader.Count, new HashSet<string>(csv.PrimaryHeader).Count, "no duplicate column in gaze.csv"); Assert.AreEqual(csv.DiagnosticHeader.Count, new HashSet<string>(csv.DiagnosticHeader).Count, "no duplicate column in gaze_diagnostics.csv");
+    }
+
     static void AssertWidths(Csv c, string name)
     {
         Assert.IsTrue(c.Exists, name + " does not exist");
@@ -778,7 +788,7 @@ public partial class NpcLifecycleTests
         Call(rig.em, "TerminateSession", "Part3");
         yield return null;
         string manifest = File.ReadAllText(rig.File("session_manifest.json"));
-        StringAssert.Contains("\"schema_version\": " + 16, manifest);
+        StringAssert.Contains("\"schema_version\": " + 17, manifest);
         StringAssert.Contains("agent-lifetime-v1", manifest);
         StringAssert.Contains("(session_id, npc_spawn_instance_id)", manifest);
         StringAssert.Contains("master_switch", manifest);

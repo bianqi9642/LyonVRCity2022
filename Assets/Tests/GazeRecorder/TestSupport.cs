@@ -8,6 +8,7 @@ using System.IO;
 using System.Reflection;
 using System.Text;
 using NUnit.Framework;
+using UnityEngine;
 
 static class Reflect
 {
@@ -61,6 +62,9 @@ static class Reflect
     }
 }
 
+// Reaches GazeRecorder.DiagnosticsPathFor (production type in Assembly-CSharp) without a compile-time reference.
+static class GazeRecorderHandle { public static string DiagPath(string gazePath) => (string)Reflect.T("GazeRecorder").GetMethod("DiagnosticsPathFor").Invoke(null, new object[] { gazePath }); }
+
 sealed class Csv
 {
     public List<string> Header = new List<string>();
@@ -81,7 +85,12 @@ sealed class Csv
         foreach (var r in Rows) if (r[c] == value) yield return r;
     }
 
-    public static Csv Load(string path)
+    /// <summary>True when this view was built from a v17 gaze.csv + gaze_diagnostics.csv pair (see Load).</summary>
+    public bool MergedV17;
+    public List<string> PrimaryHeader = new List<string>(), DiagnosticHeader = new List<string>();
+
+    /// <summary>The file exactly as written (no merging): use for schema / width assertions.</summary>
+    public static Csv LoadRaw(string path)
     {
         var c = new Csv();
         if (!File.Exists(path)) return c;
@@ -90,6 +99,51 @@ sealed class Csv
         if (all.Count == 0) return c;
         c.Header = all[0];
         for (int i = 1; i < all.Count; i++) c.Rows.Add(all[i]);
+        return c;
+    }
+
+    /// <summary>
+    /// Loads a CSV. A schema-v17 gaze.csv that has its gaze_diagnostics.csv beside it is returned as ONE view (the offline reader's job): the diagnostics columns are appended row by row (the files are
+    /// one-to-one, checked here through frame_index and t_abs), and the columns that v17 no longer stores but that are fully derivable (ray_origin_*, ray_dir_*, ray_is_eye_gaze, roi_hit_name) are
+    /// reconstructed with the documented rules. Every other file, and every historical v11-v16 gaze.csv, is returned unchanged.
+    /// </summary>
+    public static Csv Load(string path)
+    {
+        var c = LoadRaw(path);
+        if (!c.Exists || !c.Header.Contains("face_closure_valid") || !c.Header.Contains("t_abs")) return c;
+        string diagPath = (string)typeof(GazeRecorderHandle).GetMethod("DiagPath").Invoke(null, new object[] { path });
+        var d = LoadRaw(diagPath);
+        if (!d.Exists) return c;
+        c.MergedV17 = true; c.PrimaryHeader = new List<string>(c.Header); c.DiagnosticHeader = new List<string>(d.Header);
+        Assert.AreEqual(c.Rows.Count, d.Rows.Count, "gaze_diagnostics.csv has exactly one row per gaze row");
+        int fi = c.Header.IndexOf("frame_index"), ti = c.Header.IndexOf("t_abs"), dfi = d.Header.IndexOf("frame_index"), dti = d.Header.IndexOf("t_abs");
+        var extra = new List<int>(); for (int k = 0; k < d.Header.Count; k++) if (!c.Header.Contains(d.Header[k])) extra.Add(k);
+        for (int r = 0; r < c.Rows.Count; r++)
+        {
+            Assert.AreEqual(c.Rows[r][fi], d.Rows[r][dfi], "diagnostics row " + r + " belongs to the same frame");
+            Assert.AreEqual(c.Rows[r][ti], d.Rows[r][dti], "diagnostics row " + r + " has the same t_abs");
+            foreach (int k in extra) c.Rows[r].Add(d.Rows[r][k]);
+        }
+        foreach (int k in extra) c.Header.Add(d.Header[k]);
+        // derived v16 columns
+        int cv = c.Header.IndexOf("combined_valid"), hx = c.Header.IndexOf("hmd_world_x"), hq = c.Header.IndexOf("hmd_world_rot_x"), co = c.Header.IndexOf("combined_origin_x"), cd = c.Header.IndexOf("combined_dir_x"), hn = c.Header.IndexOf("hit_collider_name"), fo = c.Header.IndexOf("fallback_ray_origin_x");
+        string[] ro = { "ray_origin_x", "ray_origin_y", "ray_origin_z", "ray_dir_x", "ray_dir_y", "ray_dir_z" };
+        foreach (var n in ro) c.Header.Add(n); c.Header.Add("ray_is_eye_gaze"); c.Header.Add("roi_hit_name");
+        foreach (var row in c.Rows)
+        {
+            bool eye = row[cv] == "1";
+            if (eye) { for (int k = 0; k < 3; k++) row.Add(row[co + k]); for (int k = 0; k < 3; k++) row.Add(row[cd + k]); }
+            else if (fo >= 0 && row[fo] != "") { for (int k = 0; k < 6; k++) row.Add(row[fo + k]); }   // the cast ray of a head-fallback row is recorded in the diagnostics (fallback_ray_origin_*, fallback_ray_dir_*)
+            else if (row[hx] == "" || row[hq] == "") { for (int k = 0; k < 6; k++) row.Add(""); }   // nothing recorded and no rendered view: blank, never invented
+            else
+            {
+                float F(int i) => float.Parse(row[i], System.Globalization.CultureInfo.InvariantCulture);
+                var pos = new Vector3(F(hx), F(hx + 1), F(hx + 2)); var fwd = new Quaternion(F(hq), F(hq + 1), F(hq + 2), F(hq + 3)) * Vector3.forward;
+                var f4 = System.Globalization.CultureInfo.InvariantCulture;
+                row.Add(pos.x.ToString("F4", f4)); row.Add(pos.y.ToString("F4", f4)); row.Add(pos.z.ToString("F4", f4)); row.Add(fwd.x.ToString("F4", f4)); row.Add(fwd.y.ToString("F4", f4)); row.Add(fwd.z.ToString("F4", f4));
+            }
+            row.Add(eye ? "1" : "0"); row.Add(eye ? row[hn] : "");
+        }
         return c;
     }
 

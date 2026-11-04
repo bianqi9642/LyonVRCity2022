@@ -711,6 +711,7 @@ public class DataCaptureManager : MonoBehaviour
             if (_audio.Finalized && _audio.FinalizationOk) closed.Add("audio"); else { failed.Add("audio"); if (errors.Count == 0 || !errors.Exists(x => x.StartsWith("audio"))) errors.Add("audio: not finalized"); }
         }
         if (_gazeRecorder != null && _gazeRecorder.Writer != null) One("gaze", _gazeRecorder.Writer);   // closed by GazeRecorder.CloseForSession; verified here so its failure is not lost
+        if (_gazeRecorder != null && _gazeRecorder.DiagnosticsWriter != null) One("gaze_diagnostics", _gazeRecorder.DiagnosticsWriter);
         lock (_gate) { _captureStreamsClosed = closed.ToArray(); _captureStreamsFailed = failed.ToArray(); }
     }
 
@@ -723,7 +724,7 @@ public class DataCaptureManager : MonoBehaviour
         {
             UpdateManifestEvidence("capture_closed");
             _fileList.Clear();
-            foreach (string f in new[] { "session_manifest.json", "events.csv", "gaze.csv", "trajectory.csv", "building_registry.csv", "npc_state.csv", "npc_events.csv", "npc_lifetimes.csv", "npc_profiles.csv" }) AddIfExists(f);
+            foreach (string f in new[] { "session_manifest.json", "events.csv", "gaze.csv", CaptureConstants.GazeDiagnosticsFile, "trajectory.csv", "building_registry.csv", "npc_state.csv", "npc_events.csv", "npc_lifetimes.csv", "npc_profiles.csv" }) AddIfExists(f);
             AddAudioFiles();
             _manifest.file_list = _fileList.ToArray();
             _finalManifestWriting = true;
@@ -2259,6 +2260,7 @@ public class DataCaptureManager : MonoBehaviour
         AddIfExists("session_manifest.json");
         AddIfExists("events.csv");
         AddIfExists("gaze.csv");
+        AddIfExists(CaptureConstants.GazeDiagnosticsFile);
         AddIfExists("trajectory.csv");
         AddIfExists("building_registry.csv");
         AddIfExists("npc_state.csv");
@@ -2283,7 +2285,7 @@ public class DataCaptureManager : MonoBehaviour
         FillNpcRateManifest();
         UpdateManifestEvidence(reason);
         _fileList.Clear();
-        foreach (string f in new[] { "session_manifest.json", "events.csv", "gaze.csv", "trajectory.csv", "building_registry.csv", "npc_state.csv", "npc_events.csv", "npc_lifetimes.csv", "npc_profiles.csv" }) AddIfExists(f);
+        foreach (string f in new[] { "session_manifest.json", "events.csv", "gaze.csv", CaptureConstants.GazeDiagnosticsFile, "trajectory.csv", "building_registry.csv", "npc_state.csv", "npc_events.csv", "npc_lifetimes.csv", "npc_profiles.csv" }) AddIfExists(f);
         AddAudioFiles();
         _manifest.file_list = _fileList.ToArray();
         WriteManifest();
@@ -2419,12 +2421,14 @@ public class DataCaptureManager : MonoBehaviour
                 bm.invalid_samples = gr.Blink.InvalidSamples; bm.out_of_range_samples = gr.Blink.OutOfRangeSamples;
                 bm.mean_duration_s = gr.Blink.Blinks > 0 ? gr.Blink.MeanDuration : -1; bm.max_duration_s = gr.Blink.Blinks > 0 ? gr.Blink.MaxDuration : -1;
             }
-            bm.absence_of_blink_events_is_evidence_of_no_blinks = gr.BlinkStatus == BlinkCapability.Available;
+            bm.absence_of_blink_events_is_evidence_of_no_blinks = false;   // v17: never true - the detector is uncalibrated and needs both eyes closed (see blink_detection_note)
             bm.auto_create_enabled = gr.autoCreateFaceExpressions; bm.component_auto_created = gr.FaceAutoCreated; bm.permission_requested = gr.FacePermissionRequested; bm.start_attempts = gr.FaceStartAttempts;
             bm.state_api_probed = bf.StateApiProbed; bm.state_api_ok = bf.StateApiOk; bm.state_status_valid = bf.StateStatusValid; bm.data_source_last = bf.DataSource ?? "";
             bm.provider_time_last_s = bf.StateApiOk ? bf.ProviderTime : -1; bm.face_state_last = gr.FaceStateLast;
             bm.rows_face_current = gr.FaceSignal.rows_current; bm.rows_face_not_current = gr.FaceSignal.rows_not_current; bm.interruptions = gr.FaceSignal.interruptions;
             bm.recoveries = gr.FaceSignal.recoveries; bm.longest_gap_s = gr.FaceSignal.longest_gap_s; bm.rows_eye_following_valid = gr.RowsFaceEyeFollowing; bm.rows_audio_only_source = gr.RowsFaceAudioOnly;
+            { var fs = gr.FaceStartup; bm.startup_attempted = fs.attempted; bm.startup_ready = fs.ready; bm.startup_stage = fs.stage; bm.startup_failure_reason = fs.failure_reason; bm.startup_point = fs.start_point; bm.startup_data_source_at_ready = fs.data_source_at_ready;
+              bm.startup_wait_s = fs.wait_s; bm.startup_max_wait_s = fs.max_wait_s; bm.startup_requested_t_abs = fs.requested_t_abs; bm.startup_ready_t_abs = fs.ready_t_abs; bm.startup_frames_polled = fs.frames_polled; bm.startup_component_created_by_gate = fs.component_created_by_gate; }
             _manifest.late_gaze_rows_rejected = gr.LateRowsRejected;
         }
         DeriveEyeTrackingAliases(et);

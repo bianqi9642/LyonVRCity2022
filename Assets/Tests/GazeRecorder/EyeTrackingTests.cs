@@ -489,8 +489,8 @@ public partial class NpcLifecycleTests
 
         var csv = Csv.Load(rig.File("gaze.csv"));
         Assert.Greater(csv.Rows.Count, 5);
-        Assert.AreEqual(143, csv.Header.Count);   // 133 + 10 schema-v16 face columns
-        CollectionAssert.AreEqual(new[] { "eye_tracking_state", "left_provider_valid", "right_provider_valid" }, csv.Header.GetRange(66, 3), "schema v9 columns are appended at the END");
+        AssertV17Header(csv);   // schema v17: 61 + 85 documented columns
+        Assert.AreEqual("eye_tracking_state", csv.PrimaryHeader[11], "v17: the lifecycle state is a compact provenance column of gaze.csv"); CollectionAssert.IsSubsetOf(new[] { "left_provider_valid", "right_provider_valid" }, csv.DiagnosticHeader, "v17: the provider flags are diagnostics");
         foreach (var r in csv.Rows)
         {
             Assert.AreEqual("head_fallback", csv.Get(r, "gaze_ray_source")); Assert.AreEqual("0", csv.Get(r, "ray_is_eye_gaze"));
@@ -499,7 +499,7 @@ public partial class NpcLifecycleTests
         }
 
         var m = JObject.Parse(File.ReadAllText(rig.File("session_manifest.json")));
-        Assert.AreEqual(16, (int)m["schema_version"]);
+        Assert.AreEqual(17, (int)m["schema_version"]);
         Assert.AreEqual("ok", (string)m["gaze_writer_status"], "the CSV WRITER is healthy ...");
         Assert.AreEqual("ok", (string)m["health_gaze"]["status"], "(unchanged legacy field)");
         Assert.AreEqual("not_applicable", (string)m["gaze_acquisition_status"], "... which says nothing about whether eyes were tracked");

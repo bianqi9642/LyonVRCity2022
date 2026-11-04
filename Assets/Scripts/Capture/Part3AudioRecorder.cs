@@ -121,7 +121,12 @@ public class AudioCaptureManifest
     public int buffer_overruns, interruption_count;
     public double interruption_total_s;
     public string[] gaps = new string[0];
-    public int clock_anchor_count;
+    public int clock_anchor_count;           // = the number of anchor ROWS actually persisted in audio_anchors.csv (verified at finalisation)
+    public string time_mapping = "";         // schema v17: how every audio_index timestamp was produced ("final_frozen_affine_per_segment_v1")
+    public bool time_mapping_frozen;         // true once the final map was frozen and the index written from it
+    public int index_rows;
+    public double index_max_boundary_mismatch_s = -1;   // largest |t0(row n+1) - t1(row n)| over adjacent rows (0 up to float formatting for a frozen mapping)
+    public string index_timestamp_classification = "";  // none | float_representation | clock_fit_uncertainty | actual_discontinuity | timestamp_mapping_defect
     public double residual_rms_ms = -1, timing_uncertainty_ms = -1;
     public string timing_uncertainty_note = "";
     public AudioSegmentFit[] segments = new AudioSegmentFit[0];
@@ -201,7 +206,9 @@ public class Part3AudioRecorder : MonoBehaviour
     // ---- internals ----
     string _device = ""; int _rate, _channels, _ringFrames;
     MicCursor _cursor; AudioClockMap _map; WavFileWriter _wav; AudioWriteQueue _queue;
-    CaptureCsvWriter _indexCsv, _anchorCsv;
+    CaptureCsvWriter _journalCsv, _anchorCsv;     // _journalCsv = audio_index.csv.partial: the IMMUTABLE chunk facts (no timestamps); audio_index.csv is written once from the frozen map
+    readonly List<ChunkRecord> _chunks = new List<ChunkRecord>();
+    bool _anchorsClosed; long _anchorRowsPersisted, _anchorWriteFailures;
     float[] _readBuf; double _clickT, _tRequested, _firstSampleT = double.NaN, _tEnd = double.NaN;
     long _framesWritten;               // frames accepted into the file (sample_index of the next frame)
     int _lastPos; double _lastAdvanceT, _lastAnchorT, _lastFlushT;
@@ -213,6 +220,14 @@ public class Part3AudioRecorder : MonoBehaviour
     bool _writerFailedReported; readonly List<string> _trail = new List<string>();
     string _recordingId = "", _audioDir = "", _wavPath = "", _metaPath = "";
     bool _stopRequested, _startedOnce;
+
+    /// <summary>One entry of the audio index: sample range and chunk facts only. Its t_abs interval is derived at finalisation from the frozen clock map and is never stored here.</summary>
+    sealed class ChunkRecord
+    {
+        public int index, segment, micPos, anchorId, overrunsCum; public long s0, s1, dropped; public string status = "ok";
+        public double clockT0 = double.NaN, clockT1 = double.NaN;   // gap rows only: the interval as the clock saw it (fallback when no neighbouring chunk exists)
+        public bool IsGap => status.StartsWith("gap_");
+    }
 
     void Awake() { Instance = this; EnsureApis(); }
     void OnDestroy() { if (Instance == this) Instance = null; if (!Finalized && (_wav != null || State == AudioCaptureState.Recording)) FinalizeForSession("on_destroy"); }
@@ -379,9 +394,11 @@ public class Part3AudioRecorder : MonoBehaviour
 
         _firstSampleT = first; Manifest.first_sample_t_abs_est = first; Manifest.audio_start_latency_ms = latency * 1000.0;
         _framesWritten = 0; _lastPos = 0; _lastAdvanceT = tRead; _lastAnchorT = tRead; _lastFlushT = tRead;
-        _map.BeginSegment(0); _map.AddAnchor(0, first, 0, AudioSettings.dspTime); WriteAnchorRow(_map.Current.anchors[0]);
-        _cursor.Begin(0, first);
+        // The anchor files must exist BEFORE the first anchor is taken: the first anchor used to be written while the writer was still null and was therefore never persisted.
+        _chunks.Clear(); _chunkIndex = 0; _anchorsClosed = false; _anchorRowsPersisted = 0; _anchorWriteFailures = 0;
         OpenIndexFiles(folder);
+        _map.BeginSegment(0); var anchor0 = _map.AddAnchor(0, first, 0, AudioSettings.dspTime); WriteAnchorRow(anchor0); _chunkAnchorId = anchor0.id; Manifest.clock_anchor_count = _map.AnchorCount;
+        _cursor.Begin(0, first);
         OpenChunk(0, first, 0);
         // write the first drain now so the writer is proven alive before the experiment may proceed
         SetState(AudioCaptureState.Recording);
@@ -400,9 +417,9 @@ public class Part3AudioRecorder : MonoBehaviour
         try { _queue?.Complete(1000); } catch (Exception) { }
         try { _wav?.Dispose(); if (_wav != null) TryDelete(_wav.PartialPath); } catch (Exception) { }
         _queue = null; _wav = null; _cursor = null; _map = null;
-        try { _indexCsv?.Close(); _anchorCsv?.Close(); } catch (Exception) { }
-        _indexCsv = _anchorCsv = null;
-        string d = _audioDir; try { if (!string.IsNullOrEmpty(d)) { foreach (var f in new[] { "audio_index.csv", "audio_anchors.csv", "audio_metadata.json" }) { string p = Path.Combine(d, f); if (File.Exists(p) && !Started) File.Delete(p); } } } catch (Exception) { }
+        try { _journalCsv?.Close(); _anchorCsv?.Close(); } catch (Exception) { }
+        _journalCsv = _anchorCsv = null; _chunks.Clear();
+        string d = _audioDir; try { if (!string.IsNullOrEmpty(d)) { foreach (var f in new[] { "audio_index.csv", "audio_index.csv.partial", "audio_anchors.csv", "audio_metadata.json" }) { string p = Path.Combine(d, f); if (File.Exists(p) && !Started) File.Delete(p); } } } catch (Exception) { }
     }
     static void TryDelete(string p) { try { if (!string.IsNullOrEmpty(p) && File.Exists(p)) File.Delete(p); } catch (Exception) { } }
 
@@ -411,11 +428,9 @@ public class Part3AudioRecorder : MonoBehaviour
 
     void OpenIndexFiles(string folder)
     {
-        string sid = sessionIdProvider?.Invoke() ?? "";
-        _indexCsv = new CaptureCsvWriter(Path.Combine(_audioDir, "audio_index.csv"),
-            "session_id,part_id,audio_recording_id,chunk_index,sample_index_start,sample_index_end_exclusive,t_abs_start_est,t_abs_end_est,sample_rate_hz,channels,frames_written,duration_sec,microphone_position,clock_anchor_id,dropped_frames,buffer_overrun_count,write_status,segment", "audio_index");
-        _anchorCsv = new CaptureCsvWriter(Path.Combine(_audioDir, "audio_anchors.csv"),
-            "session_id,audio_recording_id,clock_anchor_id,segment,sample_index,t_abs,microphone_buffer_position,sample_rate_hz,dsp_time", "audio_anchors");
+        // Journal of immutable chunk facts, appended row by row during recording (crash safe). The authoritative audio_index.csv is produced once, at finalisation, from the frozen clock map.
+        _journalCsv = new CaptureCsvWriter(Path.Combine(_audioDir, "audio_index.csv.partial"), AudioIndexFormat.JournalHeader, "audio_index_journal");
+        _anchorCsv = new CaptureCsvWriter(Path.Combine(_audioDir, "audio_anchors.csv"), AudioIndexFormat.AnchorHeader, "audio_anchors");
     }
 
     // ============================================================================================ per-frame drain
@@ -471,16 +486,16 @@ public class Part3AudioRecorder : MonoBehaviour
                 _clipCount += PcmConvert.FloatToPcm16(_readBuf, skip, bytes, framesInBuf * _channels * 2, part * _channels);
                 framesInBuf += part;
             }
-            if (framesInBuf == 0) { _queue.Enqueue(bytes, 0); _droppedFrames += toRead; _chunkDropped += toRead; _map.BeginSegment(_framesWritten); break; }   // unreadable ring: count the loss, never invent samples
+            if (framesInBuf == 0) { _queue.Enqueue(bytes, 0); _droppedFrames += toRead; _chunkDropped += toRead; BreakSegment("gap_unreadable", now, pos, toRead); break; }   // unreadable ring: count the loss, never invent samples
             bool accepted = !_wav.Failed && _queue.Enqueue(bytes, framesInBuf * _channels * 2);
             if (accepted) { _framesWritten += framesInBuf; _map.ExtendSegment(_framesWritten); }
-            else if (!_wav.Failed) { _droppedFrames += framesInBuf; _chunkDropped += framesInBuf; _map.BeginSegment(_framesWritten); }
+            else if (!_wav.Failed) { _droppedFrames += framesInBuf; _chunkDropped += framesInBuf; BreakSegment("gap_backlog_dropped", now, pos, framesInBuf); }
             else { _droppedFrames += framesInBuf; _chunkDropped += framesInBuf; }
             done += framesInBuf; toRead -= framesInBuf;
             if (framesInBuf < cnt) break;
         }
         _lastPos = pos;
-        if (d.frames > 0 && (now - _lastAnchorT >= anchorIntervalSeconds))
+        if (d.frames > 0 && !_anchorsClosed && (now - _lastAnchorT >= anchorIntervalSeconds))
         {
             var a = _map.AddAnchor(_framesWritten, now, pos, AudioSettings.dspTime); WriteAnchorRow(a); _lastAnchorT = now; _chunkAnchorId = a.id; Manifest.clock_anchor_count = _map.AnchorCount;
         }
@@ -501,9 +516,9 @@ public class Part3AudioRecorder : MonoBehaviour
         double readableSec = d.frames / (double)_rate, lostSec = d.lostFrames / (double)_rate;
         double gapEnd = now - readableSec, gapStart = gapEnd - lostSec;
         if (_framesWritten > _chunkStartFrame) CloseChunk(gapStart, "ok");
-        WriteIndexRow(_framesWritten, _framesWritten, gapStart, gapEnd, pos, _chunkAnchorId, d.lostFrames, "gap_overrun", _map.Current != null ? _map.Current.id : 0, 0); _chunkIndex++;
         var seg = _map.BeginSegment(_framesWritten);
         var a = _map.AddAnchor(_framesWritten, gapEnd, pos, AudioSettings.dspTime); WriteAnchorRow(a); _chunkAnchorId = a.id;
+        RecordChunk(_framesWritten, _framesWritten, pos, a.id, d.lostFrames, "gap_overrun", seg.id, gapStart, gapEnd);
         _gaps.Add(gapStart.ToString("F3", CultureInfo.InvariantCulture) + "-" + gapEnd.ToString("F3", CultureInfo.InvariantCulture) + ":buffer_overrun:" + d.lostFrames + "_frames");
         OpenChunk(_framesWritten, gapEnd, pos);
         if (State == AudioCaptureState.Recording) SetState(AudioCaptureState.BufferOverrun);
@@ -516,28 +531,47 @@ public class Part3AudioRecorder : MonoBehaviour
     void CloseChunk(double now, string status)
     {
         long end = _framesWritten; if (end <= _chunkStartFrame && _chunkDropped == 0) { _chunkOpenT = now; return; }
-        WriteIndexRow(_chunkStartFrame, end, _map.TimeOf(_chunkStartFrame), _map.TimeOf(end), _chunkLastPos, _chunkAnchorId, _chunkDropped, status, _chunkSegment, _chunkOverruns);
-        _chunkIndex++; OpenChunk(end, now, _chunkLastPos);
+        RecordChunk(_chunkStartFrame, end, _chunkLastPos, _chunkAnchorId, _chunkDropped, status, _chunkSegment);
+        OpenChunk(end, now, _chunkLastPos);
     }
 
-    void WriteIndexRow(long s0, long s1, double t0, double t1, int pos, int anchorId, long dropped, string status, int segment, int overruns)
+    /// <summary>
+    /// Registers one index entry (a chunk or an explicit gap row). Only IMMUTABLE facts are kept - sample range, segment, status, anchor id - and journalled to audio_index.csv.partial.
+    /// No timestamp is computed here: the live clock map still changes whenever an anchor arrives, so a time taken now would belong to a mapping version that is replaced a moment later.
+    /// </summary>
+    void RecordChunk(long s0, long s1, int pos, int anchorId, long dropped, string status, int segment, double clockT0 = double.NaN, double clockT1 = double.NaN)
     {
-        if (_indexCsv == null) return;
-        long frames = s1 - s0; string sid = sessionIdProvider?.Invoke() ?? "";
-        var f = new List<string> { sid, "Part3", _recordingId, _chunkIndex.ToString(CultureInfo.InvariantCulture), s0.ToString(CultureInfo.InvariantCulture), s1.ToString(CultureInfo.InvariantCulture),
-            t0.ToString("F6", CultureInfo.InvariantCulture), t1.ToString("F6", CultureInfo.InvariantCulture), _rate.ToString(CultureInfo.InvariantCulture), _channels.ToString(CultureInfo.InvariantCulture),
-            frames.ToString(CultureInfo.InvariantCulture), (frames / (double)_rate).ToString("F6", CultureInfo.InvariantCulture), pos.ToString(CultureInfo.InvariantCulture),
-            anchorId >= 0 ? anchorId.ToString(CultureInfo.InvariantCulture) : "", dropped.ToString(CultureInfo.InvariantCulture), (_overruns).ToString(CultureInfo.InvariantCulture), status, segment.ToString(CultureInfo.InvariantCulture) };
-        _indexCsv.WriteLine(_indexCsv.Join(f));
+        var c = new ChunkRecord { index = _chunkIndex++, segment = segment, s0 = s0, s1 = s1, micPos = pos, anchorId = anchorId, dropped = dropped, overrunsCum = _overruns, status = status, clockT0 = clockT0, clockT1 = clockT1 };
+        _chunks.Add(c);
+        if (_journalCsv == null) return;
+        var f = new List<string> { c.index.ToString(CultureInfo.InvariantCulture), c.segment.ToString(CultureInfo.InvariantCulture), s0.ToString(CultureInfo.InvariantCulture), s1.ToString(CultureInfo.InvariantCulture),
+            (s1 - s0).ToString(CultureInfo.InvariantCulture), _rate.ToString(CultureInfo.InvariantCulture), pos.ToString(CultureInfo.InvariantCulture), anchorId >= 0 ? anchorId.ToString(CultureInfo.InvariantCulture) : "",
+            dropped.ToString(CultureInfo.InvariantCulture), c.overrunsCum.ToString(CultureInfo.InvariantCulture), status,
+            double.IsNaN(clockT0) ? "" : clockT0.ToString("F6", CultureInfo.InvariantCulture), double.IsNaN(clockT1) ? "" : clockT1.ToString("F6", CultureInfo.InvariantCulture) };
+        _journalCsv.WriteLine(_journalCsv.Join(f));
     }
 
-    void WriteAnchorRow(AudioClockMap.Anchor a)
+    /// <summary>A break of the continuous sample stream with no interruption event (unreadable ring, backlog drop): close the open chunk, start a new segment with its own anchor and record an explicit gap row.</summary>
+    void BreakSegment(string status, double now, int pos, long lostFrames)
     {
-        if (_anchorCsv == null) return;
+        if (_framesWritten > _chunkStartFrame) CloseChunk(now, "ok");
+        var seg = _map.BeginSegment(_framesWritten);
+        var a = _map.AddAnchor(_framesWritten, now, pos, AudioSettings.dspTime); WriteAnchorRow(a); _chunkAnchorId = a.id; Manifest.clock_anchor_count = _map.AnchorCount;
+        RecordChunk(_framesWritten, _framesWritten, pos, a.id, lostFrames, status, seg.id, now, now);
+        OpenChunk(_framesWritten, now, pos);
+    }
+
+    /// <summary>Persists one anchor row. Returns false (and counts the failure) when the row did not reach the file: finalisation then refuses to call the stream complete.</summary>
+    bool WriteAnchorRow(AudioClockMap.Anchor a)
+    {
+        if (_anchorCsv == null) { _anchorWriteFailures++; return false; }
         string sid = sessionIdProvider?.Invoke() ?? "";
         var f = new List<string> { sid, _recordingId, a.id.ToString(CultureInfo.InvariantCulture), a.segment.ToString(CultureInfo.InvariantCulture), a.sampleIndex.ToString(CultureInfo.InvariantCulture),
-            a.tAbs.ToString("F6", CultureInfo.InvariantCulture), a.micPosition.ToString(CultureInfo.InvariantCulture), _rate.ToString(CultureInfo.InvariantCulture), a.dspTime.ToString("F6", CultureInfo.InvariantCulture) };
+            a.tAbs.ToString("F9", CultureInfo.InvariantCulture), a.micPosition.ToString(CultureInfo.InvariantCulture), _rate.ToString(CultureInfo.InvariantCulture), a.dspTime.ToString("F6", CultureInfo.InvariantCulture) };
+        long before = _anchorCsv.RowsWritten;
         _anchorCsv.WriteLine(_anchorCsv.Join(f));
+        if (_anchorCsv.RowsWritten > before) { _anchorRowsPersisted++; return true; }
+        _anchorWriteFailures++; return false;
     }
 
     // ============================================================================================ interruption and recovery
@@ -568,11 +602,11 @@ public class Part3AudioRecorder : MonoBehaviour
                 double first = AudioClockMap.FirstSampleTime(now, pos, _rate); if (first < _restartRequestedT) first = _restartRequestedT;
                 // new continuous segment: the file continues (no samples invented for the gap), the time axis jumps
                 _cursor = new MicCursor(_ringFrames, _rate); _cursor.Begin(0, first);
-                _map.BeginSegment(_framesWritten); var a0 = _map.AddAnchor(_framesWritten, first, 0, AudioSettings.dspTime); WriteAnchorRow(a0); _chunkAnchorId = a0.id;
+                _map.BeginSegment(_framesWritten); var a0 = _map.AddAnchor(_framesWritten, first, 0, AudioSettings.dspTime); WriteAnchorRow(a0); _chunkAnchorId = a0.id; Manifest.clock_anchor_count = _map.AnchorCount;
                 OpenChunk(_framesWritten, first, 0); _lastPos = 0; _lastAdvanceT = now; _lastAnchorT = now;
                 double gap = first - _gapStartT; _interruptionTotal += gap;
                 _gaps.Add(_gapStartT.ToString("F3", CultureInfo.InvariantCulture) + "-" + first.ToString("F3", CultureInfo.InvariantCulture) + ":" + _interruptReason);
-                WriteIndexRow(_framesWritten, _framesWritten, _gapStartT, first, 0, a0.id, 0, "gap_interruption", _map.Current.id, 0); _chunkIndex++;
+                RecordChunk(_framesWritten, _framesWritten, 0, a0.id, 0, "gap_interruption", _map.Current.id, _gapStartT, first);
                 _awaitFirst = false; SetState(AudioCaptureState.Recording);
                 Emit("audio_recording_resumed", now, gap, "gap_s=" + gap.ToString("F3", CultureInfo.InvariantCulture) + ";reason=" + _interruptReason);
                 DrainTo(pos, now, 0);
@@ -640,6 +674,11 @@ public class Part3AudioRecorder : MonoBehaviour
     }
     bool _endedBySession;
 
+    /// <summary>
+    /// Finalisation, in this order: (1) the last chunk is registered, (2) the writer queue is drained and the WAV validated, (3) anchor collection is closed and every anchor is verified to be on disk,
+    /// (4) the clock map is FROZEN (each segment fitted once from all its anchors), (5) audio_index.csv is written once, every timestamp from that one frozen map, (6) the index is validated against
+    /// the WAV and against a re-fit from the persisted anchors. The stop boundary itself (StopAtBoundary / tEnd) is decided by the caller and is not touched here.
+    /// </summary>
     bool FinalizeFiles(string reason, bool incompleteHint)
     {
         SetState(AudioCaptureState.Finalizing);
@@ -652,18 +691,74 @@ public class Part3AudioRecorder : MonoBehaviour
         long expectedFrames = _framesWritten;
         string fileValidation = wavOk ? (v.frames == expectedFrames ? "ok" : "frame_count_mismatch:wav=" + v.frames + ";index=" + expectedFrames) : ((v != null ? v.problem : "no_validation") + (queueOk ? "" : ";writer_thread_did_not_finish"));
         if (wavOk && v.frames != expectedFrames) wavOk = false;
-        try { _indexCsv?.Close(); _anchorCsv?.Close(); } catch (Exception) { }
-        var idx = AudioIndexCheck.Check(Path.Combine(_audioDir ?? "", "audio_index.csv"), wavOk ? v.frames : expectedFrames);
-        Manifest.index_consistent = idx.consistent; Manifest.index_validation = idx.problem;
+
+        // anchors: collection stops here; every anchor must be a row of audio_anchors.csv before the stream can be called complete
+        _anchorsClosed = true;
+        string anchorProblem = "";
+        int anchorCount = _map != null ? _map.AnchorCount : 0;
+        if (_anchorWriteFailures > 0 || _anchorRowsPersisted != anchorCount) anchorProblem = "anchors_persisted_" + _anchorRowsPersisted + "_of_" + anchorCount + (_anchorWriteFailures > 0 ? "_write_failures_" + _anchorWriteFailures : "");
+        try { _anchorCsv?.Close(); } catch (Exception) { }
+        if (anchorProblem.Length == 0 && _anchorCsv != null && !_anchorCsv.ClosedCleanly) anchorProblem = "anchors_file_close_failed";
+
+        // frozen mapping -> the one and only audio_index.csv
+        var idx = new AudioIndexCheck.Result { problem = "no_map" };
+        string indexPath = Path.Combine(_audioDir ?? "", "audio_index.csv"), anchorsPath = Path.Combine(_audioDir ?? "", "audio_anchors.csv");
+        if (_map != null)
+        {
+            try { _map.Freeze(); } catch (Exception) { }
+            string writeProblem = WriteFinalIndex(indexPath);
+            try { _journalCsv?.Close(); } catch (Exception) { }
+            idx = writeProblem.Length == 0 ? AudioIndexCheck.Check(indexPath, wavOk ? v.frames : expectedFrames, anchorsPath) : new AudioIndexCheck.Result { problem = writeProblem };
+            if (idx.consistent) TryDelete(Path.Combine(_audioDir ?? "", "audio_index.csv.partial"));   // superseded by the final index (kept after a failure, for forensics)
+        }
+        Manifest.index_consistent = idx.consistent; Manifest.index_validation = idx.problem; Manifest.index_rows = idx.rows;
+        Manifest.index_max_boundary_mismatch_s = idx.maxBoundaryMismatchSec; Manifest.index_timestamp_classification = idx.classification;
+        Manifest.time_mapping = AudioIndexFormat.TimeMappingId; Manifest.time_mapping_frozen = _map != null && _map.Frozen;
         FillSummary(v, wavOk, fileValidation, reason, incompleteHint);
-        FinalizationOk = wavOk && idx.consistent;
+        Manifest.clock_anchor_count = (int)_anchorRowsPersisted;   // the number of rows that really are in the file
+        bool anchorsOk = anchorProblem.Length == 0;
+        FinalizationOk = wavOk && idx.consistent && anchorsOk;
         Finalized = true;
+        if (!FinalizationOk) { FailureReason = Manifest.failure_reason = "finalization_failed:" + fileValidation + (idx.consistent ? "" : ";index:" + idx.problem) + (anchorsOk ? "" : ";" + anchorProblem); Manifest.status = "incomplete"; }
         SetState(FinalizationOk ? (Manifest.status == "incomplete" ? AudioCaptureState.Incomplete : AudioCaptureState.Closed) : AudioCaptureState.FinalizationFailed);
         Manifest.state_trail = _trail.ToArray();
         WriteMetadata(Manifest.status);
         if (FinalizationOk) Emit("audio_file_finalized", CaptureClock.TAbs, Manifest.total_frames, "status=" + Manifest.status + ";file=" + Manifest.file + ";frames=" + Manifest.total_frames);
-        else { FailureReason = Manifest.failure_reason = "finalization_failed:" + fileValidation + (idx.consistent ? "" : ";index:" + idx.problem); Emit("audio_recording_failed", CaptureClock.TAbs, null, "FinalizationFailed:" + FailureReason); Debug.LogError("[Part3AudioRecorder] " + FailureReason); }
+        else { Emit("audio_recording_failed", CaptureClock.TAbs, null, "FinalizationFailed:" + FailureReason); Debug.LogError("[Part3AudioRecorder] " + FailureReason); }
         return FinalizationOk;
+    }
+
+    /// <summary>Writes audio_index.csv from the registered chunks and the FROZEN map. Chunk boundaries use TimeOfIn(segment of that chunk, sample): the exclusive end of one chunk and the start of the next chunk of the same segment are
+    /// the same function value at the same sample index. A gap row spans from the end of the previous chunk to the start of the next one, so rows always chain. Returns "" on success, else the problem.</summary>
+    string WriteFinalIndex(string path)
+    {
+        try
+        {
+            if (File.Exists(path)) return "index_exists_refusing_to_overwrite";
+            var w = new CaptureCsvWriter(path, AudioIndexFormat.IndexHeader, "audio_index");
+            string sid = sessionIdProvider?.Invoke() ?? "";
+            double lastEnd = double.NaN; var inv = CultureInfo.InvariantCulture;
+            for (int i = 0; i < _chunks.Count; i++)
+            {
+                var c = _chunks[i]; double t0, t1;
+                if (!c.IsGap) { t0 = _map.TimeOfIn(c.segment, c.s0); t1 = _map.TimeOfIn(c.segment, c.s1); }
+                else
+                {
+                    t0 = !double.IsNaN(lastEnd) ? lastEnd : (double.IsNaN(c.clockT0) ? _firstSampleT : c.clockT0);
+                    ChunkRecord next = null; for (int k = i + 1; k < _chunks.Count; k++) if (!_chunks[k].IsGap) { next = _chunks[k]; break; }
+                    t1 = next != null ? _map.TimeOfIn(next.segment, next.s0) : (double.IsNaN(c.clockT1) ? t0 : Math.Max(t0, c.clockT1));
+                }
+                lastEnd = t1;
+                long frames = c.s1 - c.s0;
+                var f = new List<string> { sid, "Part3", _recordingId, c.index.ToString(inv), c.s0.ToString(inv), c.s1.ToString(inv), t0.ToString("F6", inv), t1.ToString("F6", inv), _rate.ToString(inv), _channels.ToString(inv),
+                    frames.ToString(inv), (frames / (double)_rate).ToString("F6", inv), c.micPos.ToString(inv), c.anchorId >= 0 ? c.anchorId.ToString(inv) : "", c.dropped.ToString(inv), c.overrunsCum.ToString(inv), c.status, c.segment.ToString(inv) };
+                long before = w.RowsWritten; w.WriteLine(w.Join(f));
+                if (w.RowsWritten <= before) { w.Close(); return "index_write_failed_at_row_" + i; }
+            }
+            w.Close();
+            return w.ClosedCleanly ? "" : "index_close_failed";
+        }
+        catch (Exception e) { return "index_write_exception:" + e.GetType().Name; }
     }
 
     void FillSummary(WavValidation v, bool wavOk, string fileValidation, string reason, bool incompleteHint)
@@ -673,7 +768,7 @@ public class Part3AudioRecorder : MonoBehaviour
         m.dropped_frames = _droppedFrames; m.lost_frames_overrun = _lostFrames; m.backlog_dropped_frames = _queue != null ? _queue.DroppedByBacklog : 0; m.buffer_overruns = _overruns;
         m.interruption_count = _interruptions; m.interruption_total_s = _interruptionTotal; m.gaps = _gaps.ToArray();
         m.end_t_abs = _tEnd; m.first_sample_t_abs_est = _firstSampleT;
-        m.last_sample_t_abs_est = _map != null && _framesWritten > 0 ? _map.TimeOf(_framesWritten - 1) : -1;
+        m.last_sample_t_abs_est = _map != null && _framesWritten > 0 ? _map.TimeOf(_framesWritten - 1) : -1;   // from the frozen map
         m.file_validation = fileValidation; m.finalization_success = wavOk;
         if (_map != null)
         {
@@ -735,37 +830,116 @@ public class Part3AudioRecorder : MonoBehaviour
     }
 }
 
-/// <summary>Consistency checks of audio_index.csv against the finalised WAV (frame totals, monotonic indices, no overlap, ordered times).</summary>
+/// <summary>Column sets and the mapping id of the audio index files (one place, so the writer, the checker and the tests cannot drift apart).</summary>
+public static class AudioIndexFormat
+{
+    public const string TimeMappingId = "final_frozen_affine_per_segment_v1";
+    public const string IndexHeader = "session_id,part_id,audio_recording_id,chunk_index,sample_index_start,sample_index_end_exclusive,t_abs_start_est,t_abs_end_est,sample_rate_hz,channels,frames_written,duration_sec,microphone_position,clock_anchor_id,dropped_frames,buffer_overrun_count,write_status,segment";
+    public const string AnchorHeader = "session_id,audio_recording_id,clock_anchor_id,segment,sample_index,t_abs,microphone_buffer_position,sample_rate_hz,dsp_time";
+    /// <summary>Journal written while recording: immutable chunk facts only (no t_abs interval). gap_clock_* are the clock readings of a gap, kept for forensics.</summary>
+    public const string JournalHeader = "chunk_index,segment,sample_index_start,sample_index_end_exclusive,frames_written,sample_rate_hz,microphone_position,clock_anchor_id,dropped_frames,buffer_overrun_count,write_status,gap_clock_t_abs_start,gap_clock_t_abs_end";
+}
+
+/// <summary>
+/// Validation of audio_index.csv against the finalised WAV and, when the anchors file is given, against a re-fit from the PERSISTED anchors. Discrepancies are classified, never merged:
+///   float_representation     : |difference| &lt;= FloatTolerance (the columns are formatted with 6 decimals). Accepted.
+///   clock_fit_uncertainty    : the real uncertainty of the fitted map (reported by the manifest); it is NOT a licence for rows to overlap or reverse. Not accepted as a time overlap.
+///   actual_discontinuity     : a time jump between rows that an explicit gap row accounts for. Accepted.
+///   timestamp_mapping_defect : adjacent rows that do not chain on one mapping, a reversed interval, or a time that cannot be reproduced from the persisted anchors. FAILS.
+/// With one frozen mapping, adjacent chunks of a segment share their boundary exactly, so there is no tolerance to widen.
+/// </summary>
 public static class AudioIndexCheck
 {
-    public sealed class Result { public bool consistent; public string problem = ""; public long totalFrames; public int rows; }
+    /// <summary>Largest difference attributed to the 6-decimal formatting of two timestamps (each rounded by up to 5e-7).</summary>
+    public const double FloatTolerance = 2e-6;
+    /// <summary>Largest difference between an index time and the time re-fitted from the persisted anchors (anchors carry 9 decimals).</summary>
+    public const double ReproTolerance = 5e-6;
 
-    public static Result Check(string indexPath, long wavFrames)
+    public sealed class Result
+    {
+        public bool consistent; public string problem = ""; public long totalFrames; public int rows;
+        public double maxBoundaryMismatchSec; public string classification = "none"; public int gapRows; public double maxReproErrorSec = -1;
+    }
+
+    /// <param name="anchorsPath">audio_anchors.csv for the reproducibility check; null skips only that check.</param>
+    public static Result Check(string indexPath, long wavFrames, string anchorsPath)
     {
         var r = new Result();
         try
         {
             if (!File.Exists(indexPath)) { r.problem = "index_missing"; return r; }
             var lines = File.ReadAllLines(indexPath); if (lines.Length < 2) { r.problem = "index_empty"; return r; }
-            var h = lines[0].Split(','); int iS = Array.IndexOf(h, "sample_index_start"), iE = Array.IndexOf(h, "sample_index_end_exclusive"), iT0 = Array.IndexOf(h, "t_abs_start_est"), iT1 = Array.IndexOf(h, "t_abs_end_est"), iSt = Array.IndexOf(h, "write_status");
-            if (iS < 0 || iE < 0 || iT0 < 0 || iT1 < 0 || iSt < 0) { r.problem = "index_header_unexpected"; return r; }
-            long next = 0; double lastT = double.NegativeInfinity; long frames = 0;
+            var h = lines[0].Split(','); int iC = Array.IndexOf(h, "chunk_index"), iS = Array.IndexOf(h, "sample_index_start"), iE = Array.IndexOf(h, "sample_index_end_exclusive"), iT0 = Array.IndexOf(h, "t_abs_start_est"), iT1 = Array.IndexOf(h, "t_abs_end_est"), iSt = Array.IndexOf(h, "write_status"), iSeg = Array.IndexOf(h, "segment"), iR = Array.IndexOf(h, "sample_rate_hz");
+            if (iC < 0 || iS < 0 || iE < 0 || iT0 < 0 || iT1 < 0 || iSt < 0 || iSeg < 0) { r.problem = "index_header_unexpected"; return r; }
+            var inv = CultureInfo.InvariantCulture;
+            long next = 0; long frames = 0; int expectIndex = 0; double prevT1 = double.NaN; int prevSeg = -1; bool prevWasGap = false; double maxMismatch = 0; bool sawDiscontinuity = false;
+            var rowsData = new List<(long s, long e, double t0, double t1, int seg, bool gap, int rate)>();
             for (int i = 1; i < lines.Length; i++)
             {
                 if (lines[i].Length == 0) continue; var f = lines[i].Split(','); r.rows++;
-                long s = long.Parse(f[iS], CultureInfo.InvariantCulture), e = long.Parse(f[iE], CultureInfo.InvariantCulture);
-                double t0 = double.Parse(f[iT0], CultureInfo.InvariantCulture), t1 = double.Parse(f[iT1], CultureInfo.InvariantCulture);
+                int ci = int.Parse(f[iC], inv);
+                long s = long.Parse(f[iS], inv), e = long.Parse(f[iE], inv); int seg = int.Parse(f[iSeg], inv);
+                double t0 = double.Parse(f[iT0], inv), t1 = double.Parse(f[iT1], inv); string st = f[iSt]; bool gap = st.StartsWith("gap_");
+                int rate = iR >= 0 ? int.Parse(f[iR], inv) : 0;
+                if (ci != expectIndex) { r.problem = "chunk_index_not_consecutive_at_row_" + i + ":" + ci + "_expected_" + expectIndex; r.classification = "timestamp_mapping_defect"; return r; }
+                expectIndex++;
                 if (s != next) { r.problem = "sample_index_gap_or_overlap_at_row_" + i + ":" + s + "_expected_" + next; return r; }
                 if (e < s) { r.problem = "negative_chunk_at_row_" + i; return r; }
-                if (t1 < t0 - 1e-6) { r.problem = "time_goes_backwards_in_row_" + i; return r; }
-                if (t0 < lastT - 1e-3) { r.problem = "time_not_monotonic_at_row_" + i; return r; }
-                lastT = t1; next = e; frames += e - s;
+                if (gap) { r.gapRows++; if (e != s) { r.problem = "gap_row_with_samples_at_row_" + i; return r; } }
+                else if (e == s) { r.problem = "empty_chunk_at_row_" + i; return r; }
+                if (seg < prevSeg) { r.problem = "segment_id_decreases_at_row_" + i; return r; }
+                if (!gap && prevSeg >= 0 && seg != prevSeg && !prevWasGap) { r.problem = "segment_change_without_gap_row_at_row_" + i; r.classification = "timestamp_mapping_defect"; return r; }
+                if (t1 < t0 - FloatTolerance) { r.problem = "time_goes_backwards_in_row_" + i; r.classification = "timestamp_mapping_defect"; return r; }
+                if (!double.IsNaN(prevT1))
+                {
+                    double d = t0 - prevT1; double ad = Math.Abs(d);
+                    if (ad > maxMismatch) maxMismatch = ad;
+                    if (ad > FloatTolerance) { r.problem = (d < 0 ? "time_overlap_at_row_" : "time_gap_at_row_") + i + ":" + (d * 1000.0).ToString("F3", inv) + "ms"; r.classification = "timestamp_mapping_defect"; return r; }
+                }
+                if (gap && t1 - t0 > FloatTolerance) sawDiscontinuity = true;
+                rowsData.Add((s, e, t0, t1, seg, gap, rate));
+                prevT1 = t1; prevSeg = seg; prevWasGap = gap; next = e; frames += e - s;
             }
-            r.totalFrames = frames;
+            r.totalFrames = frames; r.maxBoundaryMismatchSec = maxMismatch;
             if (frames != wavFrames) { r.problem = "index_frames_" + frames + "_differ_from_wav_" + wavFrames; return r; }
+            if (!string.IsNullOrEmpty(anchorsPath))
+            {
+                string prob = Reproduce(anchorsPath, rowsData, r);
+                if (prob.Length > 0) { r.problem = prob; r.classification = "timestamp_mapping_defect"; return r; }
+            }
+            r.classification = sawDiscontinuity ? "actual_discontinuity" : (maxMismatch > 0 ? "float_representation" : "none");
             r.consistent = true;
         }
         catch (Exception e) { r.problem = "exception:" + e.GetType().Name; }
         return r;
+    }
+
+    /// <summary>Rebuilds the clock map from audio_anchors.csv alone and compares every chunk time with the index. Anchor ids must be 0..n-1 (the first anchor included).</summary>
+    static string Reproduce(string anchorsPath, List<(long s, long e, double t0, double t1, int seg, bool gap, int rate)> rows, Result r)
+    {
+        if (!File.Exists(anchorsPath)) return "anchors_missing";
+        var lines = File.ReadAllLines(anchorsPath); if (lines.Length < 2) return "anchors_empty";
+        var h = lines[0].Split(','); var inv = CultureInfo.InvariantCulture;
+        int iId = Array.IndexOf(h, "clock_anchor_id"), iSeg = Array.IndexOf(h, "segment"), iS = Array.IndexOf(h, "sample_index"), iT = Array.IndexOf(h, "t_abs"), iR = Array.IndexOf(h, "sample_rate_hz");
+        if (iId < 0 || iSeg < 0 || iS < 0 || iT < 0 || iR < 0) return "anchors_header_unexpected";
+        var anchors = new List<(int id, int seg, long s, double t, int rate)>();
+        for (int i = 1; i < lines.Length; i++) { if (lines[i].Length == 0) continue; var f = lines[i].Split(','); anchors.Add((int.Parse(f[iId], inv), int.Parse(f[iSeg], inv), long.Parse(f[iS], inv), double.Parse(f[iT], inv), int.Parse(f[iR], inv))); }
+        for (int i = 0; i < anchors.Count; i++) if (anchors[i].id != i) return "anchor_ids_not_consecutive_from_0_at_row_" + (i + 1) + ":" + anchors[i].id;
+        double rate = anchors[0].rate; var map = new AudioClockMap(rate);
+        int maxSeg = 0; foreach (var a in anchors) maxSeg = Math.Max(maxSeg, a.seg); foreach (var row in rows) maxSeg = Math.Max(maxSeg, row.seg);
+        for (int sg = 0; sg <= maxSeg; sg++) { long fs = -1; foreach (var a in anchors) if (a.seg == sg) { fs = a.s; break; } map.BeginSegment(fs); }   // a segment starts at its first anchor
+        foreach (var a in anchors) { if (a.seg >= map.Segments.Count) return "anchor_segment_unknown:" + a.seg; map.Segments[a.seg].anchors.Add(new AudioClockMap.Anchor { id = a.id, segment = a.seg, sampleIndex = a.s, tAbs = a.t }); }
+        map.Freeze();
+        double worst = 0;
+        foreach (var row in rows)
+        {
+            if (row.gap) continue;
+            var sgm = map.SegmentById(row.seg); if (sgm == null || !sgm.fitted) return "segment_without_anchors_" + row.seg;
+            double t0 = map.TimeOfIn(row.seg, row.s), t1 = map.TimeOfIn(row.seg, row.e);
+            worst = Math.Max(worst, Math.Max(Math.Abs(t0 - row.t0), Math.Abs(t1 - row.t1)));
+        }
+        r.maxReproErrorSec = worst;
+        if (worst > ReproTolerance) return "index_times_not_reproducible_from_anchors:max_error_" + (worst * 1000.0).ToString("F4", inv) + "ms";
+        return "";
     }
 }

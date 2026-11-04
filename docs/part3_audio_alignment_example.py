@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Part 3 think-aloud audio <-> multimodal alignment example (schema v15).
+Part 3 think-aloud audio <-> multimodal alignment example (schema v15 - v17; v17 sessions also have gaze_diagnostics.csv, rows are joined by t_abs / frame_index).
 
 Usage:  python3 part3_audio_alignment_example.py <session_folder> <t0_abs> <t1_abs> [--save-wav out.wav]
 
@@ -102,7 +102,8 @@ def main():
         out = sys.argv[sys.argv.index("--save-wav") + 1]
         with wave.open(out, "wb") as w: w.setnchannels(ch); w.setsampwidth(2); w.setframerate(rate); w.writeframes(raw)
         print("saved", out)
-    for name in ("gaze.csv", "trajectory.csv", "events.csv", "npc_state.csv"):
+    for name in ("gaze.csv", "gaze_diagnostics.csv", "trajectory.csv", "events.csv", "npc_state.csv"):
+        if not os.path.exists(os.path.join(session, name)): continue   # gaze_diagnostics.csv exists from schema v17 on
         rows = rows_between(os.path.join(session, name), t0, t1)
         print(f"{name}: {len(rows)} rows in [{t0}, {t1})")
     ev = rows_between(os.path.join(session, "events.csv"), t0, t1)

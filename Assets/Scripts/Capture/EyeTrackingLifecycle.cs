@@ -746,4 +746,15 @@ public class BlinkManifest
     public long blinks_detected, blinks_truncated, unilateral_closure_samples, invalid_samples, out_of_range_samples;
     public double mean_duration_s = -1, max_duration_s = -1;
     public bool absence_of_blink_events_is_evidence_of_no_blinks;
+    // ---- schema v16 (additive): how the eyelid signal was obtained and how often it was current ----
+    public bool auto_create_enabled, component_auto_created, permission_requested;
+    public int start_attempts;
+    public bool state_api_probed, state_api_ok, state_status_valid;
+    public string data_source_last = "";                 // visual | audio | "" at the last 1 Hz probe
+    public double provider_time_last_s = -1;             // FaceState.Time of that probe (OVRPlugin clock, not CaptureClock.TAbs)
+    public string face_state_last = "";
+    public long rows_face_current, rows_face_not_current, rows_eye_following_valid, rows_audio_only_source, interruptions, recoveries;
+    public double longest_gap_s = 0;
+    public string closure_basis = "eyes_closed_left/right = raw SDK EyesClosedL/R; blink detection uses eyes_closed_*_recovered = raw + min(EyesLookDownL, EyesLookDownR) when EyeFollowingBlendshapesValid, else raw";
+    public string audio_source_note = "A valid frame whose data source is Audio only (documented: 'estimate face expressions using audio data only') is not an eyelid measurement: recorded as face_state=audio_only_source with blank closure";
 }

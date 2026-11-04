@@ -10,6 +10,8 @@
 //     (OculusProjectConfig.faceTrackingSupport), the permission is granted and an OVRFaceExpressions component runs. This project has none of those configured (faceTrackingSupport = 0, no
 //     OVRFaceExpressions in the scene), so the capability here is "not_configured", NOT "unsupported". Enabling it also records facial data about the participant (a data-protection
 //     decision for the study, not a code detail), and it needs Quest Pro hardware to validate.
+//     UPDATE (schema v16): GazeRecorder now creates the OVRFaceExpressions component at run time when the runtime reports face tracking support (autoCreateFaceExpressions); see FaceExpressionSupport.cs
+//     and docs/face_tracking_diagnostic.md. The status decision below is unchanged.
 //
 // Status vocabulary: unsupported (the runtime reports it cannot provide the signal) | unavailable (could be provided, not accessible right now) | not_configured (the capability / permission /
 // component is not enabled in this project) | available (the raw signal is being delivered). The status is NEVER derived from "no blinks were seen".
@@ -30,6 +32,12 @@ public struct BlinkFacts
     public bool ComponentPresent;           // an OVRFaceExpressions component exists in the scene / is assigned
     public bool PermissionGranted;          // com.oculus.permission.FACE_TRACKING (or the platform does not require it)
     public bool SignalValid;                // OVRFaceExpressions.ValidExpressions right now
+    // ---- v16 additions (diagnostics only; BlinkCapability.Decide does not read them) ----
+    public bool StateApiProbed;             // the 1 Hz direct OVRPlugin.GetFaceState2 probe ran
+    public bool StateApiOk;                 // ... and returned true (a state was delivered; says nothing about Status.IsValid)
+    public bool StateStatusValid;           // FaceState.Status.IsValid of that probe
+    public string DataSource;               // "visual" | "audio" | "" (unknown / no valid frame) of that probe
+    public double ProviderTime;             // FaceState.Time of that probe (OVRPlugin clock; not CaptureClock.TAbs)
 }
 
 public static class BlinkCapability

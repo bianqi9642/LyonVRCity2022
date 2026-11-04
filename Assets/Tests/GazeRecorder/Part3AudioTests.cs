@@ -593,7 +593,7 @@ public partial class NpcLifecycleTests
 
         Call(rig.dcm, "OnSessionEnded");                                           // End panel confirmed: the existing finalisation
         var m = JObject.Parse(File.ReadAllText(rig.File("session_manifest.json")));
-        Assert.AreEqual(15, (int)m["schema_version"]);
+        Assert.AreEqual(16, (int)m["schema_version"]);
         Assert.AreEqual("Closed", (string)m["capture_lifecycle_state"], "the session closed with the audio stream finalised");
         CollectionAssert.Contains(((JArray)m["capture_streams_closed"]).Select(t => (string)t).ToList(), "audio"); Assert.AreEqual(0, ((JArray)m["capture_streams_failed"]).Count);
         var a = m["audio_capture"]; Assert.AreEqual("completed", (string)a["status"]); Assert.IsTrue((bool)a["finalization_success"]); Assert.IsTrue((bool)a["index_consistent"]);

@@ -81,6 +81,12 @@ public class GazeRecorder : MonoBehaviour
              "blink is ever recorded or inferred. Enabling face tracking records facial data and is a data-protection decision for the study.")]
     public OVRFaceExpressions faceExpressions;
 
+    [Tooltip("If true (default), the recorder adds an OVRFaceExpressions component to its own GameObject at run time when none exists and the runtime reports face tracking support. " +
+             "Reason: OculusProjectConfig.faceTrackingSupport only writes the manifest / permission; face tracking is started solely by an enabled OVRFaceExpressions. Without one, eyes_closed_* " +
+             "can never be measured. No scene is edited. Set false to keep face tracking off (the blink capability then stays not_configured, nothing is recorded). " +
+             "Enabling it makes the runtime process facial data about the participant - a data-protection decision for the study.")]
+    public bool autoCreateFaceExpressions = true;
+
     [Tooltip("Both eyes' closure weight (0..1) at or above this starts a blink. UNCALIBRATED default - calibrate on a Quest Pro before analysing blink durations.")]
     [Range(0.05f, 1f)] public float blinkCloseThreshold = 0.7f;
     [Tooltip("Both eyes' closure weight at or below this ends the blink (hysteresis: must be below the close threshold).")]
@@ -93,6 +99,21 @@ public class GazeRecorder : MonoBehaviour
     public string BlinkReason { get; private set; } = "not_evaluated_yet";
     public BlinkFacts BlinkFactsLast { get; private set; }
     double _nextBlinkCapabilityT; bool _faceSearched;
+    /// <summary>True when this recorder created the OVRFaceExpressions component itself (schema v16).</summary>
+    public bool FaceAutoCreated { get; private set; }
+    /// <summary>Number of bounded re-start attempts of an auto-created component that disabled itself (permission pending / StartFaceTracking2 failed).</summary>
+    public int FaceStartAttempts { get; private set; }
+    public bool FacePermissionRequested { get; private set; }
+    /// <summary>Current / not-current bookkeeping of the face signal (one observation per gaze row).</summary>
+    public FaceContinuity FaceSignal { get; } = new FaceContinuity();
+    /// <summary>Unity frame of the most recent gaze row built (diagnostic alignment of face reads and gaze rows).</summary>
+    public int LastRowFrame { get; private set; }
+    public long RowsFaceEyeFollowing { get; private set; }
+    public long RowsFaceAudioOnly { get; private set; }
+    /// <summary>Latest row state (FaceStateNames) and the 1 Hz-probed data source; used by the manifest and the diagnostic tool.</summary>
+    public string FaceStateLast { get; private set; } = FaceStateNames.NoRuntime;
+    const int MaxFaceStartAttempts = 12; const double FaceRetryIntervalS = 5.0;
+    double _nextFaceRetryT; OVRPlugin.FaceState _faceProbeState;
     /// <summary>Evidence about OVRPlugin's vs Unity XR's tracking origin (G1): sampled about every 2 s, never per sample. Written to manifest eye_tracking.tracking_space.</summary>
     public EyeGazeOrigin.TrackingSpaceStats TrackingSpace { get; } = new EyeGazeOrigin.TrackingSpaceStats();
     double _nextTrackingProbeT;
@@ -125,6 +146,7 @@ public class GazeRecorder : MonoBehaviour
     /// <summary>Test seams (never set in production): replace the runtime facts / the two closure weights.</summary>
     [NonSerialized] public Func<BlinkFacts> testBlinkFacts;
     [NonSerialized] public Func<(float? left, float? right)> testEyeClosure;
+    [NonSerialized] public Func<FaceReading> testFaceReading;   // test seam (never set in production): a full live reading incl. validity, look-down and eye-following flags
 
     [Header("Gaze origin (world space)")]
     [Tooltip("Rig LeftEyeAnchor (world position of the left eye as the OVRCameraRig renders it). Auto-filled from the scene's OVRCameraRig when empty. Used ONLY to validate the provider's left-eye origin and, when that origin is not plausible, as that eye's origin (see EyeGazeOrigin).")]
@@ -624,7 +646,14 @@ public class GazeRecorder : MonoBehaviour
             // stereo VIEW anchor separation, provider eye separation (head space, both eyes valid), the IPD the runtime holds (OVRPlugin.ipd) - three different quantities, none is a pupil measurement.
             "view_anchor_separation_m", "gaze_head_separation_m", "runtime_user_ipd_m",
             // Unity frame of the last OVRCameraRig.UpdatedAnchors; why the recorded origin is not the provider's (no_valid_eye | provider_exceeds_deviation_gate | provider_origin_non_finite | mixed).
-            "anchors_updated_frame", "origin_fallback_reason"
+            "anchors_updated_frame", "origin_fallback_reason",
+            // ----- schema v16 appended columns (face-tracking eyelid signal; blank = not measured, 0.0000 = a valid zero) -----
+            // face_state: no_runtime | unsupported | no_component | not_started | invalid_frame | audio_only_source | current (only "current" rows carry values). face_tracking_started / face_data_source come from a <=1 s old probe.
+            // face_expressions_valid / eye_following_valid: OVRFaceExpressions.ValidExpressions / EyeFollowingBlendshapesValid read live in the row's frame. eyes_look_down_*: only while eye_following_valid = 1.
+            // eyes_closed_*_recovered = SDK EyesClosedX + min(EyesLookDownL, EyesLookDownR) when eye_following_valid = 1, else the raw EyesClosedX (eyes_closed_left/right stay the raw SDK weights). face_sample_frame: Unity frame of the read.
+            "face_state", "face_tracking_started", "face_expressions_valid", "eye_following_valid",
+            "eyes_look_down_left", "eyes_look_down_right", "eyes_closed_left_recovered", "eyes_closed_right_recovered",
+            "face_sample_frame", "face_data_source"
         });
     }
 
@@ -907,18 +936,80 @@ public class GazeRecorder : MonoBehaviour
         }
         catch (Exception) { }
         if (faceExpressions == null && !_faceSearched) { _faceSearched = true; faceExpressions = FindObjectOfType<OVRFaceExpressions>(); }   // searched once: a scene-wide search every second would cost frames
+        EnsureFaceExpressions(ref f);
         f.ComponentPresent = faceExpressions != null && faceExpressions.isActiveAndEnabled;
         f.SignalValid = f.ComponentPresent && faceExpressions.ValidExpressions;
+        ProbeFaceState(ref f);
         return f;
     }
 
-    void ReadEyeClosure(out float? left, out float? right)
+    // Creates the face-tracking component when the project asked for none but the runtime supports it, and re-starts an auto-created one a bounded number of times. About once per second (RefreshBlinkCapability).
+    void EnsureFaceExpressions(ref BlinkFacts f)
     {
-        left = right = null;
-        if (testEyeClosure != null) { var t = testEyeClosure(); left = t.left; right = t.right; return; }
-        if (faceExpressions == null) return;
-        if (faceExpressions.TryGetFaceExpressionWeight(OVRFaceExpressions.FaceExpression.EyesClosedL, out float l)) left = l;
-        if (faceExpressions.TryGetFaceExpressionWeight(OVRFaceExpressions.FaceExpression.EyesClosedR, out float r)) right = r;
+        if (!autoCreateFaceExpressions || !f.OvrPluginInitialized || !f.FaceTrackingSupported) return;
+        double now = CaptureClock.TAbs;
+        try
+        {
+            if (faceExpressions == null)
+            {
+                if (!f.PermissionGranted && !FacePermissionRequested)
+                {
+                    FacePermissionRequested = true;
+                    OVRPermissionsRequester.Request(new[] { OVRPermissionsRequester.Permission.FaceTracking });   // no-op off Android (Link / Editor)
+                }
+                faceExpressions = gameObject.AddComponent<OVRFaceExpressions>();   // OnEnable starts face tracking, or waits for the permission callback
+                FaceAutoCreated = true;
+                if (enableDebugLogs) Debug.Log("[GazeRecorder] OVRFaceExpressions created at run time (autoCreateFaceExpressions); permission granted=" + f.PermissionGranted);
+            }
+            else if (FaceAutoCreated && !faceExpressions.enabled && f.PermissionGranted && !f.FaceTrackingEnabled && FaceStartAttempts < MaxFaceStartAttempts && now >= _nextFaceRetryT)
+            {
+                FaceStartAttempts++; _nextFaceRetryT = now + FaceRetryIntervalS;
+                faceExpressions.enabled = true;   // OnEnable runs StartFaceTracking2 again; on failure the component disables itself again and the SDK logs one warning
+            }
+        }
+        catch (Exception e) { Debug.LogWarning("[GazeRecorder] face-tracking component setup failed: " + e.Message); }
+    }
+
+    // A direct, independent OVRPlugin.GetFaceState2 read (1 Hz, never per row): the API result, Status.IsValid, the data source (Visual / Audio) and the provider timestamp. OVRFaceExpressions keeps these private.
+    void ProbeFaceState(ref BlinkFacts f)
+    {
+        f.DataSource = "";
+        if (!f.OvrPluginInitialized || !f.FaceTrackingEnabled) return;
+        try
+        {
+            f.StateApiProbed = true;
+            f.StateApiOk = OVRPlugin.GetFaceState2(OVRPlugin.Step.Render, -1, ref _faceProbeState);
+            if (!f.StateApiOk) return;
+            f.StateStatusValid = _faceProbeState.Status.IsValid;
+            f.ProviderTime = _faceProbeState.Time;
+            if (f.StateStatusValid) f.DataSource = _faceProbeState.DataSource == OVRPlugin.FaceTrackingDataSource.Audio ? "audio" : "visual";
+        }
+        catch (Exception) { f.StateApiProbed = false; }
+    }
+
+    // One live face reading for the current Unity frame. OVRFaceExpressions.Update (same frame, before this coroutine resumes) refreshed ValidExpressions; nothing is cached across rows.
+    FaceReading ReadFace()
+    {
+        if (testFaceReading != null) { var t = testFaceReading(); t.Queried = true; return t; }
+        var r = new FaceReading { Frame = Time.frameCount };
+        if (testEyeClosure != null)   // legacy seam: closure pair only
+        {
+            var c = testEyeClosure(); r.Queried = true;
+            if (c.left.HasValue && c.right.HasValue) { r.ExpressionsValid = true; r.ClosedL = c.left.Value; r.ClosedR = c.right.Value; }
+            return r;
+        }
+        if (faceExpressions == null || !faceExpressions.isActiveAndEnabled) return r;
+        r.Queried = true;
+        if (!faceExpressions.ValidExpressions) return r;
+        r.ExpressionsValid = true; r.EyeFollowingValid = faceExpressions.EyeFollowingBlendshapesValid;
+        if (!faceExpressions.TryGetFaceExpressionWeight(OVRFaceExpressions.FaceExpression.EyesClosedL, out r.ClosedL) ||
+            !faceExpressions.TryGetFaceExpressionWeight(OVRFaceExpressions.FaceExpression.EyesClosedR, out r.ClosedR)) { r.ExpressionsValid = false; return r; }
+        if (r.EyeFollowingValid)
+        {
+            faceExpressions.TryGetFaceExpressionWeight(OVRFaceExpressions.FaceExpression.EyesLookDownL, out r.LookDownL);
+            faceExpressions.TryGetFaceExpressionWeight(OVRFaceExpressions.FaceExpression.EyesLookDownR, out r.LookDownR);
+        }
+        return r;
     }
 
     IEnumerator SamplingLoop()
@@ -1048,17 +1139,32 @@ public class GazeRecorder : MonoBehaviour
             RefreshBlinkCapability(tAbs);
             RefreshTrackingSpaceProbe(tAbs);
             RefreshXrFacts(tAbs);
-            if (BlinkStatus == BlinkCapability.Available)
+            // The face signal is read LIVE for every row (a 1 Hz cached status must not blank the first second after the signal appears, nor keep a value after it vanishes).
+            FaceReading fr = ReadFace();
+            BlinkFacts bfNow = BlinkFactsLast;
+            bool seam = testFaceReading != null || testEyeClosure != null;   // tests inject a live reading: the runtime facts do not apply to it
+            bool fInit = seam || bfNow.OvrPluginInitialized, fSupported = seam || bfNow.FaceTrackingSupported, fStarted = seam || bfNow.FaceTrackingEnabled;
+            string faceState = FaceClosure.Classify(fInit, fSupported, fStarted, bfNow.DataSource, in fr);
+            FaceStateLast = faceState;
+            LastRowFrame = Time.frameCount;
+            bool faceCurrent = FaceClosure.IsCurrent(faceState);
+            FaceSignal.Observe(faceCurrent, tAbs);
+            if (faceCurrent && fr.EyeFollowingValid) RowsFaceEyeFollowing++;
+            if (faceState == FaceStateNames.AudioOnly) RowsFaceAudioOnly++;
+            if (BlinkStatus == BlinkCapability.Available || fr.Queried)
             {
-                ReadEyeClosure(out cl, out cr);
-                BlinkDetector.Result br = Blink.Update(tAbs, cl, cr);
+                float? rl = null, rr = null;
+                if (faceCurrent) { FaceClosure.Recover(in fr, out float xl, out float xr); rl = xl; rr = xr; }
+                cl = faceCurrent ? (float?)fr.ClosedL : null; cr = faceCurrent ? (float?)fr.ClosedR : null;
+                BlinkDetector.Result br = Blink.Update(tAbs, rl, rr);
                 if (dataCapture != null)
                 {
                     if (br.Started) dataCapture.RecordBlinkEvent(CaptureConstants.EvtBlinkStart, br.StartT, null, "");
                     if (br.Ended) dataCapture.RecordBlinkEvent(CaptureConstants.EvtBlinkEnd, br.EndT, br.Duration, br.Truncated ? "truncated_by_missing_data" : "");
                 }
-                blinkState = (cl.HasValue && cr.HasValue) ? (Blink.InBlink ? "1" : "0") : "";
+                blinkState = (rl.HasValue && rr.HasValue) ? (Blink.InBlink ? "1" : "0") : "";
             }
+            string[] faceCols = FaceColumns.Values(faceState, fInit, fStarted, bfNow.DataSource, in fr);
             double tRel = tAbs - recordingStartRealtime;
             long unixMs = CaptureClock.TUnixMs;
             string sessionId = (dataCapture != null && !string.IsNullOrEmpty(dataCapture.SessionId))
@@ -1133,7 +1239,9 @@ public class GazeRecorder : MonoBehaviour
                 (vfOk && vf.groundOk) ? F4(vf.leftWorld.y - vf.groundY) : "",
                 (vfOk && vf.groundOk) ? F4(vf.rightWorld.y - vf.groundY) : "",
                 // ----- schema v14 appended columns (37, pre-joined) -----
-                pipelineCols
+                pipelineCols,
+                // ----- schema v16 appended columns (10, pre-formatted) -----
+                string.Join(",", faceCols)
             });
 
             if (WriteRow(row))

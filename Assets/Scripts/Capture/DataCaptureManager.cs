@@ -2420,6 +2420,11 @@ public class DataCaptureManager : MonoBehaviour
                 bm.mean_duration_s = gr.Blink.Blinks > 0 ? gr.Blink.MeanDuration : -1; bm.max_duration_s = gr.Blink.Blinks > 0 ? gr.Blink.MaxDuration : -1;
             }
             bm.absence_of_blink_events_is_evidence_of_no_blinks = gr.BlinkStatus == BlinkCapability.Available;
+            bm.auto_create_enabled = gr.autoCreateFaceExpressions; bm.component_auto_created = gr.FaceAutoCreated; bm.permission_requested = gr.FacePermissionRequested; bm.start_attempts = gr.FaceStartAttempts;
+            bm.state_api_probed = bf.StateApiProbed; bm.state_api_ok = bf.StateApiOk; bm.state_status_valid = bf.StateStatusValid; bm.data_source_last = bf.DataSource ?? "";
+            bm.provider_time_last_s = bf.StateApiOk ? bf.ProviderTime : -1; bm.face_state_last = gr.FaceStateLast;
+            bm.rows_face_current = gr.FaceSignal.rows_current; bm.rows_face_not_current = gr.FaceSignal.rows_not_current; bm.interruptions = gr.FaceSignal.interruptions;
+            bm.recoveries = gr.FaceSignal.recoveries; bm.longest_gap_s = gr.FaceSignal.longest_gap_s; bm.rows_eye_following_valid = gr.RowsFaceEyeFollowing; bm.rows_audio_only_source = gr.RowsFaceAudioOnly;
             _manifest.late_gaze_rows_rejected = gr.LateRowsRejected;
         }
         DeriveEyeTrackingAliases(et);

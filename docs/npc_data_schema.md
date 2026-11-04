@@ -558,3 +558,20 @@ Manifest `eye_tracking.eye_pipeline`: architecture, `primary_gaze_path`, the con
 
 Additive only: no existing column, field or file changes. Part 3 sessions gain an `audio/` directory (`part3_audio.wav`, `audio_index.csv`, `audio_anchors.csv`, `audio_metadata.json`), the events `audio_permission_checked`, `audio_permission_granted`, `audio_recording_requested`, `audio_recording_started`, `audio_recording_interrupted`, `audio_recording_resumed`, `audio_buffer_overrun`, `audio_recording_stop_requested`, `audio_recording_stopped`, `audio_file_finalized`, `audio_recording_failed` (events.csv, always before `session_end`), the manifest block `audio_capture`, `file_list` entries for the audio files, and `capture_streams_closed` / `_failed` may contain `audio` (a failed audio finalisation keeps the session `Closing`). Sessions of other Parts or older schemas have no `audio/` directory and `audio_capture.status = not_enabled` (v15) or no block (older). Full description, time model and validation procedure: `docs/part3_audio.md`; downstream example: `docs/part3_audio_alignment_example.py`.
 
+
+## 31. Face-tracking eyelid signal (schema v16)
+
+Additive only. `gaze.csv` appends **10** columns after `origin_fallback_reason`; `eyes_closed_left`, `eyes_closed_right`, `blink_state` (v11) keep their names, positions and meaning (raw SDK `EyesClosedL/R`; detector state). **Blank = not measured, `0.0000` = a valid zero.** Nothing is carried over from a previous row.
+
+| Column | Meaning |
+|---|---|
+| `face_state` | `no_runtime` (OVRPlugin not initialised) · `unsupported` · `no_component` (no running `OVRFaceExpressions`) · `not_started` (component present, session not started) · `invalid_frame` (`ValidExpressions` false) · `audio_only_source` (valid frame, data source Audio only: not an eyelid measurement) · `current` |
+| `face_tracking_started` | `OVRPlugin.faceTracking2Enabled` from the ≤1 s runtime probe; blank until the first probe |
+| `face_expressions_valid` | `OVRFaceExpressions.ValidExpressions`, read live in the row's frame; blank without a running component |
+| `eye_following_valid` | `EyeFollowingBlendshapesValid`; blank unless the frame is valid |
+| `eyes_look_down_left/right` | `EyesLookDownL/R`; only while `eye_following_valid = 1` |
+| `eyes_closed_left/right_recovered` | `EyesClosedX + min(EyesLookDownL, EyesLookDownR)` when `eye_following_valid = 1`, else the raw `EyesClosedX` (SDK-documented correction; not clamped). **These drive blink detection.** Only on `current` rows |
+| `face_sample_frame` | Unity `Time.frameCount` of the read (`OVRFaceExpressions.Update` of that frame ran before the recorder's coroutine resumed) |
+| `face_data_source` | `visual` / `audio` from the ≤1 s `GetFaceState2` probe; blank when unknown |
+
+Manifest `eye_tracking.blink` gains: `auto_create_enabled`, `component_auto_created`, `permission_requested`, `start_attempts`, `state_api_probed/ok`, `state_status_valid`, `data_source_last`, `provider_time_last_s`, `face_state_last`, `rows_face_current`, `rows_face_not_current`, `rows_eye_following_valid`, `rows_audio_only_source`, `interruptions`, `recoveries`, `longest_gap_s`, `closure_basis`, `audio_source_note`. Behaviour change: `GazeRecorder` creates `OVRFaceExpressions` at run time when the runtime supports face tracking and none exists (`autoCreateFaceExpressions`, default true), and reads the signal live per row instead of gating on the 1 Hz cached status. Details and the diagnostic procedure: `docs/face_tracking_diagnostic.md`.

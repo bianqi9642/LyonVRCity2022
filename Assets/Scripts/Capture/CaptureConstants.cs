@@ -225,7 +225,11 @@ public static class CaptureConstants
     //    result, with the v13 view-frame anchor fallback. v13 columns left_eye_world_* / right_eye_world_* are VIEW ANCHORS (stereo view poses re-applied at the rendered camera), not gaze origins: documented, not renamed.
     // 15: Part 3 think-aloud audio. New directory audio/ (part3_audio.wav PCM16, audio_index.csv, audio_anchors.csv, audio_metadata.json), new events audio_* (events.csv), new manifest block audio_capture and
     //    file_list entries. No existing column, field or file changes. Sessions of other Parts / older schemas simply have no audio/ directory and audio_capture.status = not_enabled / not_started.
-    public const int    SchemaVersion   = 15;
+    // 16: face-tracking eyelid signal (diagnosis of empty eyes_closed_*). gaze.csv appends 10 columns after origin_fallback_reason: face_state, face_tracking_started, face_expressions_valid, eye_following_valid,
+    //    eyes_look_down_left/right, eyes_closed_left/right_recovered, face_sample_frame, face_data_source. eyes_closed_left/right/blink_state keep their meaning (raw SDK weights / detector state); blink detection now
+    //    uses the recovered closure and the signal is read live per row. GazeRecorder creates OVRFaceExpressions at run time when missing (autoCreateFaceExpressions). Manifest eye_tracking.blink gains the
+    //    fields listed in BlinkManifest (schema v16). No existing column, field or file changes.
+    public const int    SchemaVersion   = 16;
     public const string NpcIdScheme     = "agent-lifetime-v1: npc_id=AgentID (stable pooled GameObject); npc_spawn_instance_id=<AgentID>-S<n> (n = per-AgentID lifetime index, from 1)";
     public const string NpcCaptureModeText =
         "master_switch: npc_state.csv holds every active NPC lifetime of a Part whose npcCaptureEnabled is true, from the moment NPCs exist (warm-up, " +

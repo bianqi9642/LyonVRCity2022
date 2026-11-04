@@ -778,7 +778,7 @@ public partial class NpcLifecycleTests
         Call(rig.em, "TerminateSession", "Part3");
         yield return null;
         string manifest = File.ReadAllText(rig.File("session_manifest.json"));
-        StringAssert.Contains("\"schema_version\": " + 15, manifest);
+        StringAssert.Contains("\"schema_version\": " + 16, manifest);
         StringAssert.Contains("agent-lifetime-v1", manifest);
         StringAssert.Contains("(session_id, npc_spawn_instance_id)", manifest);
         StringAssert.Contains("master_switch", manifest);

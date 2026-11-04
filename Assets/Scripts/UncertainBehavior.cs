@@ -116,6 +116,21 @@ public class UncertainBehavior : MonoBehaviour
     // For detour arrival verification retries
     int detourArrivalRetryCount = 0;
 
+    // ---- Data capture (observation only): per-LIFETIME evidence of detours, reset by ResetForReuse() ----
+    // A detour is STARTED only once a reachable temporary target was chosen and issued (EnterDetour past its fallback-to-pause branch); it is COMPLETED when ExitCurrentState() ends it and the
+    // NPC resumes its main goal. The resumed destination is recorded exactly as issued (the saved snapshot, or - with a main-target restorer, Part 2 - the owner's current target).
+    int detoursStarted, detoursCompleted;
+    Vector3 lastDetourResumeTarget;
+    string lastDetourResumeSource = "", lastDetourEndReason = "", pendingDetourEndReason = "";
+    // Identity of the main destination at detour entry (valid = the mover really had one; the Transform when it was a Transform target, else position-only) and what the end of the detour
+    // restored. lastDetourRestoredPreDetourTarget is the VERIFIED fact "the NPC was sent back to the destination it was following before the detour" (false when the owner picked a different
+    // target, nothing was re-issued, or there was no valid main destination). lastDetourResumeTransform is the Transform the mover follows after an identity-preserving restore (null when the
+    // restore was by position).
+    Transform savedMainTargetTransform;
+    bool savedMainTargetValid;
+    bool lastDetourRestoredPreDetourTarget;
+    Transform lastDetourResumeTransform;
+
     // cached handler so we can unsubscribe cleanly (detour-specific handler)
     Action onMoveToArrivedHandler = null;
 
@@ -143,6 +158,21 @@ public class UncertainBehavior : MonoBehaviour
     /// state value left behind by a disabled component (see OnDisable) does not count as detouring.
     /// </summary>
     public bool IsDetouring => isActiveAndEnabled && !suspendedBecauseArrived && state == State.Detour;
+
+    /// <summary>Detours started in this lifetime (a temporary target was chosen and issued). Reset by ResetForReuse().</summary>
+    public int DetoursStarted => detoursStarted;
+    /// <summary>Detours of this lifetime that ended with the NPC resuming its main goal. Reset by ResetForReuse().</summary>
+    public int DetoursCompleted => detoursCompleted;
+    /// <summary>Destination the NPC was sent back to when its last detour ended (world position as issued to MoveToTarget; meaningful only when DetoursCompleted &gt; 0).</summary>
+    public Vector3 LastDetourResumeTarget => lastDetourResumeTarget;
+    /// <summary>True when the last completed detour ended with the NPC sent back to the main destination it was following BEFORE that detour (identity-verified; see the field comment).</summary>
+    public bool LastDetourRestoredPreDetourTarget => lastDetourRestoredPreDetourTarget;
+    /// <summary>The Transform the mover follows after an identity-preserving restore; null when the restore was by position (the position is LastDetourResumeTarget).</summary>
+    public Transform LastDetourResumeTransform => lastDetourResumeTransform;
+    /// <summary>"snapshot" (the main target saved at detour entry) | "owner" (the main-target restorer re-issued the owner's current target).</summary>
+    public string LastDetourResumeSource => lastDetourResumeSource;
+    /// <summary>"arrived" (arrival at the detour point was verified) | "timer" (the fallback detour timer expired) | "retries_exhausted" (false arrivals, fell back to a pause first).</summary>
+    public string LastDetourEndReason => lastDetourEndReason;
 
     // ---- Data capture (observation only; nothing below changes behaviour) ----
 
@@ -277,6 +307,9 @@ public class UncertainBehavior : MonoBehaviour
         detourArrivalRetryCount = 0;
         haveSavedMainTarget = false;
         mainTargetOnDetourStart = Vector3.zero;
+        detoursStarted = 0; detoursCompleted = 0; lastDetourResumeTarget = Vector3.zero;
+        lastDetourResumeSource = ""; lastDetourEndReason = ""; pendingDetourEndReason = "";
+        savedMainTargetTransform = null; savedMainTargetValid = false; lastDetourRestoredPreDetourTarget = false; lastDetourResumeTransform = null;
         suspendedBecauseArrived = false;
         ResetLookAroundImmediate();
         lastNotifiedLabel = StateLabel;   // lifetime boundary: re-baseline silently, never a transition event
@@ -499,8 +532,12 @@ public class UncertainBehavior : MonoBehaviour
         // Save main target so we can resume it after detour
         Vector3 mainTarget = GetCurrentMainTarget();
         mainTargetOnDetourStart = mainTarget;
+        savedMainTargetTransform = moveController != null ? moveController.targetTransform : null;
+        savedMainTargetValid = moveController != null && (moveController.targetTransform != null || moveController.IsMoving);   // MoveToTarget.targetPosition has a non-null default, so "moving" is what says a destination was really issued
         haveSavedMainTarget = true;
         detourArrivalRetryCount = 0;
+        detoursStarted++;
+        pendingDetourEndReason = "";
 
         // Set the chosen (navmesh-backed + reachable) detour target
         detourTarget = chosenHit.position;
@@ -547,6 +584,7 @@ public class UncertainBehavior : MonoBehaviour
             // legitimate arrival: mark detour complete by expiring the timer (Exit will handle resuming main target)
             if (enableLogging) Debug.Log($"[UncertainBehavior] [{gameObject.name}] MoveToTarget reported arrival and transform is within {visDist:F3}m -> accept detour completion.");
             // trigger exit next frame
+            pendingDetourEndReason = "arrived";
             stateTimer = 0f;
             return;
         }
@@ -583,6 +621,7 @@ public class UncertainBehavior : MonoBehaviour
                     onMoveToArrivedHandler = null;
                 }
 
+                pendingDetourEndReason = "retries_exhausted";
                 state = State.Pause;
                 stateTimer = UnityEngine.Random.Range(pauseMin, pauseMax);
                 stateStartTime = Time.time;
@@ -641,6 +680,27 @@ public class UncertainBehavior : MonoBehaviour
             // owner chose a new target after the Detour began. Without a restorer (directed mode) the original
             // snapshot restore below is unchanged.
             bool restoredByOwner = endingDetour && mainTargetRestorer != null && mainTargetRestorer();
+            if (endingDetour)
+            {
+                // Observation only: record WHICH destination the NPC was sent back to, and why the detour ended.
+                detoursCompleted++;
+                lastDetourResumeSource = restoredByOwner ? "owner" : "snapshot";
+                lastDetourResumeTarget = restoredByOwner ? GetCurrentMainTarget() : mainTarget;
+                lastDetourResumeTransform = null;
+                if (restoredByOwner)
+                {
+                    // The owner (Part 2 wander logic) re-issued ITS current target. That is a restoration only if it is the destination followed before the detour: same Transform when there was
+                    // one, else the same position. If the owner chose another target (e.g. the old entry vanished) or issued nothing, this completion is NOT a return to the pre-detour target.
+                    Transform now = moveController.targetTransform;
+                    bool same = savedMainTargetTransform != null ? now == savedMainTargetTransform
+                                                                 : now == null && Vector3.Distance(lastDetourResumeTarget, mainTarget) <= k_DestCompareThreshold;
+                    lastDetourRestoredPreDetourTarget = savedMainTargetValid && same;
+                    if (lastDetourRestoredPreDetourTarget && now != null) lastDetourResumeTransform = now;
+                }
+                else lastDetourRestoredPreDetourTarget = savedMainTargetValid;   // snapshot restore: the saved position itself was re-issued
+                lastDetourEndReason = string.IsNullOrEmpty(pendingDetourEndReason) ? "timer" : pendingDetourEndReason;
+                pendingDetourEndReason = "";
+            }
 
             if (!restoredByOwner)
             {

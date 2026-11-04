@@ -241,7 +241,48 @@ public class DataCaptureManager : MonoBehaviour
     SpawnerManager           _spawner;
     GazeRecorder             _gazeRecorder;
 
+    // ---- Part 3 think-aloud audio (schema v15): created here (no scene edit), driven by ExperimentManager.RunPart3, finalised in FinalizeCapture ----
+    Part3AudioRecorder _audio;
+    public Part3AudioRecorder AudioRecorder => _audio;
+    /// <summary>Creates (once) the audio recorder on this GameObject and wires it to the session: folder, id, event sink. Returns null if recording is blocked.</summary>
+    public Part3AudioRecorder EnsureAudioRecorder()
+    {
+        if (_audio != null) return _audio;
+        if (RecordingBlocked || string.IsNullOrEmpty(SessionFolder)) return null;
+        _audio = GetComponent<Part3AudioRecorder>();
+        if (_audio == null) _audio = gameObject.AddComponent<Part3AudioRecorder>();
+        _audio.sessionFolderProvider = () => SessionFolder;
+        _audio.sessionIdProvider = () => SessionId;
+        _audio.eventSink = RecordAudioEvent;
+        _audio.runtimePath = EyeTrackingLifecycleController.DetectRuntimePath();
+        _audio.Configure(true);
+        return _audio;
+    }
+
+    /// <summary>Audio lifecycle events go through the normal event writer: same gate (refused once the session is closing), same clock, explicit event time.</summary>
+    void RecordAudioEvent(string type, double tAbs, double? valueNum, string valueStr)
+    {
+        WriteEventRow(type, CurrentPart, CurrentPhase, "", "", "", "", "", valueNum, valueStr, Vector3.zero, Vector3.zero, tAbs);
+    }
+
     Transform _playerRig, _centerEye, _ctrlL, _ctrlR;
+    // The rendered camera (Camera.main), schema v13: what the participant sees from. The OVR CenterEyeAnchor above lacks the XR Origin's Camera Floor Offset (see ViewFrame.cs).
+    readonly ViewFrameProbe _viewProbe = new ViewFrameProbe();
+    Transform _viewCamera; double _nextViewResolveT;
+    Transform ViewTransform
+    {
+        get
+        {
+            if ((_viewCamera == null || !_viewCamera.gameObject.activeInHierarchy) && Time.unscaledTime >= _nextViewResolveT)
+            {
+                _nextViewResolveT = Time.unscaledTime + 1.0;
+                Transform fromGaze = _gazeRecorder != null ? _gazeRecorder.ViewProbe.View : null;
+                _viewCamera = fromGaze != null ? fromGaze : (Camera.main != null ? Camera.main.transform : null);
+                if (_viewCamera != null) { _viewProbe.View = _viewCamera; if (_viewProbe.GroundMask == 0) _viewProbe.Resolve(_viewCamera, _centerEye, null, null, default, _centerEye); }
+            }
+            return _viewCamera;
+        }
+    }
 
     CaptureCsvWriter _events, _traj, _npcState, _npcEvents, _npcLifetimes, _npcProfiles, _registry;
     readonly HashSet<string> _profilesWritten = new HashSet<string>();
@@ -303,6 +344,7 @@ public class DataCaptureManager : MonoBehaviour
         public bool hasLastState;
         public Vector3 lastDest;
         public bool hasLastDest;
+        public int detourCompletionsConsumed;   // completed detours of this lifetime already accounted for by an observed destination change (DestinationCause: a completion is consumed by the first change after it)
         public bool destAssigned;       // the FIRST valid destination of this lifetime has been observed (N2: that observation is an initial assignment, never a "change")
         public Animator anim;           // humanoid animator for the LOS eye point (resolved once)
         public bool animLooked;
@@ -331,6 +373,9 @@ public class DataCaptureManager : MonoBehaviour
     int _finalizerThreadId = -1;
     long _lateEventsRejected, _lateNpcRecordsRejected;
     double _captureClosedTAbs = -1;
+    string _captureFinalizationError = "";
+    string[] _captureStreamsClosed = new string[0], _captureStreamsFailed = new string[0];
+    bool _manifestSealed, _finalManifestWriting;   // after the post-close manifest the file is final: late metadata callbacks cannot rewrite it
     public CaptureLifecycle CaptureState { get { lock (_gate) return _captureState; } }
     public bool CaptureOpen { get { lock (_gate) return _captureState == CaptureLifecycle.Open; } }
     /// <summary>Events / NPC records offered after the session closed and refused (diagnostic counters; never written as experimental rows).</summary>
@@ -600,8 +645,12 @@ public class DataCaptureManager : MonoBehaviour
     // M2: the ONE way a session's data capture ends (End panel confirmed, application quit, component destroyed). Idempotent: only the first call does anything.
     //   1. Open -> Closing, atomically: from this instant every external submission is refused (WriteEventRow, NPC records, gaze / trajectory / NPC-state samples via the *CaptureActive gates).
     //   2. Records already accepted are flushed (open NPC lifetimes are closed out, the npc_events buffer is written, the gaze stream is closed after its last accepted row).
-    //   3. The single terminal session_end event is written - necessarily after everything accepted before it - and the manifest end snapshot.
-    //   4. Every session stream is closed (CaptureCsvWriter.Close: nothing can be appended afterwards) and the state becomes Closed.
+    //   3. The single terminal session_end event is written - necessarily after everything accepted before it - plus a Closing manifest snapshot (end_reason / ended_utc; a crash-safety
+    //      checkpoint: if anything below dies, the file says the session ended but is NOT Closed).
+    //   4. Every session stream is closed (CaptureCsvWriter.Close: nothing can be appended afterwards). Only if EVERY stream - gaze included - closed cleanly and no step above failed does the
+    //      state become Closed and capture_closed_t_abs get the real CaptureClock.TAbs of that instant; otherwise the state stays Closing and the failure is recorded, never reported as Closed.
+    //   5. The FINAL manifest is persisted (atomic replace, ManifestFileWriter): it carries the state of step 4. The manifest is metadata, not an experimental stream; writing it after the streams
+    //      are closed touches no CSV stream, and it is then sealed so no later callback can rewrite it.
     void FinalizeCapture(string endReason, string openLifetimeReason)
     {
         lock (_gate)
@@ -610,10 +659,17 @@ public class DataCaptureManager : MonoBehaviour
             _captureState = CaptureLifecycle.Closing;
             _finalizerThreadId = System.Threading.Thread.CurrentThread.ManagedThreadId;
         }
+        var errors = new List<string>();
         try
         {
             EmitOpenLifetimes(openLifetimeReason);
             FlushNpcEvents();
+            // Part 3 audio: stop (if Part 3 never reached its end the recording is marked incomplete), drain, write the final WAV header, validate, rename. Strictly BEFORE session_end and before any stream is closed.
+            if (_audio != null && !_audio.Finalized)
+            {
+                bool audioOk = _audio.FinalizeForSession(openLifetimeReason);
+                if (!audioOk) errors.Add("audio: " + _audio.FailureReason);
+            }
             if (_gazeRecorder != null) _gazeRecorder.CloseForSession();
             if (!_endWritten)
             {
@@ -622,17 +678,59 @@ public class DataCaptureManager : MonoBehaviour
                 _endWritten = true;
             }
         }
+        catch (Exception ex) { errors.Add("flush_or_session_end: " + ex.GetType().Name + ": " + ex.Message); }
         finally
         {
-            CloseSessionStreams();
-            lock (_gate) { _captureState = CaptureLifecycle.Closed; _finalizerThreadId = -1; _captureClosedTAbs = CaptureClock.TAbs; }
+            CloseSessionStreams(errors);
+            lock (_gate)
+            {
+                _finalizerThreadId = -1;
+                if (errors.Count == 0) { _captureState = CaptureLifecycle.Closed; _captureClosedTAbs = CaptureClock.TAbs; }
+                _captureFinalizationError = string.Join(" | ", errors);
+            }
+            if (errors.Count > 0) Debug.LogError("[DataCapture] Session capture could NOT be closed cleanly (state stays Closing): " + _captureFinalizationError);
+            WriteManifestFinal();
         }
     }
 
-    void CloseSessionStreams()
+    // Closes every session stream and records, per stream, whether the close succeeded. capture_errors.csv is a diagnostic log, not an experimental stream: it stays open.
+    void CloseSessionStreams(List<string> errors)
     {
-        foreach (CaptureCsvWriter w in new[] { _events, _traj, _npcState, _npcEvents, _npcLifetimes, _npcProfiles, _registry })
-            if (w != null) w.Close();   // capture_errors.csv is a diagnostic log, not an experimental stream: it stays open
+        var closed = new List<string>(); var failed = new List<string>();
+        void One(string name, CaptureCsvWriter w)
+        {
+            if (w == null) return;
+            try { w.Close(); }
+            catch (Exception ex) { failed.Add(name); errors.Add(name + ": " + ex.GetType().Name + ": " + ex.Message); return; }
+            if (w.ClosedCleanly) closed.Add(name); else { failed.Add(name); errors.Add(name + ": " + (w.CloseError ?? "not closed")); }
+        }
+        One("events", _events); One("trajectory", _traj); One("npc_state", _npcState); One("npc_events", _npcEvents);
+        One("npc_lifetimes", _npcLifetimes); One("npc_profiles", _npcProfiles); One("building_registry", _registry);
+        if (_audio != null && _audio.Started)
+        {
+            if (_audio.Finalized && _audio.FinalizationOk) closed.Add("audio"); else { failed.Add("audio"); if (errors.Count == 0 || !errors.Exists(x => x.StartsWith("audio"))) errors.Add("audio: not finalized"); }
+        }
+        if (_gazeRecorder != null && _gazeRecorder.Writer != null) One("gaze", _gazeRecorder.Writer);   // closed by GazeRecorder.CloseForSession; verified here so its failure is not lost
+        lock (_gate) { _captureStreamsClosed = closed.ToArray(); _captureStreamsFailed = failed.ToArray(); }
+    }
+
+    // The final manifest of a finished session: refreshed from the (now closed) writers, carrying the real lifecycle state and closure timestamp. end_reason / ended_utc / t_abs_at_end
+    // are NOT touched (they were set by the session_end snapshot and must never be overwritten by a late callback). Atomic replace; sealed afterwards.
+    void WriteManifestFinal()
+    {
+        if (_manifest == null || _manifestSealed) return;
+        try
+        {
+            UpdateManifestEvidence("capture_closed");
+            _fileList.Clear();
+            foreach (string f in new[] { "session_manifest.json", "events.csv", "gaze.csv", "trajectory.csv", "building_registry.csv", "npc_state.csv", "npc_events.csv", "npc_lifetimes.csv", "npc_profiles.csv" }) AddIfExists(f);
+            AddAudioFiles();
+            _manifest.file_list = _fileList.ToArray();
+            _finalManifestWriting = true;
+            WriteManifest();
+        }
+        catch (Exception ex) { Debug.LogError("[DataCapture] Final manifest update failed: " + ex.Message); }
+        finally { _finalManifestWriting = false; _manifestSealed = true; }
     }
 
     void OnApplicationFocus(bool hasFocus)
@@ -999,7 +1097,8 @@ public class DataCaptureManager : MonoBehaviour
             mt    = pa.GetComponent<MoveToTarget>() ?? pa.GetComponentInChildren<MoveToTarget>(true),
             agentId = pa.AgentID,
             lifetimeId = lifetimeId,
-            lifetimeIndex = pa.LifetimeIndex
+            lifetimeIndex = pa.LifetimeIndex,
+            detourCompletionsConsumed = pa.UncertainDetoursCompleted   // lifetime boundary: nothing completed before this record existed can be a pending return
         };
         _npcByAgent[pa] = rec;
         _lifetimesRegistered++;
@@ -1143,6 +1242,16 @@ public class DataCaptureManager : MonoBehaviour
         // appended (schema v5): Part / phase at the sample time (the authoritative values, not a post-hoc join)
         _rf.Add(S(CurrentPart)); _rf.Add(S(CurrentPhase));
 
+        // appended (schema v13): the rendered camera and its height above the ground below it
+        Transform view = ViewTransform;
+        if (view != null)
+        {
+            Vector3 vp = view.position; _rf.Add(F(vp.x)); _rf.Add(F(vp.y)); _rf.Add(F(vp.z));
+            _viewProbe.View = view;
+            _rf.Add(_viewProbe.TryGroundY(vp, out float gy) ? F(vp.y - gy) : "");
+        }
+        else { _rf.Add(""); _rf.Add(""); _rf.Add(""); _rf.Add(""); }
+
         long before = _traj.RowsWritten;
         _traj.WriteLine(_traj.Join(_rf));
         if (_traj.RowsWritten > before)   // only SUCCESSFUL rows count, at the row's own t_abs
@@ -1248,7 +1357,7 @@ public class DataCaptureManager : MonoBehaviour
             if (rec.anim == null && !rec.animLooked) { rec.anim = rec.pa.GetComponentInChildren<Animator>(true); rec.animLooked = true; }
             Vector3 eye;
             Vector3? eyeOpt = NpcLineOfSight.TryGetNpcEyePoint(rec.tr, rec.agent, rec.anim, out eye) ? eye : (Vector3?)null;
-            LosStatus losStatus = NpcLineOfSight.Query(eyeOpt, rec.tr, _centerEye, _playerRig, _losMask);
+            LosStatus losStatus = NpcLineOfSight.Query(eyeOpt, rec.tr, ViewTransform != null ? ViewTransform : _centerEye, _playerRig, _losMask);   // aim at the RENDERED view (schema v13); the OVR anchor sits a Camera Floor Offset lower
             _losCounts[(int)losStatus]++;
             string los = losStatus == LosStatus.Clear ? "1" : (losStatus == LosStatus.Blocked ? "0" : "");
 
@@ -1302,6 +1411,7 @@ public class DataCaptureManager : MonoBehaviour
                 {
                     WriteNpcEventRow(CaptureConstants.NpcEvtDestChange, rec, pos, yaw, navDest, "", "", "cause=" + CaptureConstants.DestCauseInitialAssignment + ";prev_dest=none", tAbs, tUnix);
                     rec.destAssigned = true;
+                    rec.detourCompletionsConsumed = rec.pa.UncertainDetoursCompleted;
                 }
                 rec.lastDest = navDest; rec.hasLastDest = true;
             }
@@ -1309,8 +1419,10 @@ public class DataCaptureManager : MonoBehaviour
             {
                 // ONE observed-destination-change row (the former second row, npc_leg_start, carried identical data and is retired in schema v3).
                 // value_str says why the NavMeshAgent destination moved; the exact-time itinerary events are npc_movement_start / npc_target_set.
+                string cause = DestChangeCause(rec, navDest);
+                string causeExtra = cause == CaptureConstants.DestCauseDetourReturn ? ";detour_end=" + S(rec.pa.UncertainDetourEndReason) : "";
                 WriteNpcEventRow(CaptureConstants.NpcEvtDestChange, rec, pos, yaw, navDest, "", "",
-                    "cause=" + DestChangeCause(rec, navDest) + ";jump_m=" + F((navDest - rec.lastDest).magnitude) + ";prev_dest=" + F(rec.lastDest.x) + "|" + F(rec.lastDest.z), tAbs, tUnix);
+                    "cause=" + cause + causeExtra + ";jump_m=" + F((navDest - rec.lastDest).magnitude) + ";prev_dest=" + F(rec.lastDest.x) + "|" + F(rec.lastDest.z), tAbs, tUnix);
                 rec.lastDest = navDest;
             }
         }
@@ -1348,20 +1460,40 @@ public class DataCaptureManager : MonoBehaviour
         else if (!_rate.Unachievable) _rateWarnedUnachievable = false;
     }
 
-    // Why the NavMeshAgent destination moved: an UncertainBehavior detour, the current itinerary target (leg change / re-issue), or something else
-    // (entrance placement, wander re-targeting that is not the current itinerary entry).
+    // Transform identity of the restore, when it preserved one: does the mover still follow that Transform? Unknown when the restore was by position (nothing to compare).
+    static DestinationCause.ResumeIdentity ResumeIdentityOf(NpcRec rec)
+    {
+        Transform t = rec.pa.UncertainDetourResumeTransform;
+        if (t == null || rec.mt == null) return DestinationCause.ResumeIdentity.Unknown;
+        return rec.mt.targetTransform == t ? DestinationCause.ResumeIdentity.Match : DestinationCause.ResumeIdentity.Mismatch;
+    }
+
+    // Why the NavMeshAgent destination moved (rule and vocabulary: DestinationCause.cs - ONE classifier for every movement mode, no Part check): in an UncertainBehavior detour now, a VERIFIED
+    // return from a completed detour to the main destination followed before it (wandering point or itinerary / attractor target alike), a normal new itinerary / wandering target, or other.
     static string DestChangeCause(NpcRec rec, Vector3 navDest)
     {
         PedestrianAgent pa = rec.pa;
-        if (pa.UncertainActive && pa.UncertainStateLabel == "detour") return "detour";
+        var inp = new DestinationCause.Inputs
+        {
+            DetourActiveNow = pa.UncertainActive && pa.UncertainStateLabel == "detour",
+            DetoursStarted = pa.UncertainDetoursStarted,
+            DetoursCompleted = pa.UncertainDetoursCompleted,
+            DetoursCompletedConsumed = rec.detourCompletionsConsumed,
+            RestoredPreDetourTarget = pa.UncertainDetourRestoredPreDetourTarget,
+            ResumeTransformIdentity = ResumeIdentityOf(rec),
+            ResumeTarget = pa.UncertainDetourResumeTarget,
+            ObservedDestination = navDest
+        };
         IReadOnlyList<Transform> it = pa.ItineraryTransformsView;
         int i = pa.CurrentItineraryIndex;
         if (it != null && i >= 0 && i < it.Count && it[i] != null)
         {
             Vector3 d = it[i].position - navDest; d.y = 0f;
-            if (d.sqrMagnitude <= 2.25f) return "itinerary_target";   // within 1.5 m: NavMeshAgent snaps its destination onto the NavMesh
+            inp.ItineraryTargetMatches = d.sqrMagnitude <= 2.25f;   // within 1.5 m: NavMeshAgent snaps its destination onto the NavMesh
         }
-        return CaptureConstants.DestCauseOther;   // a genuine change whose reason cannot be identified stays explicitly "other" (never relabelled as an initial assignment)
+        string cause = DestinationCause.Classify(inp, out int consumed);
+        rec.detourCompletionsConsumed = consumed;
+        return cause;
     }
 
     void WriteNpcEventRow(string type, NpcRec rec, Vector3 pos, float yaw, Vector3 dest,
@@ -1855,9 +1987,14 @@ public class DataCaptureManager : MonoBehaviour
         // ---- schema v10: NPC preparation (pool preparation vs fixed behaviour warm-up vs Start-gated pause / resume) and the random sources behind NPC behaviour ----
         // pool_prewarm_* counts INACTIVE pool objects; active_npcs_* counts the visible NPC population. They are different quantities.
         public NpcPreparationInfo npc_preparation = new NpcPreparationInfo();
+        // schema v15: Part 3 think-aloud audio (status, format, device descriptor, timing, integrity). Filled from Part3AudioRecorder; status not_enabled / not_started when Part 3 audio did not run.
+        public AudioCaptureManifest audio_capture = new AudioCaptureManifest();
         // schema v11: the central capture lifecycle (Open / Closing / Closed) and what it refused. late_* are diagnostic counters of records offered after the session closed; they are never rows.
         public string capture_lifecycle_state = "Open";
-        public double capture_closed_t_abs = -1;
+        public double capture_closed_t_abs = -1;   // CaptureClock.TAbs (the t_abs clock of every row) at which every session stream had been closed; -1 until then (and for ever when closing failed)
+        // M2 (v11 follow-up): which streams closed cleanly, which did not, and why the state is not Closed. capture_lifecycle_state is Closed ONLY when every stream closed without error.
+        public string[] capture_streams_closed = new string[0], capture_streams_failed = new string[0];
+        public string capture_finalization_error = "";
         public long late_events_rejected, late_npc_records_rejected, late_gaze_rows_rejected, npc_event_buffer_high_water;
         public string npc_random_sources = "";
         public FrameTimingSummary frame_timing = new FrameTimingSummary();
@@ -2065,6 +2202,7 @@ public class DataCaptureManager : MonoBehaviour
     void WriteManifest()
     {
         if (_manifest == null || RecordingBlocked || string.IsNullOrEmpty(SessionFolder)) return;
+        if (_manifestSealed && !_finalManifestWriting) return;   // M2: the final manifest is final
         _inManifestWrite = true;
         try
         {
@@ -2127,6 +2265,7 @@ public class DataCaptureManager : MonoBehaviour
         AddIfExists("npc_events.csv");
         AddIfExists("npc_lifetimes.csv");
         AddIfExists("npc_profiles.csv");
+        AddAudioFiles();
         _manifest.file_list = _fileList.ToArray();
 
         WriteManifest();
@@ -2145,6 +2284,7 @@ public class DataCaptureManager : MonoBehaviour
         UpdateManifestEvidence(reason);
         _fileList.Clear();
         foreach (string f in new[] { "session_manifest.json", "events.csv", "gaze.csv", "trajectory.csv", "building_registry.csv", "npc_state.csv", "npc_events.csv", "npc_lifetimes.csv", "npc_profiles.csv" }) AddIfExists(f);
+        AddAudioFiles();
         _manifest.file_list = _fileList.ToArray();
         WriteManifest();
     }
@@ -2186,6 +2326,7 @@ public class DataCaptureManager : MonoBehaviour
         FillFrameTiming(_manifest.frame_timing);
         FillEyeTracking(gh);
         FillNpcPreparation();
+        if (_audio != null) _audio.FillManifest(_manifest.audio_capture); else { _manifest.audio_capture.enabled = false; _manifest.audio_capture.status = "not_enabled"; }
 
         _manifest.trials_started = _trialsStarted; _manifest.trials_ended = _trialsEnded;
         _manifest.app_pause_count = _appPauseCount; _manifest.app_resume_count = _appResumeCount;
@@ -2283,6 +2424,7 @@ public class DataCaptureManager : MonoBehaviour
         }
         DeriveEyeTrackingAliases(et);
         _manifest.capture_lifecycle_state = CaptureState.ToString(); _manifest.capture_closed_t_abs = _captureClosedTAbs;
+        _manifest.capture_streams_closed = _captureStreamsClosed; _manifest.capture_streams_failed = _captureStreamsFailed; _manifest.capture_finalization_error = _captureFinalizationError;
         _manifest.late_events_rejected = LateEventsRejected; _manifest.late_npc_records_rejected = LateNpcRecordsRejected; _manifest.npc_event_buffer_high_water = _npcEventBufHighWater;
         if (_gazeRecorder != null)
         {
@@ -2298,6 +2440,27 @@ public class DataCaptureManager : MonoBehaviour
             et.origin_samples_checked = os.Checked; et.origin_samples_provider = os.Provider; et.origin_samples_eye_anchor_fallback = os.AnchorFallback; et.origin_samples_unchecked = os.Unchecked;
             et.origin_deviation_max_m = os.FiniteCount > 0 ? os.MaxDeviation : -1; et.origin_deviation_mean_m = os.MeanDeviation;
             Vector3 mo = os.MeanOffset; et.origin_mean_offset_x_m = mo.x; et.origin_mean_offset_y_m = mo.y; et.origin_mean_offset_z_m = mo.z;
+            et.origin_frames_samples = os.OffsetHead.N;
+            if (os.FramesRecorded)
+            {
+                et.origin_offset_world_mean_m = V3(os.OffsetWorld.Mean); et.origin_offset_world_std_m = V3(os.OffsetWorld.Std);
+                et.origin_offset_rig_mean_m = V3(os.OffsetRig.Mean); et.origin_offset_rig_std_m = V3(os.OffsetRig.Std);
+                et.origin_offset_head_mean_m = V3(os.OffsetHead.Mean); et.origin_offset_head_std_m = V3(os.OffsetHead.Std);
+            }
+            et.origin_vs_rig_anchor_mean_m = V3(g.ProviderMinusRigAnchor.Mean); et.origin_vs_rig_anchor_std_m = V3(g.ProviderMinusRigAnchor.Std);
+            FillViewFrame(g, et.view_frame);
+            FillEyePipeline(g, et);
+            EyeGazeOrigin.TrackingSpaceStats ts = g.TrackingSpace; TrackingSpaceManifest tm = et.tracking_space;
+            tm.captured = ts.Probes > 0; tm.probes = ts.Probes; tm.probes_with_both_heads = ts.ProbesWithBothHeads;
+            tm.ovrplugin_initialized = ts.OvrPluginInitialized; tm.openxr_active = ts.OpenXrActive;
+            tm.ovrplugin_tracking_origin = ts.OvrPluginOrigin; tm.unity_xr_tracking_origin_mode = ts.UnityXrMode; tm.loaded_xr_device = ts.LoadedXrDevice; tm.native_xr_api = ts.NativeXrApi;
+            tm.tracking_origins_relation = ts.Relation;
+            tm.head_delta_available = ts.ProbesWithBothHeads > 0;
+            if (tm.head_delta_available)
+            {
+                tm.head_y_ovrplugin_last_m = ts.LastOvrPluginHeadY; tm.head_y_unity_xr_last_m = ts.LastUnityHeadY;
+                tm.head_height_delta_mean_m = ts.HeadDelta.Mean.y; tm.head_height_delta_std_m = ts.HeadDelta.Std.y;
+            }
         }
         _manifest.gaze_writer_status = gazeHealth.status;
         if (_gazeRecorder == null) { _manifest.gaze_acquisition_status = "unknown"; _manifest.gaze_acquisition_reason = "no_gaze_recorder"; }
@@ -2308,6 +2471,37 @@ public class DataCaptureManager : MonoBehaviour
             // A host conflict means the recorded eye pose cannot be trusted whatever the tracker state is.
             if (et.gaze_host_conflict.Length > 0 && _gazeRecorder.blockEyeSamplesOnHostConflict) _manifest.gaze_acquisition_reason = "gaze_host_conflict:" + et.gaze_host_conflict + " (" + et.acquisition_reason + ")";
         }
+    }
+
+    // The rendered-view facts a reader needs to interpret every height (schema v13). Counters come from the recorder; the XR Origin facts are the ones it last read from the live scene.
+    void FillViewFrame(GazeRecorder g, ViewFrameManifest vm)
+    {
+        XrOriginFacts xf = g.XrFactsLast;
+        vm.captured = g.ViewSamples > 0 || !string.IsNullOrEmpty(xf.ViewCameraPath) || xf.OriginPresent;
+        vm.samples = g.ViewSamples; vm.ground_samples = g.GroundSamples; vm.ground_unavailable_samples = g.GroundUnavailableSamples;
+        vm.view_camera = xf.ViewCameraPath ?? ""; vm.ovr_centre_eye = xf.CentreEyePath ?? "";
+        vm.xr_origin_present = xf.OriginPresent; vm.xr_origin_requested_mode = xf.RequestedMode ?? ""; vm.xr_origin_current_mode = xf.CurrentMode ?? "";
+        vm.xr_origin_camera_y_offset_property_m = xf.CameraYOffsetProperty;
+        vm.camera_floor_offset_object_present = xf.HasOffsetObject; vm.camera_floor_offset_local_y_m = xf.OffsetObjectLocalY; vm.camera_floor_offset_object = xf.OffsetObjectPath ?? "";
+        vm.ovr_manager_tracking_origin_type = g.OvrTrackingOriginType ?? "";
+        vm.view_minus_ovr_centre_eye_mean_m = V3(g.ViewMinusCentre.Mean); vm.view_minus_ovr_centre_eye_std_m = V3(g.ViewMinusCentre.Std);
+        vm.eye_height_source = g.ViewSamples > 0 || xf.OriginPresent ? EyeHeightSource.Decide(xf) : "unknown";
+        vm.eye_height_is_participant_specific = vm.eye_height_source == EyeHeightSource.RuntimeFloor;
+        if (g.GroundSamples > 0)
+        {
+            vm.hmd_height_above_ground_first_m = g.HeightFirst; vm.hmd_height_above_ground_min_m = g.HeightMin; vm.hmd_height_above_ground_max_m = g.HeightMax; vm.hmd_height_above_ground_mean_m = g.HeightSum / g.GroundSamples;
+        }
+    }
+
+    // The per-eye pipeline block (schema v14): configuration facts read from the live components + the running statistics the recorder kept. The statistics objects are shared with the recorder.
+    void FillEyePipeline(GazeRecorder g, EyeTrackingManifest et)
+    {
+        EyePipelineManifest pm = g.Pipeline; et.eye_pipeline = pm;
+        pm.left_provider_tracking_mode = g.leftEyeGaze != null ? g.leftEyeGaze.TrackingMode.ToString() : "";
+        pm.right_provider_tracking_mode = g.rightEyeGaze != null ? g.rightEyeGaze.TrackingMode.ToString() : "";
+        string src = "unknown";
+        try { src = OVRManager.loadedXRDevice == OVRManager.XRDevice.Oculus ? "OVRPlugin.GetNodePose (OVRPlugin tracking space)" : "Unity XR nodes (Unity tracking space)"; } catch (Exception) { }
+        pm.anchor_source = src;
     }
 
     void FillFrameTiming(FrameTimingSummary f)
@@ -2386,6 +2580,8 @@ public class DataCaptureManager : MonoBehaviour
     }
     bool _unachievableSeen;
 
+    void AddAudioFiles() { foreach (string f in new[] { "audio/part3_audio.wav", "audio/part3_audio.wav.partial", "audio/audio_index.csv", "audio/audio_anchors.csv", "audio/audio_metadata.json" }) AddIfExists(f); }
+
     void AddIfExists(string name)
     {
         try { if (File.Exists(Path.Combine(SessionFolder, name))) _fileList.Add(name); }
@@ -2396,6 +2592,8 @@ public class DataCaptureManager : MonoBehaviour
 
     static string F(float v)  => v.ToString("F4", CultureInfo.InvariantCulture);
     static string F(double v) => v.ToString("F4", CultureInfo.InvariantCulture);
+
+    static float[] V3(Vector3 v) => new[] { v.x, v.y, v.z };
 
     static string S(string s)
     {

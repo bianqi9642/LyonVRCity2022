@@ -171575,10 +171575,24 @@ MonoBehaviour:
   lifecycleController: {fileID: 0}
   requireProviderValidity: 1
   blockEyeSamplesOnHostConflict: 1
+  faceExpressions: {fileID: 0}
+  blinkCloseThreshold: 0.7
+  blinkOpenThreshold: 0.5
+  HeightMin: NaN
+  HeightMax: NaN
+  HeightSum: 0
+  HeightFirst: NaN
+  recordProviderPipeline: 1
   leftEyeAnchor: {fileID: 0}
   rightEyeAnchor: {fileID: 0}
   validateProviderOrigin: 1
   maxProviderOriginDeviationMeters: 0.12
+  viewCamera: {fileID: 0}
+  centerEyeAnchor: {fileID: 0}
+  groundLayerMask:
+    serializedVersion: 2
+    m_Bits: 0
+  recordViewFrame: 1
   headTransform: {fileID: 922815402}
   experimentManager: {fileID: 0}
   sessionController: {fileID: 0}

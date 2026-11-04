@@ -159,7 +159,7 @@ public partial class NpcLifecycleTests
         Call(rig.dcm, "WriteManifestEnd", "test");
         var m = Newtonsoft.Json.Linq.JObject.Parse(System.IO.File.ReadAllText(rig.File("session_manifest.json")));
         var np = m["npc_preparation"];
-        Assert.AreEqual(11, (int)m["schema_version"]);
+        Assert.AreEqual(15, (int)m["schema_version"]);
         Assert.AreEqual("Part2", (string)np["part"]); Assert.AreEqual(200, (int)np["pool_preparation_target_count"]); Assert.AreEqual(200, (int)np["pool_preparation_created_count"]);
         Assert.AreEqual("ready", (string)np["pool_preparation_status"]);
         Assert.AreEqual(0.7, (double)np["npc_generation_configured_duration_seconds"], 1e-6); Assert.IsTrue((bool)np["hold_until_start"]);

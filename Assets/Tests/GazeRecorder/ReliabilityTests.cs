@@ -368,7 +368,7 @@ public partial class NpcLifecycleTests
         if (useJson) { Set(r.sc, "useExternalJson", true); Set(r.sc, "externalFileName", jsonName); }
         if (withEm)
         {
-            var emGo = Make("IdEm", active: false); r.em = emGo.AddComponent(T("ExperimentManager")); Set(r.em, "sessionController", r.sc);
+            var emGo = Make("IdEm", active: false); r.em = emGo.AddComponent(T("ExperimentManager")); Set(r.em, "part3AudioRecording", false); Set(r.em, "sessionController", r.sc);
         }
         LogAssert.ignoreFailingMessages = false;
         scGo.SetActive(true);

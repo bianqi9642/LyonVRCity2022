@@ -643,6 +643,16 @@ public class EyeTrackingManifest
     public bool origin_validation_enabled;
     public long origin_samples_checked, origin_samples_provider, origin_samples_eye_anchor_fallback, origin_samples_unchecked;
     public double origin_deviation_max_m = -1, origin_deviation_mean_m = -1, origin_mean_offset_x_m, origin_mean_offset_y_m, origin_mean_offset_z_m, origin_max_allowed_deviation_m = -1;
+    // schema v12: the provider-minus-anchor offset in three frames (mean + sample std, metres; -1 std when fewer than 2 samples). Constant in world / rig axes but varying in head axes = a tracking-origin
+    // offset; constant in head axes = a head-model offset. origin_frames_samples is 0 when the frames were not recorded (no anchor / no head transform).
+    public long origin_frames_samples;
+    public float[] origin_offset_world_mean_m = new float[0], origin_offset_world_std_m = new float[0];
+    public float[] origin_offset_rig_mean_m = new float[0], origin_offset_rig_std_m = new float[0];
+    public float[] origin_offset_head_mean_m = new float[0], origin_offset_head_std_m = new float[0];
+    public TrackingSpaceManifest tracking_space = new TrackingSpaceManifest();
+    public EyePipelineManifest eye_pipeline = new EyePipelineManifest();   // schema v14: the per-eye provider pipeline (raw provider vs head space vs view anchors vs IPD, frame coherence)
+    public ViewFrameManifest view_frame = new ViewFrameManifest();   // schema v13: the rendered view, the Camera Floor Offset and ground-relative heights
+    public float[] origin_vs_rig_anchor_mean_m = new float[0], origin_vs_rig_anchor_std_m = new float[0];   // provider minus the RAW OVR anchor (rig frame): the Camera Floor Offset shows up here
 
     // raw provider confidence behaviour (see GazeConfidence) and the blink-signal capability (see BlinkCapability)
     public ConfidenceManifest confidence = new ConfidenceManifest();
@@ -704,6 +714,24 @@ public class FrameTimingSummary
 
 /// <summary>Manifest block "eye_tracking.blink": whether a blink / eye-closure signal exists on this runtime and project configuration, and what was detected from it. The ABSENCE of blink events is
 /// evidence of "no blinks" only when status == available.</summary>
+/// <summary>
+/// G1 evidence about the tracking origins behind the gaze origin: what OVRPlugin and Unity XR each report, and the vertical difference between the two readings of the SAME head node.
+/// It is evidence, not a verdict: tracking_origins_relation says whether the two origin kinds agree; head_height_delta_* compares with the provider-minus-anchor offset.
+/// </summary>
+[Serializable]
+public class TrackingSpaceManifest
+{
+    public bool captured;
+    public long probes, probes_with_both_heads;
+    public bool ovrplugin_initialized, openxr_active;
+    public string ovrplugin_tracking_origin = "", unity_xr_tracking_origin_mode = "", loaded_xr_device = "", native_xr_api = "";
+    public string tracking_origins_relation = "unknown";   // same_kind | differ | unknown
+    public bool head_delta_available;   // false = the values below are placeholders (0), not measurements (never NaN in the JSON)
+    public double head_y_ovrplugin_last_m, head_y_unity_xr_last_m;
+    public double head_height_delta_mean_m, head_height_delta_std_m;   // OVRPlugin head y minus Unity XR head y
+    public string note = "evidence only: a head_height_delta equal to origin_offset_world_mean_m[1] indicates two different tracking origins (not a gaze-specific fault); not a hardware verification";
+}
+
 [Serializable]
 public class BlinkManifest
 {

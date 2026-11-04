@@ -57,6 +57,7 @@ public partial class NpcLifecycleTests
     [UnityTearDown]
     public IEnumerator TearDown()
     {
+        LogAssert.ignoreFailingMessages = false;
         foreach (var o in _spawned) if (o != null) UnityEngine.Object.Destroy(o);
         _spawned.Clear();
         yield return null;
@@ -105,6 +106,7 @@ public partial class NpcLifecycleTests
         public bool withAppearance = false;         // AppearanceController with hair + top SkinnedMeshRenderers
         public bool realPart = false;               // do NOT simulate part_start / the NPC simulation: the test starts the real ExperimentManager.RunPartN itself
         public UnityEngine.Object profile;          // AgentProfile applied through the production AgentFactory (null = none)
+        public bool audio = false;                  // ExperimentManager.part3AudioRecording (default OFF in test rigs)
         public bool noAgentPrefab = false;          // SpawnerManager.agentPrefab left null: pool creation must fail explicitly
         public float prewarmBudgetMs = -1f;         // SpawnerManager.prewarmFrameBudgetMs (>= 0 overrides the default; tiny = about one pooled object per frame)
     }
@@ -189,6 +191,7 @@ public partial class NpcLifecycleTests
 
         var emGo = Make("TestExperimentManager");
         rig.em = emGo.AddComponent(EmType);
+        Set(rig.em, "part3AudioRecording", o.audio);   // Part 3 audio needs a microphone (or a simulated one): off in every rig that does not test it
         o.emSetup?.Invoke(rig.em);
         object cfg = Activator.CreateInstance(CfgType);
         Set(cfg, "npcEnabled", true);
@@ -775,7 +778,7 @@ public partial class NpcLifecycleTests
         Call(rig.em, "TerminateSession", "Part3");
         yield return null;
         string manifest = File.ReadAllText(rig.File("session_manifest.json"));
-        StringAssert.Contains("\"schema_version\": " + 11, manifest);
+        StringAssert.Contains("\"schema_version\": " + 15, manifest);
         StringAssert.Contains("agent-lifetime-v1", manifest);
         StringAssert.Contains("(session_id, npc_spawn_instance_id)", manifest);
         StringAssert.Contains("master_switch", manifest);

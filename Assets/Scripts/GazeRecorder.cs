@@ -93,6 +93,35 @@ public class GazeRecorder : MonoBehaviour
     public string BlinkReason { get; private set; } = "not_evaluated_yet";
     public BlinkFacts BlinkFactsLast { get; private set; }
     double _nextBlinkCapabilityT; bool _faceSearched;
+    /// <summary>Evidence about OVRPlugin's vs Unity XR's tracking origin (G1): sampled about every 2 s, never per sample. Written to manifest eye_tracking.tracking_space.</summary>
+    public EyeGazeOrigin.TrackingSpaceStats TrackingSpace { get; } = new EyeGazeOrigin.TrackingSpaceStats();
+    double _nextTrackingProbeT;
+    /// <summary>Rendered-view resolution + readings (schema v13). Statistics below are written to manifest eye_tracking.view_frame.</summary>
+    public ViewFrameProbe ViewProbe { get; } = new ViewFrameProbe();
+    public long ViewSamples { get; private set; }
+    public long GroundSamples { get; private set; }
+    public long GroundUnavailableSamples { get; private set; }
+    public readonly EyeGazeOrigin.Welford3 ViewMinusCentre = new EyeGazeOrigin.Welford3();
+    /// <summary>Provider minus the RAW OVR rig anchor (rig frame): the v10-v12 diagnostic, kept so the Camera Floor Offset stays visible in the data.</summary>
+    public readonly EyeGazeOrigin.Welford3 ProviderMinusRigAnchor = new EyeGazeOrigin.Welford3();
+    public double HeightMin = double.NaN, HeightMax = double.NaN, HeightSum, HeightFirst = double.NaN;   // hmd height above ground (first recorded = the initial standing height)
+    [NonSerialized] public Func<XrOriginFacts> testXrFacts;   // test seam (never set in production)
+    double _nextXrFactsT; public XrOriginFacts XrFactsLast { get; private set; }
+
+    // ---- per-eye pipeline evidence (schema v14): raw provider pose, head-space pose, coherence with the rendered camera, stereo / IPD facts ----
+    [Header("Provider pipeline evidence (schema v14)")]
+    [Tooltip("Record the raw OVRPlugin eye-gaze poses (tracking space), their head-space conversion, the provider timestamp, stereo / IPD facts and the composed-vs-WorldSpace coherence check. Reads OVRPlugin.GetEyeGazesState once per row; does not change the recorded gaze ray.")]
+    public bool recordProviderPipeline = true;
+    public EyePipelineManifest Pipeline { get; } = new EyePipelineManifest();
+    /// <summary>Unity frame in which OVRCameraRig last raised UpdatedAnchors (-1 = never seen).</summary>
+    public int AnchorsUpdatedFrame { get; private set; } = -1;
+    OVRPlugin.EyeGazesState _rawBuf; double _prevProviderTime = double.NaN; OVRCameraRig _subRig; double _nextSubT, _nextIpdT; float _ipdCache; bool _ipdOk;
+    [NonSerialized] public Func<RawGazeState> testRawGaze;                          // test seams (never set in production)
+    [NonSerialized] public Func<(Vector3 pos, Quaternion rot)> testHeadReference;   // head node pose in tracking space (what the SDK's head-space conversion uses)
+    [NonSerialized] public Func<float> testRuntimeIpd;
+    public string OvrTrackingOriginType { get; private set; } = "";
+    [NonSerialized] public Func<EyeGazeOrigin.TrackingSpaceFacts> testTrackingFacts;   // test seam (never set in production)
+    Transform _rigTrackingSpace;
     /// <summary>Test seams (never set in production): replace the runtime facts / the two closure weights.</summary>
     [NonSerialized] public Func<BlinkFacts> testBlinkFacts;
     [NonSerialized] public Func<(float? left, float? right)> testEyeClosure;
@@ -111,6 +140,20 @@ public class GazeRecorder : MonoBehaviour
     [Tooltip("Plausibility bound (metres) between the provider's eye origin and the rig eye anchor. Real pupil-vs-eye-node differences are centimetres; this is a gate, never added to a coordinate.")]
     [Range(0.02f, 0.5f)]
     public float maxProviderOriginDeviationMeters = EyeGazeOrigin.DefaultMaxDeviationMeters;
+
+    [Header("View frame (the camera the participant sees from) - schema v13")]
+    [Tooltip("The RENDERED camera (centre-eye / HMD reference). Empty = Camera.main. In this project that is the XRI Main Camera under the XR Origin's Camera Floor Offset, NOT the OVRCameraRig's CenterEyeAnchor: the two follow the same " +
+             "tracked head but differ by the Camera Floor Offset (see ViewFrame.cs). Eye / HMD world positions, heights above ground, the head-fallback ray and the anchor validation use this frame.")]
+    public Transform viewCamera;
+
+    [Tooltip("OVRCameraRig CenterEyeAnchor (the head frame the eye anchors are defined in). Empty = the scene's OVRCameraRig, then 'headTransform'.")]
+    public Transform centerEyeAnchor;
+
+    [Tooltip("Layers that are the walkable ground for height-above-ground. Empty (0) = the ground layer of the scene's AutoGroundAlign. NPC and participant colliders are never ground. No ground found = the height columns stay blank.")]
+    public LayerMask groundLayerMask;
+
+    [Tooltip("Record the view-frame columns (hmd_world_*, eye head-local / world positions, heights above ground) and use the rendered view for the head-fallback ray and the anchor validation. Turn off only to reproduce the pre-v13 behaviour.")]
+    public bool recordViewFrame = true;
 
     [Header("Head Reference")]
     [Tooltip("HMD transform (e.g. CenterEyeAnchor) used to log head position/rotation alongside gaze, " +
@@ -259,12 +302,14 @@ public class GazeRecorder : MonoBehaviour
     int _anchorSearches;
     void ResolveEyeAnchors()
     {
-        if (leftEyeAnchor != null && rightEyeAnchor != null) return;
+        if (leftEyeAnchor != null && rightEyeAnchor != null && _rigTrackingSpace != null) return;
+        if (leftEyeAnchor != null && rightEyeAnchor != null && _anchorSearches >= 8) return;
         _anchorSearches++;   // bounded: the rig creates its anchors in its own Awake/Update, which may run after this component's Awake, so the search is repeated a few times (Awake, Start, first samples)
         OVRCameraRig rig = FindObjectOfType<OVRCameraRig>();
         if (rig == null) return;
         if (leftEyeAnchor == null) leftEyeAnchor = rig.leftEyeAnchor;
         if (rightEyeAnchor == null) rightEyeAnchor = rig.rightEyeAnchor;
+        if (_rigTrackingSpace == null) _rigTrackingSpace = rig.trackingSpace != null ? rig.trackingSpace : rig.transform;
     }
 
     // The permission request, the start of OVREyeGaze and its retries belong to ONE owner (EyeTrackingLifecycleController); this recorder only makes sure it exists.
@@ -303,6 +348,7 @@ public class GazeRecorder : MonoBehaviour
     void OnDestroy()
     {
         terminated = true;
+        if (_subRig != null) { _subRig.UpdatedAnchors -= OnAnchorsUpdated; _subRig = null; }
         if (experimentManager != null)
         {
             experimentManager.OnTrialStart -= OnExperimentTrialStart;
@@ -554,7 +600,31 @@ public class GazeRecorder : MonoBehaviour
             "gaze_origin_source",
             // ----- schema v11 appended columns (blink signal; ALWAYS blank unless the face-tracking eye-closure signal is available - blank means "not measured", never "eyes open") -----
             // eyes_closed_left / eyes_closed_right: raw FaceExpression.EyesClosedL / R weights 0..1; blink_state: 1 = inside a detected blink, 0 = not, blank = no valid measurement for both eyes.
-            "eyes_closed_left", "eyes_closed_right", "blink_state"
+            "eyes_closed_left", "eyes_closed_right", "blink_state",
+            // ----- schema v13 appended columns (view frame; ALL blank when the rendered view / OVR anchors are not resolved, ground columns blank when no ground surface is found) -----
+            // hmd_world_*: the RENDERED camera (centre-eye / HMD reference the participant sees from) in Unity world coordinates; hmd_world_rot_*: its rotation.
+            // *_eye_head_local_*: the eye anchors in the OVR centre-eye (head) frame - independent of any world height. *_eye_world_*: the eyes in the rendered view frame = view pos + view rot * head-local.
+            // ground_y: world Y of the walkable ground surface below the rendered camera; *_height_above_ground = world Y - ground_y (never an assumed eye height).
+            "hmd_world_x", "hmd_world_y", "hmd_world_z", "hmd_world_rot_x", "hmd_world_rot_y", "hmd_world_rot_z", "hmd_world_rot_w",
+            "left_eye_head_local_x", "left_eye_head_local_y", "left_eye_head_local_z", "right_eye_head_local_x", "right_eye_head_local_y", "right_eye_head_local_z",
+            "left_eye_world_x", "left_eye_world_y", "left_eye_world_z", "right_eye_world_x", "right_eye_world_y", "right_eye_world_z",
+            "ground_y", "hmd_height_above_ground", "left_eye_height_above_ground", "right_eye_height_above_ground",
+            // ----- schema v14 appended columns (per-eye provider pipeline; blank when unavailable, never estimated) -----
+            // provider_time_s: OVRPlugin EyeGazesState.Time; provider_time_changed: 1 = a newer provider sample than the previous row, 0 = the previous sample reused.
+            // *_raw_tracking_*: the provider eye pose in OVRPlugin tracking space (position, forward direction). *_gaze_head_*: the same pose in the head frame (SDK head-space conversion; independent of the tracking origin,
+            // the Camera Offset and the world). The recorded gaze ray (left_/right_/combined_origin, _dir) remains the OVREyeGaze WorldSpace result.
+            "provider_time_s", "provider_time_changed",
+            "left_raw_tracking_pos_x", "left_raw_tracking_pos_y", "left_raw_tracking_pos_z", "left_raw_tracking_dir_x", "left_raw_tracking_dir_y", "left_raw_tracking_dir_z",
+            "right_raw_tracking_pos_x", "right_raw_tracking_pos_y", "right_raw_tracking_pos_z", "right_raw_tracking_dir_x", "right_raw_tracking_dir_y", "right_raw_tracking_dir_z",
+            "left_gaze_head_pos_x", "left_gaze_head_pos_y", "left_gaze_head_pos_z", "left_gaze_head_dir_x", "left_gaze_head_dir_y", "left_gaze_head_dir_z",
+            "right_gaze_head_pos_x", "right_gaze_head_pos_y", "right_gaze_head_pos_z", "right_gaze_head_dir_x", "right_gaze_head_dir_y", "right_gaze_head_dir_z",
+            // provider eye position minus the stereo VIEW anchor, both in head space (metres); WorldSpace result vs (rendered camera * head-space eye): origin metres / direction degrees (should be ~0 within one frame).
+            "left_gaze_vs_view_anchor_head_m", "right_gaze_vs_view_anchor_head_m",
+            "left_worldspace_vs_composed_origin_m", "right_worldspace_vs_composed_origin_m", "left_worldspace_vs_composed_dir_deg", "right_worldspace_vs_composed_dir_deg",
+            // stereo VIEW anchor separation, provider eye separation (head space, both eyes valid), the IPD the runtime holds (OVRPlugin.ipd) - three different quantities, none is a pupil measurement.
+            "view_anchor_separation_m", "gaze_head_separation_m", "runtime_user_ipd_m",
+            // Unity frame of the last OVRCameraRig.UpdatedAnchors; why the recorded origin is not the provider's (no_valid_eye | provider_exceeds_deviation_gate | provider_origin_non_finite | mixed).
+            "anchors_updated_frame", "origin_fallback_reason"
         });
     }
 
@@ -566,9 +636,12 @@ public class GazeRecorder : MonoBehaviour
         public Vector3 direction;
         public EyeOriginSource originSource;
         public bool confidenceAvailable;   // a usable RAW provider confidence exists for this sample (see GazeConfidence); false = the confidence columns stay blank
+        public bool hasProviderWorld;      // a real OVREyeGaze reading (not injected): providerWorldOrigin / Dir are its WorldSpace transform BEFORE any fallback replaced the origin
+        public Vector3 providerWorldOrigin, providerWorldDir;
+        public string fallbackReason;      // (null = none) why the recorded origin is not the provider's: provider_exceeds_deviation_gate | provider_origin_non_finite ("" = provider origin used / not applicable)
     }
 
-    EyeSample ReadEye(OVREyeGaze eyeGaze, EyeInjection injected, bool providerKnown, bool providerValid, bool hostBlocked, Transform eyeAnchor = null)
+    EyeSample ReadEye(OVREyeGaze eyeGaze, EyeInjection injected, bool providerKnown, bool providerValid, bool hostBlocked, Transform eyeAnchor = null, Vector3? viewFrameAnchor = null)
     {
         EyeSample sample = new EyeSample
         {
@@ -596,6 +669,7 @@ public class GazeRecorder : MonoBehaviour
             sample.confidenceAvailable = GazeConfidence.Usable(sample.confidence);
             sample.origin = eyeGaze.transform.position;
             sample.direction = eyeGaze.transform.forward;
+            sample.hasProviderWorld = true; sample.providerWorldOrigin = sample.origin; sample.providerWorldDir = sample.direction;
             // The threshold only ACCEPTS or REJECTS a measured value. A provider-valid eye with no usable confidence is not rejected by it (nothing was measured to compare), and a missing
             // confidence never turns a valid ray into an invalid one.
             sample.valid = GazeConfidence.IsValid(sample.confidence, sample.confidenceAvailable, minConfidenceForValid, providerKnown, providerValid);
@@ -604,9 +678,17 @@ public class GazeRecorder : MonoBehaviour
                 // Origin and direction must live in the same world frame. The direction is a rotation (unaffected by a translation between tracking origins); the origin is
                 // validated against the rig's own eye position (see EyeGazeOrigin for the observed mismatch). Nothing is added to or subtracted from a coordinate.
                 Vector3 providerWorld = sample.origin;
-                Vector3? anchorWorld = eyeAnchor != null ? eyeAnchor.position : (Vector3?)null;
+                // The anchor the provider is compared with / replaced by is the eye as seen from the RENDERED view (viewFrameAnchor) when the view frame is available: the provider (OVREyeGaze converts with
+                // Camera.main) lives in that frame, the raw OVR anchor does not (it lacks the XR Origin's Camera Floor Offset). Without a view frame the raw anchor is used, as before.
+                Vector3? rigAnchor = eyeAnchor != null ? eyeAnchor.position : (Vector3?)null;
+                Vector3? anchorWorld = viewFrameAnchor ?? rigAnchor;
                 sample.originSource = EyeGazeOrigin.Resolve(providerWorld, anchorWorld, maxProviderOriginDeviationMeters, out sample.origin, out float deviation);
+                if (viewFrameAnchor.HasValue && sample.originSource == EyeOriginSource.EyeAnchor) sample.originSource = EyeOriginSource.EyeAnchorView;
+                if (sample.originSource == EyeOriginSource.EyeAnchor || sample.originSource == EyeOriginSource.EyeAnchorView) sample.fallbackReason = float.IsInfinity(deviation) ? "provider_origin_non_finite" : "provider_exceeds_deviation_gate";
+                if (sample.valid && rigAnchor.HasValue && EyeGazeOrigin.IsFinite(providerWorld) && EyeGazeOrigin.IsFinite(rigAnchor.Value)) ProviderMinusRigAnchor.Add(providerWorld - rigAnchor.Value);
                 if (sample.valid) OriginStats.Note(sample.originSource, providerWorld, anchorWorld, deviation);
+                if (sample.valid && anchorWorld.HasValue && headTransform != null)
+                    OriginStats.NoteInFrames(providerWorld, anchorWorld.Value, headTransform.rotation, _rigTrackingSpace != null ? _rigTrackingSpace.rotation : Quaternion.identity);
             }
         }
         // Provider gating (same rules for a real OVREyeGaze reading and for an injected one that opts in): host conflict and stale confidence.
@@ -615,6 +697,191 @@ public class GazeRecorder : MonoBehaviour
         // The SDK keeps its previous Confidence when the provider flags the eye invalid: that number is not an observation of THIS sample.
         sample.confidenceAvailable = GazeConfidence.AvailableAfterProvider(sample.confidenceAvailable, providerKnown, providerValid);
         return sample;
+    }
+
+    // ---- per-eye pipeline helpers (schema v14) ----
+    void OnAnchorsUpdated(OVRCameraRig rig) { AnchorsUpdatedFrame = Time.frameCount; Pipeline.anchors_updated_events++; }
+
+    void TrySubscribeAnchors()
+    {
+        if (_subRig != null || Time.unscaledTime < _nextSubT) return;
+        _nextSubT = Time.unscaledTime + 1f;
+        OVRCameraRig rig = FindObjectOfType<OVRCameraRig>();
+        if (rig != null) { _subRig = rig; rig.UpdatedAnchors += OnAnchorsUpdated; }
+    }
+
+    // One OVRPlugin read per row (the public call OVREyeGaze.Update itself makes). Unavailable = every raw column stays blank.
+    bool ReadRawGaze(out RawGazeState r)
+    {
+        r = default;
+        if (testRawGaze != null) { r = testRawGaze(); return r.available; }
+        try
+        {
+            if (!OVRPlugin.initialized || !OVRPlugin.eyeTrackingEnabled) return false;
+            if (!OVRPlugin.GetEyeGazesState(OVRPlugin.Step.Render, -1, ref _rawBuf) || _rawBuf.EyeGazes == null || _rawBuf.EyeGazes.Length < 2) return false;
+            r.available = true; r.time = _rawBuf.Time;
+            r.left = ToRawEye(_rawBuf.EyeGazes[(int)OVRPlugin.Eye.Left]); r.right = ToRawEye(_rawBuf.EyeGazes[(int)OVRPlugin.Eye.Right]);
+            return true;
+        }
+        catch (Exception) { return false; }
+    }
+
+    static RawGazeEye ToRawEye(OVRPlugin.EyeGazeState g)
+    {
+        OVRPose p = g.Pose.ToOVRPose();   // the SDK's own handedness conversion
+        return new RawGazeEye { valid = g.IsValid, confidence = g.Confidence, rawPos = p.position, rawDir = p.orientation * Vector3.forward };
+    }
+
+    // The SDK's head-space conversion (OVRCommon.ToHeadSpacePose = head node^-1 * pose, head node from the same OVRPlugin source the anchors use) - or a test head reference.
+    bool ToHeadSpace(Vector3 pos, Quaternion rot, out Vector3 hp, out Quaternion hr)
+    {
+        hp = default; hr = Quaternion.identity;
+        try
+        {
+            if (testHeadReference != null) { var h = testHeadReference(); EyePipelineMath.ToHeadSpace(h.pos, h.rot, pos, rot, out hp, out hr); return true; }
+            OVRPose p = new OVRPose { position = pos, orientation = rot }.ToHeadSpacePose();
+            hp = p.position; hr = p.orientation; return EyeGazeOrigin.IsFinite(hp);
+        }
+        catch (Exception) { return false; }
+    }
+
+    static Quaternion LookOf(Vector3 dir) => dir.sqrMagnitude > 1e-12f ? Quaternion.LookRotation(dir, Vector3.up) : Quaternion.identity;
+
+    float ReadRuntimeIpd(double now, out bool ok)
+    {
+        if (testRuntimeIpd != null) { float t = testRuntimeIpd(); ok = EyePipelineMath.IsUsableIpd(t); return t; }
+        if (now >= _nextIpdT)
+        {
+            _nextIpdT = now + 1.0;
+            try { _ipdCache = OVRPlugin.initialized ? OVRPlugin.ipd : 0f; } catch (Exception) { _ipdCache = 0f; }
+            _ipdOk = EyePipelineMath.IsUsableIpd(_ipdCache);
+        }
+        ok = _ipdOk; return _ipdCache;
+    }
+
+    // The 37 schema-v14 columns of one row (see GetCsvHeader). Everything unavailable is blank; nothing is estimated.
+    string PipelineColumns(double tAbs, bool vfOk, in ViewFrameSample vf, in EyeSample left, in EyeSample right, string gazeRaySource)
+    {
+        const int N = 37;
+        string[] c = new string[N]; for (int i = 0; i < N; i++) c[i] = "";
+        if (!recordProviderPipeline) return string.Join(",", c);
+        bool rawOk = ReadRawGaze(out RawGazeState raw);
+        Vector3 lHeadPos = default, lHeadDir = default, rHeadPos = default, rHeadDir = default; bool lHead = false, rHead = false;
+        if (rawOk)
+        {
+            Pipeline.raw_provider_read_available = true; Pipeline.rows_with_raw_provider++;
+            c[0] = raw.time.ToString("F6", CultureInfo.InvariantCulture);
+            if (!double.IsNaN(_prevProviderTime))
+            {
+                bool adv = raw.time != _prevProviderTime; c[1] = adv ? "1" : "0";
+                if (adv) Pipeline.rows_provider_time_advanced++; else Pipeline.rows_provider_time_repeated++;
+            }
+            _prevProviderTime = raw.time;
+            if (raw.left.valid)
+            {
+                SetV3(c, 2, raw.left.rawPos); SetV3(c, 5, raw.left.rawDir);
+                if (ToHeadSpace(raw.left.rawPos, LookOf(raw.left.rawDir), out Vector3 hp, out Quaternion hr)) { lHead = true; lHeadPos = hp; lHeadDir = hr * Vector3.forward; SetV3(c, 14, lHeadPos); SetV3(c, 17, lHeadDir); }
+            }
+            if (raw.right.valid)
+            {
+                SetV3(c, 8, raw.right.rawPos); SetV3(c, 11, raw.right.rawDir);
+                if (ToHeadSpace(raw.right.rawPos, LookOf(raw.right.rawDir), out Vector3 hp, out Quaternion hr)) { rHead = true; rHeadPos = hp; rHeadDir = hr * Vector3.forward; SetV3(c, 20, rHeadPos); SetV3(c, 23, rHeadDir); }
+            }
+        }
+        // view anchors in the SAME head frame the provider is converted into (so the two are comparable)
+        Vector3 laHead = default, raHead = default; bool laOk = false, raOk = false;
+        if (vfOk && ViewProbe.LeftEye != null && ViewProbe.RightEye != null)
+        {
+            laOk = ToHeadSpace(ViewProbe.LeftEye.localPosition, ViewProbe.LeftEye.localRotation, out laHead, out _);
+            raOk = ToHeadSpace(ViewProbe.RightEye.localPosition, ViewProbe.RightEye.localRotation, out raHead, out _);
+        }
+        if (lHead && laOk) { float d = (lHeadPos - laHead).magnitude; c[26] = F5(d); Pipeline.left_gaze_vs_view_anchor_head_m.Add(d); }
+        if (rHead && raOk) { float d = (rHeadPos - raHead).magnitude; c[27] = F5(d); Pipeline.right_gaze_vs_view_anchor_head_m.Add(d); }
+        // coherence: the OVREyeGaze WorldSpace result vs (rendered camera * head-space eye). ~0 when the camera and the provider sample share a frame.
+        if (vfOk && lHead && left.hasProviderWorld)
+        {
+            float d = (EyePipelineMath.ComposeOrigin(vf.hmdPos, vf.hmdRot, lHeadPos) - left.providerWorldOrigin).magnitude;
+            float a = EyePipelineMath.AngleDeg(EyePipelineMath.ComposeDirection(vf.hmdRot, lHeadDir), left.providerWorldDir);
+            c[28] = F5(d); c[30] = F3(a); Pipeline.left_worldspace_vs_composed_origin_m.Add(d); Pipeline.left_worldspace_vs_composed_dir_deg.Add(a);
+        }
+        if (vfOk && rHead && right.hasProviderWorld)
+        {
+            float d = (EyePipelineMath.ComposeOrigin(vf.hmdPos, vf.hmdRot, rHeadPos) - right.providerWorldOrigin).magnitude;
+            float a = EyePipelineMath.AngleDeg(EyePipelineMath.ComposeDirection(vf.hmdRot, rHeadDir), right.providerWorldDir);
+            c[29] = F5(d); c[31] = F3(a); Pipeline.right_worldspace_vs_composed_origin_m.Add(d); Pipeline.right_worldspace_vs_composed_dir_deg.Add(a);
+        }
+        if (vfOk) { float s = (vf.leftLocal - vf.rightLocal).magnitude; c[32] = F5(s); Pipeline.view_anchor_separation_m.Add(s); }
+        if (lHead && rHead) { float s = (lHeadPos - rHeadPos).magnitude; c[33] = F5(s); Pipeline.gaze_head_separation_m.Add(s); }
+        float ipd = ReadRuntimeIpd(tAbs, out bool ipdOk);
+        if (ipdOk) { c[34] = F5(ipd); Pipeline.runtime_user_ipd_available = true; Pipeline.runtime_user_ipd_m.Add(ipd); }
+        if (AnchorsUpdatedFrame >= 0)
+        {
+            c[35] = Inv(AnchorsUpdatedFrame);
+            long lag = Time.frameCount - AnchorsUpdatedFrame; if (lag > Pipeline.anchors_frame_lag_max) Pipeline.anchors_frame_lag_max = lag;
+        }
+        // why the recorded origin is not (all) the provider's
+        string reason = "";
+        if (gazeRaySource == "head_fallback") reason = "no_valid_eye";
+        else
+        {
+            string lr = (left.valid ? left.fallbackReason : null) ?? "", rr = (right.valid ? right.fallbackReason : null) ?? "";
+            reason = (lr.Length > 0 && rr.Length > 0 && lr != rr) ? "mixed" : (lr.Length > 0 ? lr : rr);
+        }
+        c[36] = reason;
+        return string.Join(",", c);
+    }
+
+    static void SetV3(string[] c, int at, Vector3 v) { c[at] = F4(v.x); c[at + 1] = F4(v.y); c[at + 2] = F4(v.z); }
+    static string F5(float v) => v.ToString("F5", CultureInfo.InvariantCulture);
+
+    // ---- XR Origin facts (schema v13): about every 2 s, guarded, observation only ----
+    void RefreshXrFacts(double now)
+    {
+        if (now < _nextXrFactsT) return;
+        _nextXrFactsT = now + 2.0;
+        XrFactsLast = testXrFacts != null ? testXrFacts() : ViewProbe.ReadXrFacts();
+        if (testXrFacts == null)
+        {
+            try { OvrTrackingOriginType = OVRPlugin.initialized && OVRManager.instance != null ? OVRManager.instance.trackingOriginType.ToString() : ""; }
+            catch (Exception) { OvrTrackingOriginType = ""; }
+        }
+    }
+
+    // ---- tracking-origin evidence (G1): read at about 0.5 Hz, guarded, observation only ----
+    void RefreshTrackingSpaceProbe(double now)
+    {
+        if (now < _nextTrackingProbeT) return;
+        _nextTrackingProbeT = now + 2.0;
+        EyeGazeOrigin.TrackingSpaceFacts f = testTrackingFacts != null ? testTrackingFacts() : ReadRuntimeTrackingFacts();
+        TrackingSpace.Note(f);
+    }
+
+    static EyeGazeOrigin.TrackingSpaceFacts ReadRuntimeTrackingFacts()
+    {
+        var f = new EyeGazeOrigin.TrackingSpaceFacts { OvrPluginOrigin = "unavailable", UnityXrMode = "unavailable", LoadedXrDevice = "", NativeXrApi = "" };
+        try
+        {
+            f.OvrPluginInitialized = OVRPlugin.initialized;
+            if (f.OvrPluginInitialized)
+            {
+                f.OvrPluginOrigin = OVRPlugin.GetTrackingOriginType().ToString();   // OVRPlugin's OWN tracking origin (the space OVRPlugin node / eye-gaze poses are reported in)
+                f.OpenXrActive = OVRPlugin.UnityOpenXR.Enabled;
+                f.NativeXrApi = OVRPlugin.nativeXrApi.ToString();
+                f.OvrPluginHeadY = OVRPlugin.GetNodePose(OVRPlugin.Node.Head, OVRPlugin.Step.Render).ToOVRPose().position.y;
+            }
+            f.LoadedXrDevice = OVRManager.loadedXRDevice.ToString();
+        }
+        catch (Exception) { /* not available on this runtime: the manifest says so */ }
+        try
+        {
+            var subs = new System.Collections.Generic.List<UnityEngine.XR.XRInputSubsystem>();
+            SubsystemManager.GetSubsystems(subs);
+            if (subs.Count > 0) f.UnityXrMode = subs[0].GetTrackingOriginMode().ToString();   // Device = eye-level (what the rig, camera and eye anchors use); Floor = floor-referenced
+            var head = UnityEngine.XR.InputDevices.GetDeviceAtXRNode(UnityEngine.XR.XRNode.Head);
+            if (head.isValid && head.TryGetFeatureValue(UnityEngine.XR.CommonUsages.devicePosition, out Vector3 hp)) f.UnityHeadY = hp.y;
+        }
+        catch (Exception) { }
+        return f;
     }
 
     // ---- blink signal plumbing (decisions live in BlinkCapability / BlinkDetector, both unit-tested) ----
@@ -682,8 +949,24 @@ public class GazeRecorder : MonoBehaviour
             bool probeKnown = requireProviderValidity && lc != null && lc.ProviderProbeAvailable &&
                               (lc.State == EyeTrackingState.Running || lc.State == EyeTrackingState.TrackingUnavailable);
             bool hostBlocked = blockEyeSamplesOnHostConflict && lifecycleController != null && lifecycleController.HostConflict.Length > 0;
-            EyeSample left = ReadEye(leftEyeGaze, testLeftEye, probeKnown, lc != null && lc.LeftProviderValid, hostBlocked, leftEyeAnchor);
-            EyeSample right = ReadEye(rightEyeGaze, testRightEye, probeKnown, lc != null && lc.RightProviderValid, hostBlocked, rightEyeAnchor);
+            ViewFrameSample vf = default; bool vfOk = false;
+            if (recordViewFrame)
+            {
+                ViewProbe.Resolve(viewCamera, centerEyeAnchor, leftEyeAnchor, rightEyeAnchor, groundLayerMask, headTransform);
+                vfOk = ViewProbe.Read(out vf);
+                if (vfOk)
+                {
+                    ViewSamples++; ViewMinusCentre.Add(vf.viewMinusCentre);
+                    if (vf.groundOk)
+                    {
+                        GroundSamples++; double h = vf.hmdPos.y - vf.groundY; if (double.IsNaN(HeightFirst)) HeightFirst = h;
+                        if (double.IsNaN(HeightMin) || h < HeightMin) HeightMin = h; if (double.IsNaN(HeightMax) || h > HeightMax) HeightMax = h; HeightSum += h;
+                    }
+                    else GroundUnavailableSamples++;
+                }
+            }
+            EyeSample left = ReadEye(leftEyeGaze, testLeftEye, probeKnown, lc != null && lc.LeftProviderValid, hostBlocked, leftEyeAnchor, vfOk ? vf.leftWorld : (Vector3?)null);
+            EyeSample right = ReadEye(rightEyeGaze, testRightEye, probeKnown, lc != null && lc.RightProviderValid, hostBlocked, rightEyeAnchor, vfOk ? vf.rightWorld : (Vector3?)null);
             bool leftInjected = testLeftEye != null && testLeftEye.active && !testLeftEye.applyProviderGate, rightInjected = testRightEye != null && testRightEye.active && !testRightEye.applyProviderGate;
 
             bool combinedValid;
@@ -721,8 +1004,9 @@ public class GazeRecorder : MonoBehaviour
             {
                 combinedValid = false;
                 combinedConfidence = 0f;
-                combinedOrigin = headTransform != null ? headTransform.position : transform.position;
-                combinedDirection = headTransform != null ? headTransform.forward : transform.forward;
+                // The head-forward fallback ray starts at the RENDERED view (what the participant sees from) when it is available, else at the head transform as before.
+                combinedOrigin = vfOk ? vf.hmdPos : (headTransform != null ? headTransform.position : transform.position);
+                combinedDirection = vfOk ? vf.hmdRot * Vector3.forward : (headTransform != null ? headTransform.forward : transform.forward);
                 gazeRaySource = "head_fallback";
             }
 
@@ -762,6 +1046,8 @@ public class GazeRecorder : MonoBehaviour
             // Blink (schema v11): only from a real eye-closure signal. Gaze validity / confidence / tracking loss are never read as a blink.
             float? cl = null, cr = null; string blinkState = "";
             RefreshBlinkCapability(tAbs);
+            RefreshTrackingSpaceProbe(tAbs);
+            RefreshXrFacts(tAbs);
             if (BlinkStatus == BlinkCapability.Available)
             {
                 ReadEyeClosure(out cl, out cr);
@@ -779,6 +1065,9 @@ public class GazeRecorder : MonoBehaviour
                 ? dataCapture.SessionId : (subjectId + "_" + trialId);
 
             Vector3 hp = didHit ? hit.point : Vector3.zero;
+
+            TrySubscribeAnchors();
+            string pipelineCols = PipelineColumns(tAbs, vfOk, in vf, in left, in right, gazeRaySource);
 
             string row = string.Join(",", new string[]
             {
@@ -834,7 +1123,17 @@ public class GazeRecorder : MonoBehaviour
                 // ----- schema v10 appended column -----
                 EyeGazeOrigin.CombinedName(left.valid, left.originSource, right.valid, right.originSource),
                 // ----- schema v11 appended columns -----
-                cl.HasValue ? F4(cl.Value) : "", cr.HasValue ? F4(cr.Value) : "", blinkState
+                cl.HasValue ? F4(cl.Value) : "", cr.HasValue ? F4(cr.Value) : "", blinkState,
+                // ----- schema v13 appended columns -----
+                V3(vfOk, vf.hmdPos), vfOk ? F4(vf.hmdRot.x) : "", vfOk ? F4(vf.hmdRot.y) : "", vfOk ? F4(vf.hmdRot.z) : "", vfOk ? F4(vf.hmdRot.w) : "",
+                V3(vfOk, vf.leftLocal), V3(vfOk, vf.rightLocal),
+                V3(vfOk, vf.leftWorld), V3(vfOk, vf.rightWorld),
+                (vfOk && vf.groundOk) ? F4(vf.groundY) : "",
+                (vfOk && vf.groundOk) ? F4(vf.hmdPos.y - vf.groundY) : "",
+                (vfOk && vf.groundOk) ? F4(vf.leftWorld.y - vf.groundY) : "",
+                (vfOk && vf.groundOk) ? F4(vf.rightWorld.y - vf.groundY) : "",
+                // ----- schema v14 appended columns (37, pre-joined) -----
+                pipelineCols
             });
 
             if (WriteRow(row))

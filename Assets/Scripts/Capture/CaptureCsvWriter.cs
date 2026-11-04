@@ -126,7 +126,19 @@ public sealed class CaptureCsvWriter
     public long RowsRejectedAfterClose { get; private set; }
     /// <summary>Closes the stream for good. This writer opens, appends and closes the file on every commit, so no handle or buffer is left behind; what Close() adds is the guarantee that
     /// nothing can be appended to a finished session's file afterwards, whatever component calls. Idempotent.</summary>
-    public void Close() { IsClosed = true; }
+    public void Close()
+    {
+        if (IsClosed) return;
+        IsClosed = true;   // refuse further records whatever happens next: a failed close must never leave the file appendable
+        try { CloseProbe?.Invoke(this); }
+        catch (Exception e) { CloseError = e.GetType().Name + ": " + e.Message; }
+    }
+    /// <summary>Null after a successful Close(); the failure text when the close step itself failed (the stream still refuses records).</summary>
+    public string CloseError { get; private set; }
+    /// <summary>True only when Close() ran and completed without error.</summary>
+    public bool ClosedCleanly => IsClosed && CloseError == null;
+    /// <summary>Optional hook run inside Close() (a place to verify or flush a handle; also the seam deterministic tests use to simulate a failing close). Null in production.</summary>
+    public Action<CaptureCsvWriter> CloseProbe;
 
     // Duration of the last / the worst commit (the synchronous open + append + close): the writer's own cost, used to tell I/O pressure from frame and scheduler delays.
     public double LastCommitSeconds { get; private set; }

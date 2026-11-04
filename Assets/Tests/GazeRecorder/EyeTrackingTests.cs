@@ -489,7 +489,7 @@ public partial class NpcLifecycleTests
 
         var csv = Csv.Load(rig.File("gaze.csv"));
         Assert.Greater(csv.Rows.Count, 5);
-        Assert.AreEqual(73, csv.Header.Count);
+        Assert.AreEqual(133, csv.Header.Count);
         CollectionAssert.AreEqual(new[] { "eye_tracking_state", "left_provider_valid", "right_provider_valid" }, csv.Header.GetRange(66, 3), "schema v9 columns are appended at the END");
         foreach (var r in csv.Rows)
         {
@@ -499,7 +499,7 @@ public partial class NpcLifecycleTests
         }
 
         var m = JObject.Parse(File.ReadAllText(rig.File("session_manifest.json")));
-        Assert.AreEqual(11, (int)m["schema_version"]);
+        Assert.AreEqual(15, (int)m["schema_version"]);
         Assert.AreEqual("ok", (string)m["gaze_writer_status"], "the CSV WRITER is healthy ...");
         Assert.AreEqual("ok", (string)m["health_gaze"]["status"], "(unchanged legacy field)");
         Assert.AreEqual("not_applicable", (string)m["gaze_acquisition_status"], "... which says nothing about whether eyes were tracked");

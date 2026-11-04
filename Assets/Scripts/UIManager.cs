@@ -367,9 +367,10 @@ public class UIManager : MonoBehaviour
 
     #region Part 3 APIs
 
-    public void ShowPart3StartPanel(Action onStart)
+    /// <param name="overrideMessage">Optional. When given, it REPLACES the template text (used to tell the participant / experimenter why the recording-dependent start is blocked).</param>
+    public void ShowPart3StartPanel(Action onStart, string overrideMessage = null)
     {
-        ShowFullPanel(part3StartPanelTemplate, "Press Start to begin.", onStart);
+        ShowFullPanel(part3StartPanelTemplate, string.IsNullOrEmpty(overrideMessage) ? "Press Start to begin." : overrideMessage, onStart, null, !string.IsNullOrEmpty(overrideMessage));
     }
 
     /// <summary>
@@ -404,7 +405,7 @@ public class UIManager : MonoBehaviour
     /// Instantiate the provided template GameObject (must not be null) and position it in front of the camera.
     /// This helper does not return the PanelController.
     /// </summary>
-    private void ShowFullPanel(GameObject template, string fallbackMessage, Action onConfirm, Action onShown = null)
+    private void ShowFullPanel(GameObject template, string fallbackMessage, Action onConfirm, Action onShown = null, bool forceMessage = false)
     {
         if (template == null)
         {
@@ -433,7 +434,7 @@ public class UIManager : MonoBehaviour
         if (pc.messageTextUI != null && !string.IsNullOrEmpty(pc.messageTextUI.text)) templateHasText = true;
         else if (pc.messageTextTMP != null && !string.IsNullOrEmpty(pc.messageTextTMP.text)) templateHasText = true;
 
-        string textToPass = templateHasText ? null : fallbackMessage;
+        string textToPass = (templateHasText && !forceMessage) ? null : fallbackMessage;
 
         // Wire up the confirm callback; PanelController will destroy the instance on confirm
         pc.Setup(textToPass, onConfirm, showCancel: false);

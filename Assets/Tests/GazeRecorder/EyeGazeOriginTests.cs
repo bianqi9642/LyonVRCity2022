@@ -162,15 +162,15 @@ public partial class NpcLifecycleTests
         yield return new WaitForSecondsRealtime(0.3f);
         Call(rec, "StopRecording");
         var csv = Csv.Load(path);
-        Assert.AreEqual("gaze_origin_source", csv.Header[csv.Header.Count - 4], "the v10 column sits right after the v9 columns; the three v11 blink columns follow");
-        Assert.AreEqual("right_provider_valid", csv.Header[csv.Header.Count - 5], "existing trailing columns did not move");
-        Assert.AreEqual("blink_state", csv.Header[csv.Header.Count - 1]);
+        Assert.AreEqual("gaze_origin_source", csv.Header[csv.Header.Count - 4 - 60], "the v10 column sits right after the v9 columns; the three v11 blink columns and the 23 v13 view-frame and 37 v14 pipeline columns follow");
+        Assert.AreEqual("right_provider_valid", csv.Header[csv.Header.Count - 5 - 60], "existing trailing columns did not move");
+        Assert.AreEqual("blink_state", csv.Header[csv.Header.Count - 1 - 60]); Assert.AreEqual("origin_fallback_reason", csv.Header[csv.Header.Count - 1]); Assert.AreEqual("right_eye_height_above_ground", csv.Header[csv.Header.Count - 38]);
         Assert.Greater(csv.Rows.Count, 2);
         foreach (var row in csv.Rows)
         {
             Assert.AreEqual(csv.Header.Count, row.Count, "header / row lockstep");
             Assert.AreEqual("provider_unchecked", csv.Get(row, "gaze_origin_source"), "injected samples have no rig anchor: the provider origin is passed through and says so");
         }
-        Assert.AreEqual(11, GetStatic<int>(T("CaptureConstants"), "SchemaVersion"));
+        Assert.AreEqual(15, GetStatic<int>(T("CaptureConstants"), "SchemaVersion"));
     }
 }

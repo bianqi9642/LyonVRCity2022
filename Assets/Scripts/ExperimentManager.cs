@@ -195,6 +195,12 @@ public class ExperimentManager : MonoBehaviour
              "permanently placed under an active parent in the scene.")]
     public bool ensureExplorationBoundaryActive = true;
 
+    [Header("Part 3 think-aloud audio")]
+    [Tooltip("Record the participant's microphone continuously from the Part 3 Start click to the Part 3 trial end (WAV + sample/time index, synchronised to CaptureClock). Part 3 only; Parts 1 and 2 never record audio.")]
+    public bool part3AudioRecording = true;
+    [Tooltip("If true (default) Part 3 cannot start while the microphone recording cannot be established: the participant is shown why and the Start is retried. If false the failure is recorded in the manifest and Part 3 continues WITHOUT audio.")]
+    public bool part3AudioRequired = true;
+
     [Header("River teleport availability")]
     [Tooltip("Participant-facing river teleport points (visuals, anchors, instruction signs) exist and work ONLY while Part 3 " +
              "is running (part_start until its trial ends / End Panel). Part 1, Part 2 and idle: hidden and rejected. " +
@@ -708,7 +714,60 @@ public class ExperimentManager : MonoBehaviour
     // locks the participant by itself. In the normal case the End panel is shown synchronously right after this call.
     private void EndTrial()
     {
+        // Part 3 think-aloud audio ends at the SAME boundary as every other recorder's trial scope: the audio interval is [first audio frame, this instant).
+        if (currentRunningPart == RunningPart.Part3 && _part3Audio != null)
+        {
+            try { _part3Audio.StopAtBoundary(CaptureClock.TAbs, "part3_trial_end"); }
+            catch (Exception ex) { Debug.LogError("[ExperimentManager] Part 3 audio stop threw: " + ex); }
+        }
         OnTrialEnd?.Invoke();
+    }
+
+    // ---- Part 3 think-aloud audio orchestration (Part 3 only; the recorder itself lives in the capture layer) ----
+    private Part3AudioRecorder _part3Audio;
+
+    private Part3AudioRecorder ResolvePart3Audio()
+    {
+        if (!part3AudioRecording) return null;
+        DataCaptureManager dcm = FindObjectOfType<DataCaptureManager>();
+        Part3AudioRecorder a = dcm != null ? dcm.EnsureAudioRecorder() : null;
+        if (a == null) Debug.LogError("[ExperimentManager] Part 3 audio recording is enabled but no usable DataCaptureManager session exists: no audio will be recorded.", this);
+        return a;
+    }
+
+    // Preflight until the audio system is ready. A failure is shown to the participant / experimenter and retried; with part3AudioRequired = false it is only recorded and Part 3 proceeds without audio.
+    private IEnumerator Part3AudioPreflightGate(Part3AudioRecorder audio)
+    {
+        while (!SessionEnded)
+        {
+            yield return audio.RunPreflight();
+            if (audio.IsReady) yield break;
+            if (!part3AudioRequired) { Debug.LogError("[ExperimentManager] Part 3 audio preflight failed (" + audio.FailureReason + "); part3AudioRequired is false, continuing WITHOUT audio.", this); _part3Audio = null; yield break; }
+            yield return Part3AudioBlockedWait("Microphone recording is not available (" + audio.FailureReason + "). Please inform the experimenter, fix the microphone, then press to retry.");
+        }
+    }
+
+    private IEnumerator Part3AudioStartGate(Part3AudioRecorder audio, double clickT)
+    {
+        while (!SessionEnded)
+        {
+            yield return audio.StartRecording(clickT);
+            if (audio.IsRecording) yield break;
+            if (!part3AudioRequired) { Debug.LogError("[ExperimentManager] Part 3 audio start failed (" + audio.FailureReason + "); part3AudioRequired is false, continuing WITHOUT audio.", this); _part3Audio = null; yield break; }
+            yield return Part3AudioBlockedWait("The audio recording could not start (" + audio.FailureReason + "). Please inform the experimenter, then press to retry.");
+            clickT = CaptureClock.TAbs;   // the retry is a new Start click
+            if (audio.State != AudioCaptureState.Ready) yield return audio.RunPreflight();
+        }
+    }
+
+    // Visible block: a panel with the reason; its button is the retry. Without a UI the wait is a timed retry (never a silent continue).
+    private IEnumerator Part3AudioBlockedWait(string message)
+    {
+        if (uiManager == null) { yield return new WaitForSeconds(2f); yield break; }
+        bool retry = false;
+        uiManager.ShowPart3StartPanel(() => retry = true, message);
+        yield return new WaitUntil(() => retry || SessionEnded);
+        yield return new WaitForSeconds(0.5f);   // never a tight loop, even if the panel template is missing and auto-confirms
     }
 
     // The End panel is on screen (UIManager 'onShown'), or - safety net - was confirmed without the display being observed.
@@ -1412,15 +1471,25 @@ public class ExperimentManager : MonoBehaviour
         yield return RunNpcWarmup(CurrentPartConfig, "Part3");
         if (AbortPartIfNpcPreparationFailed("Part3")) yield break;
 
+        // --- 7a. Think-aloud audio preflight (permission, device, capture format, writable output). Part 3 only; nothing is recorded yet. ---
+        _part3Audio = ResolvePart3Audio();
+        if (_part3Audio != null) yield return Part3AudioPreflightGate(_part3Audio);
+
         // --- 7. Phase 3 Start panel. (All candidates are still non-interactable ordinary buildings.) ---
         yield return WaitForHeadsetBeforeStartPanel();
         bool started = false;
+        double startClickT = double.NaN;
         RaiseEvt("panel_shown", "Part3", label: "part3_start");
-        uiManager.ShowPart3StartPanel(() => { started = true; RaiseEvt("panel_confirmed", "Part3", label: "part3_start"); });
+        uiManager.ShowPart3StartPanel(() => { startClickT = CaptureClock.TAbs; started = true; RaiseEvt("panel_confirmed", "Part3", label: "part3_start"); });
         yield return new WaitUntil(() => started);
+
+        // --- 7b. The microphone must be delivering samples BEFORE the participant may act: the Start click starts the recording, BeginTrial() waits for the first sample. ---
+        if (_part3Audio != null) yield return Part3AudioStartGate(_part3Audio, startClickT);
+        if (SessionEnded) yield break;
 
         // Phase first, then the trial: the first sample written inside BeginTrial() must already be labelled d1_pending (panel reading), not 'idle'.
         SetPhase("d1_pending");
+        if (_part3Audio != null && _part3Audio.IsRecording) _part3Audio.NoteExperimentStart(CaptureClock.TAbs);
         BeginTrial();
 
         // Diagnostic only (phase_end elapsed time, a wall-clock trial window that INCLUDES panel reading). It no longer limits any

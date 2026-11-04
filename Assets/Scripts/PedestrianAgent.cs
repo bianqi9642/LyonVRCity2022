@@ -254,6 +254,13 @@ public class PedestrianAgent : MonoBehaviour
     public bool UncertainActive => uncertainBehavior != null && uncertainBehavior.isActiveAndEnabled;
     public string UncertainStateLabel => uncertainBehavior != null ? uncertainBehavior.StateLabel : "";
     public string UncertainLookPhaseLabel => uncertainBehavior != null ? uncertainBehavior.LookPhaseLabel : "";
+    /// <summary>Detours this lifetime completed (observation for the recorder; 0 without an UncertainBehavior). Reset with the lifetime.</summary>
+    public int UncertainDetoursCompleted => uncertainBehavior != null ? uncertainBehavior.DetoursCompleted : 0;
+    public int UncertainDetoursStarted => uncertainBehavior != null ? uncertainBehavior.DetoursStarted : 0;
+    public Vector3 UncertainDetourResumeTarget => uncertainBehavior != null ? uncertainBehavior.LastDetourResumeTarget : Vector3.zero;
+    public bool UncertainDetourRestoredPreDetourTarget => uncertainBehavior != null && uncertainBehavior.LastDetourRestoredPreDetourTarget;
+    public Transform UncertainDetourResumeTransform => uncertainBehavior != null ? uncertainBehavior.LastDetourResumeTransform : null;
+    public string UncertainDetourEndReason => uncertainBehavior != null ? uncertainBehavior.LastDetourEndReason : "";
 
     void OnUncertainStateChanged(string from, string to, float plannedSeconds)
     {

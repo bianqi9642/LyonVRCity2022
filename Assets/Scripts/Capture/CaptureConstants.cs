@@ -30,7 +30,10 @@ public static class CaptureConstants
         "ctrl_l_pos_x,ctrl_l_pos_y,ctrl_l_pos_z,ctrl_l_rot_x,ctrl_l_rot_y,ctrl_l_rot_z,ctrl_l_rot_w,ctrl_l_tracked," +
         "ctrl_r_pos_x,ctrl_r_pos_y,ctrl_r_pos_z,ctrl_r_rot_x,ctrl_r_rot_y,ctrl_r_rot_z,ctrl_r_rot_w,ctrl_r_tracked," +
         // Appended (schema v5): Part and experimental phase AT THE SAMPLE TIME (see docs: phase labels).
-        "part,phase";
+        "part,phase," +
+        // Appended (schema v13): the RENDERED camera (what the participant sees from; the hmd_* columns above are the OVRCameraRig CenterEyeAnchor, which lacks the XR Origin's Camera Floor Offset) and its height
+        // above the walkable ground below it (blank when no ground is found - never an assumed eye height).
+        "view_pos_x,view_pos_y,view_pos_z,view_height_above_ground";
 
     public const string NpcStateHeader =
         "t_abs,t_unix_ms,frame_index," +
@@ -126,6 +129,11 @@ public static class CaptureConstants
     // Blink events (only ever written when the face-tracking eye-closure signal is available): value_num = blink duration (seconds) on blink_end, blank on blink_start.
     public const string EvtBlinkStart           = "blink_start";
     public const string EvtBlinkEnd             = "blink_end";
+    // Part 3 think-aloud audio lifecycle (schema v15). One row per transition - never per audio buffer (the per-chunk timing lives in audio/audio_index.csv).
+    public const string EvtAudioPermissionChecked = "audio_permission_checked", EvtAudioPermissionGranted = "audio_permission_granted", EvtAudioRecordingRequested = "audio_recording_requested",
+                        EvtAudioRecordingStarted = "audio_recording_started", EvtAudioRecordingInterrupted = "audio_recording_interrupted", EvtAudioRecordingResumed = "audio_recording_resumed",
+                        EvtAudioBufferOverrun = "audio_buffer_overrun", EvtAudioStopRequested = "audio_recording_stop_requested", EvtAudioStopped = "audio_recording_stopped",
+                        EvtAudioFileFinalized = "audio_file_finalized", EvtAudioFailed = "audio_recording_failed";
     public const string EvtNpcWarmupStart       = "npc_warmup_start";
     public const string EvtNpcWarmupEnd         = "npc_warmup_end";
 
@@ -136,10 +144,11 @@ public static class CaptureConstants
     public const string NpcEvtDwellEnd   = "npc_dwell_end";
     public const string NpcEvtArrived    = "npc_arrived";
     public const string NpcEvtDestChange = "npc_dest_change";
-    // value_str of npc_dest_change: "cause=<cause>;..." - cause is initial_assignment (the lifetime's first valid destination; prev_dest=none, no jump_m), detour, itinerary_target or other
+    // value_str of npc_dest_change: "cause=<cause>;..." - cause is initial_assignment (the lifetime's first valid destination; prev_dest=none, no jump_m), detour, itinerary_target, detour_return (v12) or other
     // (a genuine change whose reason is not identified). Genuine changes also carry jump_m and prev_dest=<x>|<z>.
     public const string DestCauseInitialAssignment = "initial_assignment";
     public const string DestCauseOther = "other";
+    public const string DestCauseDetourReturn = "detour_return";   // schema v12: a verified return to the pre-detour destination (see DestinationCause.cs for the exact evidence rule)
     public const string NpcEvtLegStart   = "npc_leg_start";   // RETIRED in schema v3: identical to npc_dest_change by construction; no longer emitted
 
     // Added with the lifetime identity work (schema v2). Every one has a real code trigger.
@@ -199,7 +208,24 @@ public static class CaptureConstants
     //    (limit_diagnosis values change to healthy | frame_limited | scheduler_limited | io_limited | mixed | unknown, gaps_* attribution counters, writer_* cost) - the old value
     //    scheduling_or_io_limited is retired. events.csv: session_end is the final row (events after it are refused), blink_start / blink_end only with an available signal. npc_events.csv: the first
     //    destination of a lifetime is npc_dest_change cause=initial_assignment (prev_dest=none, no jump_m); genuine changes keep their cause and gain prev_dest. Older sessions are not reinterpreted.
-    public const int    SchemaVersion   = 11;
+    // 12: follow-up to v11. npc_events.csv: npc_dest_change gains the cause value detour_return - an identity-verified return to the main destination followed BEFORE a completed UncertainBehavior
+    //    detour, for every movement mode (Part 2 wandering points and Part 3 itinerary / attractor targets alike; such rows were cause=other in v11 Part 3 and cause=itinerary_target in v11 Part 2) -
+    //    value_str of that row also carries detour_end=arrived|timer|retries_exhausted. Manifest: capture_lifecycle_state is now persisted as Closed with a
+    //    real capture_closed_t_abs once every stream closed cleanly (v11 files said Closing / -1); capture_streams_closed / capture_streams_failed / capture_finalization_error added. gaze.csv columns
+    //    unchanged. Older sessions are not reinterpreted.
+    // 13: view frame. The scene audit found the +1.36144 m "provider origin offset" is the XR Origin's Camera Floor Offset (XROrigin.CameraYOffset, a scene constant): the rendered camera
+    //    (Camera.main = XRI Main Camera) sits that far above the OVRCameraRig anchors that gaze.csv head_*, trajectory hmd_* and the NPC line of sight used. gaze.csv appends 23 view-frame columns (hmd_world_*,
+    //    eye head-local / world positions, ground_y, heights above ground); trajectory.csv appends view_pos_* and view_height_above_ground; gaze_origin_source gains eye_anchor_view (the anchor re-applied at
+    //    the rendered view); the head-fallback ray and npc_state los_* now start from / aim at the rendered view; manifest eye_tracking gains view_frame and origin_vs_rig_anchor_*.
+    //    Existing columns keep their names, positions and meaning (head_* and hmd_* remain the OVR anchor tree). v10-v12 recordings are NOT reinterpreted: their eye_anchor origins, head-fallback rays and los_*
+    //    sit about one Camera Floor Offset below the viewpoint.
+    // 14: per-eye provider pipeline (audit of the Quest Pro eye-tracking architecture). gaze.csv appends 37 columns: provider_time_s / provider_time_changed, the raw OVRPlugin eye poses in tracking space,
+    //    the same poses in the head frame (SDK head-space conversion), provider-vs-view-anchor and WorldSpace-vs-composed coherence measures, view-anchor / provider / runtime-IPD separations,
+    //    anchors_updated_frame and origin_fallback_reason. Manifest eye_tracking gains eye_pipeline. The recorded gaze ray (left_/right_/combined_ origin and dir) is unchanged: still the OVREyeGaze WorldSpace
+    //    result, with the v13 view-frame anchor fallback. v13 columns left_eye_world_* / right_eye_world_* are VIEW ANCHORS (stereo view poses re-applied at the rendered camera), not gaze origins: documented, not renamed.
+    // 15: Part 3 think-aloud audio. New directory audio/ (part3_audio.wav PCM16, audio_index.csv, audio_anchors.csv, audio_metadata.json), new events audio_* (events.csv), new manifest block audio_capture and
+    //    file_list entries. No existing column, field or file changes. Sessions of other Parts / older schemas simply have no audio/ directory and audio_capture.status = not_enabled / not_started.
+    public const int    SchemaVersion   = 15;
     public const string NpcIdScheme     = "agent-lifetime-v1: npc_id=AgentID (stable pooled GameObject); npc_spawn_instance_id=<AgentID>-S<n> (n = per-AgentID lifetime index, from 1)";
     public const string NpcCaptureModeText =
         "master_switch: npc_state.csv holds every active NPC lifetime of a Part whose npcCaptureEnabled is true, from the moment NPCs exist (warm-up, " +

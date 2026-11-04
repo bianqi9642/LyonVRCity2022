@@ -82,7 +82,7 @@ public partial class NpcLifecycleTests
 
         var csv = Csv.Load(path);
         AssertWidths(csv, "gaze.csv");
-        Assert.AreEqual(73, csv.Header.Count);
+        Assert.AreEqual(133, csv.Header.Count);
         string[] lv = { "left_origin_x", "left_origin_y", "left_origin_z", "left_dir_x", "left_dir_y", "left_dir_z" };
         string[] rv = { "right_origin_x", "right_origin_y", "right_origin_z", "right_dir_x", "right_dir_y", "right_dir_z" };
         string[] cv = { "combined_origin_x", "combined_origin_y", "combined_origin_z", "combined_dir_x", "combined_dir_y", "combined_dir_z" };

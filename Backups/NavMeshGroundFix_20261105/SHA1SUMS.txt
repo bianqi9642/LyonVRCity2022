@@ -1,0 +1,10 @@
+058b16cdc8cb4966c6469ec5415ce8364e45cedd  ./Assets/Scenes/LyonVRVity35.unity
+1c877923c57e122aa0aab30fe1b3d02ac3a20cf5  ./Assets/Scenes/LyonVRVity35.unity.meta
+428003da0f3cad50825b1261ad20bc3d3207ef68  ./Assets/Scenes/LyonVRVity35/NavMesh-NavMesh 1.asset
+651aa130d05b5143eddb3c718d82a4090bb8b4c5  ./Assets/Scenes/LyonVRVity35/NavMesh-NavMesh 1.asset.meta
+3bd493e7b687a874e13c4527b8614f2443c30f5d  ./Assets/Scenes/LyonVRVity35/NavMesh-NavMesh 2.asset
+702ffe2f86138b4b9cf9aa9d0998c3a94b1411fc  ./Assets/Scenes/LyonVRVity35/NavMesh-NavMesh 2.asset.meta
+91e725d1ece2c3a77fc60ff2f5d023bc7372ef3a  ./Assets/Scenes/LyonVRVity35/NavMesh-NavMesh.asset
+afd1885d50bd3894bc51369dc19860b807d633be  ./Assets/Scenes/LyonVRVity35/NavMesh-NavMesh.asset.meta
+6592bd2193f0674470c828d1b8c34ebdb116cffd  ./NavMeshAreas.asset
+38a731100b4df3edbed5108037addef0af304041  ./TagManager.asset

@@ -1,0 +1,18 @@
+path,layer,activeAndEnabled,ignoreFromBuild,overrideArea,area,applyToChildren
+Practice Area/gml_8bf87428-0e6e-485c-894d-eebcb42a5e76,3,True,True,False,0,True
+Organic Area/5EMEPeripheral,0,True,False,True,1,True
+Practice Area/gml_38179d6d-9886-48a9-9634-4e5eb1016a06,3,True,True,False,0,True
+Practice Area/2EME,0,True,False,True,1,True
+BATI_Discard,0,False,False,True,1,True
+Grid Area/TIN_Textured,0,True,True,False,0,True
+Grid Area/3EMEPeripheral,0,True,False,True,1,True
+Practice Area/gml_ca89eda0-46ef-4c3b-8e69-8b65157d50ea,3,True,True,False,0,True
+Grid Area/6EMEPeripheral,0,True,False,True,1,True
+Grid Area/3EME,0,True,False,True,1,True
+Practice Area/gml_198275d7-1842-4ff1-abc3-123f14b587d4,3,True,True,False,0,True
+Practice Area/gml_9fb11684-5d01-442f-8e2a-781b88d720b7,3,True,True,False,0,True
+XR Interaction Setup,0,True,True,False,0,True
+Organic Area/5EME,0,True,False,True,1,True
+Organic Area/TIN_Textured,0,True,True,False,0,True
+Practice Area/gml_dd4fd483-1c11-4e3b-9b11-02d15babedd8,3,True,True,False,0,True
+Organic Area/TIN_Textured/SouthRiver_TIN_GapPatch,3,False,True,False,0,True

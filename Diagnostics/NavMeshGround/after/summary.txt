@@ -1,0 +1,44 @@
+label=after scene=Assets/Scenes/LyonVRVity35.unity time=2026-11-05T20:56:14
+== D1 NavMesh sources ==
+surface NavMesh: collect=All useGeometry=RenderMeshes layerMask=73 defaultArea=0 agentType=0 overrideVoxel=False voxel=0.1 overrideTile=False tile=256 minRegionArea=2 buildHeightMesh=False data=Assets/Scenes/LyonVRVity35/NavMesh-NavMesh_GroundOnly.asset
+buildSettings: radius=0.3 height=2 slope=60 climb=0.75 cell=0.1 minRegion=2 overrideTile=False tile=256
+sources collected: 2053 walkable-area=25 not-walkable-area=2028
+  Bridge / area 0 = 7
+  Building / NOT WALKABLE = 2028
+  TinGround / area 0 = 18
+BUILDING sources contributing WALKABLE area: 0
+
+== D2 ground mesh topology (world space, welded 1 cm) ==
+ALL_TIN_render: meshes=21 tris=238613 weldedVerts=120350 components=12 boundaryEdges=9758 innerLoops=195 nonManifoldEdges=7199 degenerate=3025 duplicateTris=5108 downFacingTris=573 (area 2127.007 m2 of 2924981.308) steeper-than-slope-area=71450.374 m2
+ALL_TIN_collider: meshes=21 tris=235746 weldedVerts=120350 components=12 boundaryEdges=9761 innerLoops=196 nonManifoldEdges=7199 degenerate=160 duplicateTris=5106 downFacingTris=0 (area 0.000 m2 of 2924981.367) steeper-than-slope-area=71459.639 m2
+GRID_TIN_render: meshes=8 tris=47041 weldedVerts=22513 components=5 boundaryEdges=2490 innerLoops=58 nonManifoldEdges=7196 degenerate=213 duplicateTris=5106 downFacingTris=98 (area 155.398 m2 of 1029776.331) steeper-than-slope-area=4454.955 m2
+ORGANIC_TIN_render: meshes=7 tris=156421 weldedVerts=78833 components=3 boundaryEdges=4087 innerLoops=74 nonManifoldEdges=1 degenerate=2614 duplicateTris=1 downFacingTris=317 (area 628.711 m2 of 1075560.622) steeper-than-slope-area=49705.675 m2
+PRACTICE_TIN_render: meshes=6 tris=35151 weldedVerts=19040 components=6 boundaryEdges=3249 innerLoops=63 nonManifoldEdges=2 degenerate=198 duplicateTris=1 downFacingTris=158 (area 1342.897 m2 of 819644.356) steeper-than-slope-area=17289.744 m2
+NAV_PROXY_repaired: meshes=18 tris=230551 weldedVerts=120349 components=14 boundaryEdges=10767 nonManifoldEdges=3 degenerate=155 duplicateTris=0 downFacingTris=34 area=2822676.683 m2
+== D3 current NavMesh triangulation vs ground footprint ==
+NavMesh tris=64698 area=2642347.596 m2 | on-ground 64506 (2635816.961 m2) | ELEVATED above ground (>0.5 m; rooftop candidates) 0 (0.000 m2) | below ground 0 (0.000 m2) | over bridge decks 62 (6475.442 m2) | outside any TIN/bridge footprint 130 (55.193 m2)
+NavMesh ground-level polygons under building footprints: 24432 tris (298994.990 m2), of which connected to the main street network: 376 tris (8127.328 m2)
+NavMesh connected islands=1631 (majority on ground: 1631, majority elevated: 0), largest island 1606619.271 m2
+== D3/D4 sampled coverage (interval 2 m, vertical tolerance 0.5 m, edge buffer 0.75 m) ==
+TIN footprint samples=670403 | intentional SouthRiver gap patch (excluded)=519 | under buildings (excluded)=84704 (of which WITH NavMesh = 76716) | denominator=585180
+NavMesh present=576086 (98.45%) | missing in agent-radius edge buffer=4234 | missing as CANDIDATE HOLE=4860 in 1323 region(s) | coverage excl. edge buffer=99.16%
+Physical Ground collider present=585180 (100.00%) | missing=0 | NavMesh but NO physical ground=0 | physical ground but NO NavMesh=9094
+  region Organic Area: footprint=239065 underBuilding=21750 navOk=212426 edgeBuffer=1317 candidateHole=3572 physOk=217315 physMissing=0 navButNoPhys=0
+  region Practice Area: footprint=200534 underBuilding=20777 navOk=177796 edgeBuffer=1108 candidateHole=853 physOk=179757 physMissing=0 navButNoPhys=0
+  region Grid Area: footprint=230804 underBuilding=42696 navOk=185864 edgeBuffer=1809 candidateHole=435 physOk=188108 physMissing=0 navButNoPhys=0
+CharacterProbe CC params: height=1.36144 radius=0.1 skin=0.08 step=0.5 slopeLimit=45 center=(0.00, 0.76, 0.00) (read from XR Interaction Setup/XR Origin (XR Rig))
+CharacterProbe down-facing triangles: 128/128 landed (CC), AutoGroundAlign ray hits 128/128 | control (up-facing): 150/150 landed, ray hits 150/150 | down-facing TIN triangles >=0.05 m2 available: 128
+D6 NPC route points (EnvironmentConfig/Npc/**) with NavMesh within 0.5 m: 944/987
+== D5 connectivity ==
+anchor StartPointOU pos=(2106.88, 169.37, 418.76) navmesh within 1 m: True (dy 0.065)
+anchor StartPointGE pos=(2393.18, 168.15, 807.36) navmesh within 1 m: True (dy 0.082)
+anchor StartPoint pos=(2173.25, 168.95, 1142.13) navmesh within 1 m: True (dy -0.046)
+anchor StartPointGU pos=(2332.78, 169.20, 402.46) navmesh within 1 m: True (dy 0.062)
+anchor StartPoint pos=(2588.88, 167.28, 2629.96) navmesh within 1 m: True (dy 0.080)
+anchor StartPointO pos=(2228.18, 169.44, 810.96) navmesh within 1 m: True (dy 0.038)
+anchor StartPointG pos=(2393.18, 168.15, 807.36) navmesh within 1 m: True (dy 0.082)
+anchor StartPointOE pos=(2228.18, 169.44, 810.96) navmesh within 1 m: True (dy 0.038)
+connectivity within_grid: PathComplete 35/40
+connectivity within_organic: PathComplete 35/40
+connectivity grid_to_organic: PathComplete 28/40
+connectivity start_anchors: PathComplete 21/28

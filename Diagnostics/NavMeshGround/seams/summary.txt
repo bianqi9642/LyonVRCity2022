@@ -1,0 +1,1 @@
+footprint samples=670403 | samples where >=2 different tiles overlap=29324 (117296 m2) in 17 tile pairs | worst vertical disagreement=8.151 m | overlap samples with dy>0.10 m: 5534, >0.25 m: 2559

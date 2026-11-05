@@ -1,0 +1,18 @@
+tilePair,samples,areaM2,meanAbsDy,maxAbsDy,samplesDyOver0.10m,samplesDyOver0.25m
+Grid Area/TIN_Textured/gml_c9b1830c-4fe8-4fea-bfd7-87af196e6721/geometry0 <> Grid Area/TIN_Textured/gml_c9b1830c-4fe8-4fea-bfd7-87af196e6721/geometry0,12958,51832.000,0.000,0.000,0,0
+Grid Area/TIN_Textured/gml_29317c3e-50a8-4689-8e26-0ebd3b66324c/geometry0 <> Grid Area/TIN_Textured/gml_29317c3e-50a8-4689-8e26-0ebd3b66324c/geometry0,11871,47484.000,0.000,0.000,0,0
+Grid Area/TIN_Textured/gml_4d5046a5-1bf0-4bd7-b6f9-ba977d2bfe55/geometry0 <> Organic Area/TIN_Textured/gml_4811c913-de34-43c1-ae8a-51304bcd7a24/geometry0,4376,17504.000,0.308,7.812,3158,1757
+Grid Area/TIN_Textured/gml_29317c3e-50a8-4689-8e26-0ebd3b66324c/geometry0 <> Organic Area/TIN_Textured/gml_4811c913-de34-43c1-ae8a-51304bcd7a24/geometry0,4218,16872.000,0.325,8.151,2272,730
+Grid Area/TIN_Textured/gml_4d5046a5-1bf0-4bd7-b6f9-ba977d2bfe55/geometry0 <> Organic Area/TIN_Textured/gml_e3cdfa42-929d-4954-904e-fa4807d0a2bd/geometry0,72,288.000,0.831,0.879,72,72
+Practice Area/gml_38179d6d-9886-48a9-9634-4e5eb1016a06/geometry0 <> Practice Area/gml_dd4fd483-1c11-4e3b-9b11-02d15babedd8/geometry0,22,88.000,0.143,0.152,22,0
+Practice Area/gml_198275d7-1842-4ff1-abc3-123f14b587d4/geometry0 <> Practice Area/gml_ca89eda0-46ef-4c3b-8e69-8b65157d50ea/geometry0,10,40.000,0.191,0.203,10,0
+Grid Area/TIN_Textured/gml_2c9c7a15-afcf-44d3-a4fa-e57b6234043d/geometry0 <> Grid Area/TIN_Textured/gml_babe4fa3-ecc6-4cd9-8a77-78814f30b57c/geometry0,4,16.000,0.021,0.029,0,0
+Organic Area/TIN_Textured/gml_28445915-ef07-4e22-987c-610c478cc370/geometry0 <> Organic Area/TIN_Textured/gml_786faa4c-221d-4254-b8b2-aca3b8f8fea1/geometry0,2,8.000,0.014,0.017,0,0
+Organic Area/TIN_Textured/gml_4811c913-de34-43c1-ae8a-51304bcd7a24/geometry0 <> Organic Area/TIN_Textured/gml_786faa4c-221d-4254-b8b2-aca3b8f8fea1/geometry0,2,8.000,0.009,0.011,0,0
+Organic Area/TIN_Textured/gml_786faa4c-221d-4254-b8b2-aca3b8f8fea1/geometry0 <> Organic Area/TIN_Textured/gml_af20ae56-d662-4581-b17f-e7ca01101e3e/geometry0,1,4.000,0.029,0.029,0,0
+Organic Area/TIN_Textured/gml_4811c913-de34-43c1-ae8a-51304bcd7a24/geometry0 <> Organic Area/TIN_Textured/gml_a4635653-22bf-43bf-9894-1f652cf03371/geometry0,1,4.000,0.005,0.005,0,0
+Organic Area/TIN_Textured/gml_4811c913-de34-43c1-ae8a-51304bcd7a24/geometry0 <> Organic Area/TIN_Textured/gml_e3cdfa42-929d-4954-904e-fa4807d0a2bd/geometry0,1,4.000,0.008,0.008,0,0
+Grid Area/TIN_Textured/gml_2c9c7a15-afcf-44d3-a4fa-e57b6234043d/geometry0 <> Organic Area/TIN_Textured/SouthRiver_TIN_GapPatch,1,4.000,0.000,0.000,0,0
+Grid Area/TIN_Textured/gml_2c9c7a15-afcf-44d3-a4fa-e57b6234043d/geometry0 <> Grid Area/TIN_Textured/gml_4d5046a5-1bf0-4bd7-b6f9-ba977d2bfe55/geometry0,1,4.000,0.001,0.001,0,0
+Grid Area/TIN_Textured/gml_4d5046a5-1bf0-4bd7-b6f9-ba977d2bfe55/geometry0 <> Grid Area/TIN_Textured/gml_87623043-f996-4e2c-83c8-16f139a63d7c/geometry0,1,4.000,0.002,0.002,0,0
+Grid Area/TIN_Textured/gml_87623043-f996-4e2c-83c8-16f139a63d7c/geometry0 <> Grid Area/TIN_Textured/gml_babe4fa3-ecc6-4cd9-8a77-78814f30b57c/geometry0,1,4.000,0.000,0.000,0,0

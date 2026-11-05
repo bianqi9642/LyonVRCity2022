@@ -282,6 +282,14 @@ public class ExperimentManager : MonoBehaviour
     /// </summary>
     public bool EndPanelActive { get; private set; }
 
+    [Header("Participant control at the Part 3 Destination 2 panel")]
+    [Tooltip("If true (default), the participant is locked (continuous move, turn providers, XRI and river-point teleports, building selection - the same ParticipantControlEnabled gate the Start panel uses) " +
+             "from the moment the Part 3 Destination 2 panel is shown until its Continue button is pressed. Head tracking, controller rays and the panel UI stay usable; NPC spawning / movement, audio, " +
+             "gaze / trajectory capture and the experiment clocks are not touched (the D2 search budget only starts at the Continue click anyway). Why: the full panels are placed ONCE in world space, " +
+             "so a participant who keeps walking leaves the Destination 2 panel behind and the Part cannot continue. False = previous behaviour (free continuous movement while the panel is open; " +
+             "generic XRI teleports are still refused by GuardedTeleportationProvider 'panel_open').")]
+    public bool lockParticipantWhileDestination2Panel = true;
+
     [Header("Session lifecycle")]
     [Tooltip("Log one line when the session ends (End panel confirmed). Never logged per frame.")]
     public bool enableLifecycleLogs = true;
@@ -706,10 +714,35 @@ public class ExperimentManager : MonoBehaviour
         OnParticipantControlChanged?.Invoke(enabled);
     }
 
+    // ---- Mandatory-checkpoint lock (Part 3 Destination 2 panel) -------------------------------------------------------------------
+    // Reuses the ONE participant-control gate (SetParticipantControl -> OnParticipantControlChanged -> ParticipantControlLock providers,
+    // GuardedTeleportationProvider, RiverTeleportPoint, RiverPointAvailability, TargetSelectable). Only the participant is affected: no NPC, audio,
+    // capture, UI-input or timing system reads this flag. Idempotent; never overrides a lock that belongs to the Start panel, the End panel or a
+    // finished session (those own the flag in their states), and a release can never re-open a terminal state.
+    private bool _checkpointLockActive;
+
+    private void LockParticipantForCheckpoint(string label, string reason)
+    {
+        if (_checkpointLockActive || SessionEnded || EndPanelActive || !ParticipantControlEnabled) return;   // already locked by another state, or terminal: nothing to add
+        _checkpointLockActive = true;
+        SetParticipantControl(false);
+        RaiseEvt("participant_control", CurrentRunningPartString(), label: label, stringValue: "locked;reason=" + reason);
+    }
+
+    private void ReleaseParticipantCheckpointLock(string label, string reason)
+    {
+        if (!_checkpointLockActive) return;
+        _checkpointLockActive = false;
+        if (SessionEnded || EndPanelActive) return;   // the End panel / session end own the lock now
+        SetParticipantControl(true);
+        RaiseEvt("participant_control", CurrentRunningPartString(), label: label, stringValue: "unlocked;reason=" + reason);
+    }
+
     // Start of the timed trial: participant control is enabled first so listeners of OnTrialStart already see the Running state.
     private void BeginTrial()
     {
         if (SessionEnded) return;
+        _checkpointLockActive = false;   // a new trial never inherits a checkpoint lock (SetParticipantControl(true) below is the release)
         if (NpcPreparation.applicable && NpcPreparation.state == NpcPreparationState.Failed.ToString())
         {
             Debug.LogError("[ExperimentManager] Trial start refused: NPC preparation failed.", this);
@@ -1659,6 +1692,10 @@ public class ExperimentManager : MonoBehaviour
             p3D2Ran = true;
             SetPhase("d2_pending");
 
+            // Mandatory checkpoint: the D2 panel is positioned once in world space and the Part cannot continue without its Continue click, so the participant is
+            // locked from the moment it is shown (BEFORE it becomes visible: the placement may wait up to settleTimeout) until that click. See lockParticipantWhileDestination2Panel.
+            if (lockParticipantWhileDestination2Panel) LockParticipantForCheckpoint("D2", "d2_panel_shown");
+
             bool dest2Confirmed = false;
             RaiseEvt("destination_shown", "Part3", label: "D2");
             RaiseEvt("panel_shown", "Part3", label: "part3_dest2");
@@ -1670,6 +1707,7 @@ public class ExperimentManager : MonoBehaviour
                 if (firstD2Confirm) RaiseEvt("part3_d2_continue_confirmed", "Part3", label: "D2");
                 RaiseEvt("panel_confirmed", "Part3", label: "part3_dest2");
                 RaiseEvt("destination_confirmed", "Part3", label: "D2");
+                ReleaseParticipantCheckpointLock("D2", "d2_continue_confirmed");   // same moment the D2 search clock starts (stamped first, above)
             },
             () =>
             {
@@ -1683,6 +1721,7 @@ public class ExperimentManager : MonoBehaviour
                 }
             });
             yield return new WaitUntil(() => dest2Confirmed);
+            ReleaseParticipantCheckpointLock("D2", "d2_continue_confirmed");   // safety net only (idempotent): the callback above already released it
             SetPhase("d2_search");
 
             // Destination 2 assigned: make ONLY destination2Building interactable.

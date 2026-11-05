@@ -122364,10 +122364,12 @@ PrefabInstance:
       propertyPath: m_Text
       value: "You are now located in the city centre of Lyon, France.\r\nYou have
         10 minutes to explore and memorize the area.\r\nThe area consists of two
-        parts located on the east and west banks of the river.\r\nYou will first
-        explore one part of the area. After 5 minutes, a prompt will appear. Once
-        confirmed, you will be automatically teleported to the other side of the
-        river to continue exploring for another 5 minutes.\r"
+        parts located on the east and west banks of the river. You will first explore
+        one part of the area. After 5 minutes, a prompt will appear. Once confirmed,
+        you will be automatically teleported to the other side of the river to continue
+        exploring for another 5 minutes.\r\nPlease do not attempt to cross the river
+        on foot or by any other means. You should only move between the two sides
+        using the designated teleportation.\r"
       objectReference: {fileID: 0}
     m_RemovedComponents: []
     m_RemovedGameObjects: []
@@ -199787,7 +199789,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!4 &1318806865
 Transform:
   m_ObjectHideFlags: 0
@@ -246330,6 +246332,7 @@ MonoBehaviour:
     npcCaptureEnabled: 1
     gazeCaptureEnabled: 1
     trajectoryCaptureEnabled: 1
+  lockParticipantWhileDestination2Panel: 1
   enableLifecycleLogs: 1
   npcWarmupDuration: 20
   holdNpcsUntilStart: 1
@@ -265262,7 +265265,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!4 &1786930768
 Transform:
   m_ObjectHideFlags: 0

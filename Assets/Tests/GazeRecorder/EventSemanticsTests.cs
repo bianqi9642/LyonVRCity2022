@@ -333,8 +333,11 @@ public partial class NpcLifecycleTests
         long dupBefore = 0;
         yield return WaitUntil(() => Get<string>(rig.dcm, "CurrentPhase") == "d2_pending", 4f, "D1 found -> d2_pending");
 
-        // (4) click during the D2 panel again, then search D2 with a correct click
-        Click(d2); string idPending2 = Id(d2); yield return null; yield return null;
+        // (4) click during the D2 panel: the participant is locked at this mandatory checkpoint (ExperimentManager.lockParticipantWhileDestination2Panel, default on), and TargetSelectable.Select ignores
+        //     clicks while ParticipantControlEnabled is false - exactly like before the Start click: no building_click row, no interaction id is allocated. (Before that option the click was recorded.)
+        string idBeforeD2Panel = Id(d2); Click(d2); string idPending2 = Id(d2); yield return null; yield return null;
+        Assert.AreEqual(idBeforeD2Panel, idPending2, "a click while the D2 panel locks the participant is ignored (no new interaction id)");
+        // then search D2 with a correct click
         yield return PressPanel(p.ui, "D2 panel");
         yield return WaitUntil(() => Get<string>(rig.dcm, "CurrentPhase") == "d2_search", 3f, "d2_search");
         yield return null;
@@ -352,11 +355,11 @@ public partial class NpcLifecycleTests
         var correct = Rows(evs, "event_type", "correct_selection"); var incorrect = Rows(evs, "event_type", "incorrect_selection");
         UnityEngine.Debug.Log($"[EventSemanticsTests][click] clicks={clicks.Count} correct={correct.Count} incorrect={incorrect.Count}  ids pending={idPending} wrong={wrong1},{wrong2} d1={idD1} pending2={idPending2} d2={idD2}");
 
-        // exactly one building_click per accepted physical click: 6 (pending, wrong, wrong, D1 [duplicate ignored], pending, D2)
-        Assert.AreEqual(6, clicks.Count);
+        // exactly one building_click per accepted physical click: 5 (pending at the D1 panel, wrong, wrong, D1 [duplicate ignored], D2); the click at the locked D2 panel is not accepted
+        Assert.AreEqual(5, clicks.Count);
         var clickIds = new List<string>(); foreach (var r in clicks) clickIds.Add(evs.Get(r, "interaction_id"));
         CollectionAssert.AllItemsAreUnique(clickIds); foreach (var id in clickIds) StringAssert.IsMatch(@"^C\d{6}$", id);
-        CollectionAssert.AreEqual(new[] { idPending, wrong1, wrong2, idD1, idPending2, idD2 }, clickIds, "ids are allocated in click order, once per click");
+        CollectionAssert.AreEqual(new[] { idPending, wrong1, wrong2, idD1, idD2 }, clickIds, "ids are allocated in click order, once per click");
         for (int i = 1; i < clickIds.Count; i++) Assert.Greater(int.Parse(clickIds[i].Substring(1)), int.Parse(clickIds[i - 1].Substring(1)), "monotonic");
         Assert.IsFalse(clickIds.Contains(""), "no building_click without an interaction id");
 
@@ -370,7 +373,7 @@ public partial class NpcLifecycleTests
         Assert.AreEqual(idD1, evs.Get(correct[0], "interaction_id")); Assert.AreEqual("D1", evs.Get(correct[0], "label"));
         Assert.AreEqual(idD2, evs.Get(correct[1], "interaction_id")); Assert.AreEqual("D2", evs.Get(correct[1], "label"));
         CollectionAssert.AreEquivalent(new[] { wrong1, wrong2 }, new[] { evs.Get(incorrect[0], "interaction_id"), evs.Get(incorrect[1], "interaction_id") });
-        var unresolved = clickIds.FindAll(id => !outcomeIds.Contains(id)); CollectionAssert.AreEquivalent(new[] { idPending, idPending2 }, unresolved, "clicks outside a search window have no outcome (by design)");
+        var unresolved = clickIds.FindAll(id => !outcomeIds.Contains(id)); CollectionAssert.AreEquivalent(new[] { idPending }, unresolved, "clicks outside a search window have no outcome (by design)");
         foreach (var r in evs.Rows) if (evs.Get(r, "event_type") != "building_click" && evs.Get(r, "event_type") != "correct_selection" && evs.Get(r, "event_type") != "incorrect_selection")
             Assert.AreEqual("", evs.Get(r, "interaction_id"), evs.Get(r, "event_type") + ": interaction_id is blank on every other event");
 
@@ -385,7 +388,7 @@ public partial class NpcLifecycleTests
         foreach (var o in new[] { correct[0], correct[1], incorrect[0], incorrect[1] }) Assert.IsTrue(Regexp(evs.Get(o, "value_num")), "outcome carries its elapsed time");
 
         // counting rules from the documentation
-        Assert.AreEqual(6, new HashSet<string>(clickIds).Count); Assert.AreEqual(4, new HashSet<string>(outcomeIds).Count);
+        Assert.AreEqual(5, new HashSet<string>(clickIds).Count); Assert.AreEqual(4, new HashSet<string>(outcomeIds).Count);
 
         Call(rig.dcm, "WriteManifestEnd", "test");
         var man = File.ReadAllText(rig.File("session_manifest.json"));

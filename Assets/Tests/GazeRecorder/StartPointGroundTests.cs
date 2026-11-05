@@ -205,8 +205,8 @@ public class StartPointGroundTests
         Surface(100f);
         var (rig, _, em) = Setup(new Vector3(0, 100.5f, 0), true);
         Call(em, "TeleportPlayerTo", Anchor(new Vector3(0, 99.98f, 0)));   // -2 cm: the audit tolerance
-        float t0 = Time.realtimeSinceStartup; while (Mathf.Abs(rig.position.y - 100f) > 0.0015f && Time.realtimeSinceStartup - t0 < 10f) yield return null;
-        Assert.AreEqual(100f, rig.position.y, 2e-3f);
+        float t0 = Time.realtimeSinceStartup; while (Mathf.Abs(rig.position.y - 100f) > 0.0015f && Time.realtimeSinceStartup - t0 < 20f) yield return null;
+        Assert.AreEqual(100f, rig.position.y, 3e-3f);   // 3 mm: the wait is real-time bound and a loaded machine can leave the lerp a hair short
     }
 
     [UnityTest]

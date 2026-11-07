@@ -1,0 +1,6 @@
+c624842edb5d7d5eba9e973167ffc4b2c8ffa42f  ./Assets/Editor/NavMeshAudit/GroundNavFix.cs
+4b7d26cd4d2a74e325f050d10d49331cba300924  ./Assets/Scenes/LyonVRVity35.unity
+86ff915a47393d565bd6696b28c4c72ab138572c  ./Assets/Scripts/ExplorationBoundary.cs
+f9aa85942db7f26340a85636900db2002daa82b7  ./Assets/Scripts/GroundFallRecovery.cs
+29b593a6be795be5db6772d80c4e472db1fe6f3c  ./Assets/Tests/EditMode/GroundNavRegressionTests.cs
+d9c80404f022dc6b2b326609eb5700f53ef86c89  ./Assets/Tests/EditMode/GroundRunawayRegressionTests.cs

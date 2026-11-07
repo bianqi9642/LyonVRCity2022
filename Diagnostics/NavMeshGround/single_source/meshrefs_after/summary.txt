@@ -1,0 +1,5 @@
+scene=Assets/Scenes/LyonVRVity35.unity time=2026-11-07T15:13:24 (read-only; in-memory activation only)
+NavMeshSurface: useGeometry=RenderMeshes layerMask=73 sources=2631
+TIN tile roots (Ground-layer MeshColliders on TIN meshes): 21  A(filter+collider repaired)=20  B(only collider repaired)=0  C(neither)=1  D(other)=0
+repaired TIN assets on disk: 18
+proxy objects: 18; each MeshFilter in NavMeshGroundProxy: Ground_gml_c9b1830c-4fe8-4fea-bfd7-87af196e6721_GridArea -> collected=False rendererEnabled=True; Ground_gml_babe4fa3-ecc6-4cd9-8a77-78814f30b57c_GridArea -> collected=False rendererEnabled=True; Ground_gml_87623043-f996-4e2c-83c8-16f139a63d7c_GridArea -> collected=False rendererEnabled=True ...

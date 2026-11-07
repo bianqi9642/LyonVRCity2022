@@ -34,7 +34,7 @@ public class GroundNavRegressionTests
         for (int i = 0; i < SceneManager.sceneCount; i++) if (SceneManager.GetSceneAt(i).path == ScenePath) Assert.Ignore("the experiment scene is open in the Editor; close it (or run in batch mode)");
         bool ignore = LogAssert.ignoreFailingMessages; LogAssert.ignoreFailingMessages = true;
         try { _scene = EditorSceneManager.OpenScene(ScenePath, OpenSceneMode.Additive); _opened = true; } finally { LogAssert.ignoreFailingMessages = ignore; }
-        foreach (var root in _scene.GetRootGameObjects()) foreach (var tr in root.GetComponentsInChildren<Transform>(true)) if (tr.name == "TIN_Textured" || tr.name == "Practice Area") tr.gameObject.SetActive(true);   // in memory only
+        foreach (var root in _scene.GetRootGameObjects()) foreach (var tr in root.GetComponentsInChildren<Transform>(true)) if (tr.name == "TIN_Textured" || tr.name == "Practice Area" || tr.name == "Grid Area" || tr.name == "Organic Area" || tr.name == "EnvironmentConfig" || tr.name == "NavMesh") tr.gameObject.SetActive(true);   // in memory only
         _prevAutoSync = Physics.autoSyncTransforms; Physics.autoSyncTransforms = true; Physics.SyncTransforms();   // restored in TearDown (project setting)
         if (!AllIn<MeshCollider>().Any(m => m.gameObject.layer == 3 && m.sharedMesh != null)) Assert.Ignore("no Ground-layer terrain mesh is imported in this project");
     }
@@ -46,26 +46,114 @@ public class GroundNavRegressionTests
     static string AssetPath(UnityEngine.Object o) { return o == null ? "" : AssetDatabase.GetAssetPath(o); }
     static bool IsTin(string ap) { return ap.Contains("/Models/TIN/") && !ap.Contains("/Models/TIN/Patches/"); }
 
+    // The production configuration: these nine NavMeshModifier components are INTENTIONALLY saved disabled (8 TIN "ignore from build" + the SouthRiver patch). They must stay that way.
+    static readonly string[] NineDisabledModifiers = {
+        "Grid Area/TIN_Textured", "Organic Area/TIN_Textured", "Organic Area/TIN_Textured/SouthRiver_TIN_GapPatch",
+        "Practice Area/gml_198275d7-1842-4ff1-abc3-123f14b587d4", "Practice Area/gml_38179d6d-9886-48a9-9634-4e5eb1016a06", "Practice Area/gml_8bf87428-0e6e-485c-894d-eebcb42a5e76",
+        "Practice Area/gml_9fb11684-5d01-442f-8e2a-781b88d720b7", "Practice Area/gml_ca89eda0-46ef-4c3b-8e69-8b65157d50ea", "Practice Area/gml_dd4fd483-1c11-4e3b-9b11-02d15babedd8" };
+
+    static string HierPath(Transform t) { string s = t.name; for (var p = t.parent; p != null; p = p.parent) s = p.name + "/" + s; return s; }
+
     [Test]
-    public void NavMeshSurface_CollectsNoWalkableBuilding_AndOnlyRepairedProxiesAsTin()
+    public void NineTinModifiers_RemainDisabled_AsIntended_AndBuildingModifiersAreEnabled()
+    {
+        var modType = Type.GetType("Unity.AI.Navigation.NavMeshModifier, Unity.AI.Navigation"); Assert.IsNotNull(modType);
+        var mods = _scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren(modType, true)).Cast<Behaviour>().ToList();
+        bool Ignore(Behaviour m) { return (bool)modType.GetProperty("ignoreFromBuild").GetValue(m); }
+        bool Override(Behaviour m) { return (bool)modType.GetProperty("overrideArea").GetValue(m); }
+        int Area(Behaviour m) { return (int)modType.GetProperty("area").GetValue(m); }
+        foreach (var path in NineDisabledModifiers)
+        {
+            var m = mods.FirstOrDefault(x => HierPath(x.transform) == path); Assert.IsNotNull(m, "expected NavMeshModifier missing: " + path);
+            Assert.IsTrue(Ignore(m), path + " must keep Ignore From Build"); Assert.IsFalse(m.enabled, path + " is intentionally DISABLED and must stay disabled");
+        }
+        var buildingMods = mods.Where(m => Override(m) && Area(m) == 1).ToList();
+        Assert.GreaterOrEqual(buildingMods.Count, 6, "building roots must carry Not Walkable modifiers");
+        foreach (var m in buildingMods) Assert.IsTrue(m.enabled, "building modifier disabled (rooftop exclusion would break): " + HierPath(m.transform));
+    }
+
+    [Test]
+    public void GroundNavFix_NeverWritesModifierEnabledState()
+    {
+        string src = File.ReadAllText("Assets/Editor/NavMeshAudit/GroundNavFix.cs");
+        Assert.IsFalse(System.Text.RegularExpressions.Regex.IsMatch(src, @"\.enabled\s*=\s*true"), "GroundNavFix must not enable components: the nine TIN modifiers are intentionally disabled");
+    }
+
+    static IList<NavMeshBuildSource> CollectSources(Component surface)
+    {
+        return (IList<NavMeshBuildSource>)surface.GetType().GetMethod("CollectSources", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(surface, null);
+    }
+
+    Component Surface()
     {
         var surfType = Type.GetType("Unity.AI.Navigation.NavMeshSurface, Unity.AI.Navigation"); Assert.IsNotNull(surfType, "Unity.AI.Navigation not available");
-        var surface = (Component)_scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren(surfType, true)).FirstOrDefault(); Assert.IsNotNull(surface, "no NavMeshSurface in the scene");
-        var sources = (IList<NavMeshBuildSource>)surfType.GetMethod("CollectSources", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(surface, null);
-        int buildingWalkable = 0, buildings = 0, visualTin = 0, proxies = 0, walkable = 0;
+        var surface = (Component)_scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren(surfType, true)).FirstOrDefault(); Assert.IsNotNull(surface, "no NavMeshSurface in the scene"); return surface;
+    }
+
+    [Test]
+    public void NavMeshSurface_WithTheIntendedModifierStates_CollectsEachRepairedTileOnce_NoProxy_NoOriginalTin_NoWalkableBuilding()
+    {
+        var sources = CollectSources(Surface());
+        int buildingWalkable = 0, buildings = 0, originalTin = 0, repaired = 0, proxySources = 0, bridges = 0, groundNotWalkable = 0; var perComponent = new Dictionary<Component, int>();
         foreach (var s in sources)
         {
-            string ap = AssetPath(s.sourceObject);
+            string ap = AssetPath(s.sourceObject); string cp = s.component != null ? HierPath(s.component.transform) : "";
+            if (s.component != null) { int n; perComponent.TryGetValue(s.component, out n); perComponent[s.component] = n + 1; }
             if (ap.Contains("/Models/BATI/")) { buildings++; if (s.area != 1) buildingWalkable++; }
-            else if (ap.StartsWith("Assets/Models/TIN/Repaired/")) proxies++;
-            else if (IsTin(ap)) visualTin++;
-            if (s.area != 1) walkable++;
+            else if (ap.StartsWith("Assets/Models/TIN/Repaired/")) { if (cp.StartsWith("NavMeshGroundProxy/")) proxySources++; else repaired++; if (s.area == 1) groundNotWalkable++; }
+            else if (IsTin(ap)) originalTin++;
+            else if (ap.Contains("/Models/PONT/")) bridges++;
         }
-        TestContext.Out.WriteLine("sources=" + sources.Count + " buildings(not walkable)=" + buildings + " visualTin=" + visualTin + " repairedProxies=" + proxies + " walkable-area sources=" + walkable);
+        TestContext.Out.WriteLine("sources=" + sources.Count + " buildings=" + buildings + " (walkable " + buildingWalkable + ") repaired tile sources=" + repaired + " proxy sources=" + proxySources + " original TIN sources=" + originalTin + " bridges=" + bridges);
         Assert.Greater(buildings, 0, "buildings must stay in the build as obstacles");
         Assert.AreEqual(0, buildingWalkable, "building geometry contributes WALKABLE area (rooftops)");
-        Assert.AreEqual(0, visualTin, "visual TIN renderers must not be NavMesh sources");
-        Assert.Greater(proxies, 0, "repaired ground proxies are not collected");
+        Assert.Greater(repaired, 0, "the tiles' own repaired meshes are not collected");
+        Assert.AreEqual(0, originalTin, "an ORIGINAL (unrepaired) TIN mesh is still a NavMesh source");
+        Assert.AreEqual(0, proxySources, "the NavMeshGroundProxy must not be a second ground source");
+        Assert.Greater(bridges, 0, "bridge decks (PONT) are not collected");
+        Assert.AreEqual(0, groundNotWalkable, "ground sources must be walkable");
+        Assert.IsTrue(perComponent.Values.All(n => n == 1), "a renderer was collected more than once");
+    }
+
+    [Test]
+    public void EveryGroundTile_MeshFilterAndMeshCollider_ReferenceTheSameRepairedAsset_WithUv()
+    {
+        int tiles = 0; var bad = new List<string>();
+        foreach (var c in AllIn<MeshCollider>().Where(m => m.gameObject.layer == 3 && m.sharedMesh != null))
+        {
+            string ap = AssetPath(c.sharedMesh); if (!ap.StartsWith("Assets/Models/TIN/Repaired/")) continue; tiles++;
+            var mf = c.GetComponentInChildren<MeshFilter>(true);
+            if (mf == null || mf.sharedMesh != c.sharedMesh) { bad.Add(c.name + ": MeshFilter does not reference the collider's repaired asset"); continue; }
+            var uv = new List<Vector2>(); c.sharedMesh.GetUVs(0, uv);
+            bool textured = c.name.Length > 0 && HierPath(c.transform).Contains("TIN_Textured");
+            if (textured && uv.Count != c.sharedMesh.vertexCount) bad.Add(c.name + ": repaired mesh lost its UVs");
+        }
+        Assert.Greater(tiles, 0); Assert.IsEmpty(bad, string.Join("; ", bad));
+    }
+
+    [Test]
+    public void FreshBake_WithTheIntendedModifierStates_CoversEveryRegion_AndRoofPolygonsAreOnlyFromNonBuildingSources()
+    {
+        var surface = Surface(); var sources = CollectSources(surface);
+        var nonBuildingBounds = new List<Bounds>();
+        foreach (var s in sources) { string ap = AssetPath(s.sourceObject); if (s.area == 1 || ap.Contains("/Models/TIN/") || ap.Contains("/Models/PONT/")) continue; var r = s.component as Renderer; if (r != null) { var b = r.bounds; b.Expand(1f); nonBuildingBounds.Add(b); } }
+        surface.GetType().GetMethod("BuildNavMesh").Invoke(surface, null);          // IN MEMORY: replaces the data of the additively opened scene, nothing is saved
+        var tr = NavMesh.CalculateTriangulation(); Assert.Greater(tr.indices.Length, 0, "fresh bake produced no NavMesh");
+        var hits = new RaycastHit[16]; var perRegion = new Dictionary<string, int> { { "PONT", 0 }, { "Practice", 0 }, { "Organic", 0 }, { "Grid", 0 } }; int roof = 0, unexplainedRoof = 0;
+        float Top(Vector3 q) { int k = Physics.RaycastNonAlloc(new Vector3(q.x, 600f, q.z), Vector3.down, hits, 1200f, 1 << 3, QueryTriggerInteraction.Ignore); float top = float.NegativeInfinity; for (int h = 0; h < k; h++) top = Mathf.Max(top, hits[h].point.y); return top; }
+        for (int t = 0; t < tr.indices.Length / 3; t++)
+        {
+            Vector3 a = tr.vertices[tr.indices[3 * t]], b = tr.vertices[tr.indices[3 * t + 1]], c = tr.vertices[tr.indices[3 * t + 2]]; var ce = (a + b + c) / 3f;
+            int n = Physics.RaycastNonAlloc(new Vector3(ce.x, 600f, ce.z), Vector3.down, hits, 1200f, 1 << 3, QueryTriggerInteraction.Ignore); float best = float.NegativeInfinity; Collider top = null;
+            for (int h = 0; h < n; h++) if (hits[h].point.y > best) { best = hits[h].point.y; top = hits[h].collider; }
+            if (top != null) { string p = HierPath(top.transform); string reg = p.StartsWith("PONT/") ? "PONT" : p.StartsWith("Practice Area/") ? "Practice" : p.StartsWith("Organic Area/") ? "Organic" : p.StartsWith("Grid Area/") ? "Grid" : null; if (reg != null) perRegion[reg]++; }
+            float ta = Top(a), tb = Top(b), tc = Top(c);
+            if (!float.IsNegativeInfinity(ta) && !float.IsNegativeInfinity(tb) && !float.IsNegativeInfinity(tc) && a.y > ta + 1f && b.y > tb + 1f && c.y > tc + 1f)
+            { roof++; if (!nonBuildingBounds.Any(bd => bd.Contains(ce))) unexplainedRoof++; }
+        }
+        TestContext.Out.WriteLine("polygons per region: " + string.Join(", ", perRegion.Select(kv => kv.Key + "=" + kv.Value)) + "; roof-like polygons=" + roof + " (unexplained by non-building sources: " + unexplainedRoof + ")");
+        Assert.Greater(perRegion["PONT"], 50, "no NavMesh on the bridge decks"); Assert.Greater(perRegion["Practice"], 5000, "Practice not covered"); Assert.Greater(perRegion["Organic"], 5000, "Organic not covered"); Assert.Greater(perRegion["Grid"], 5000, "Grid not covered");
+        Assert.AreEqual(0, unexplainedRoof, "roof-like NavMesh polygons that no non-building source explains = building rooftops are walkable");
     }
 
     [Test]
@@ -90,15 +178,19 @@ public class GroundNavRegressionTests
     [Test]
     public void CharacterController_LandsOnFormerlyFlippedTriangles_AndAutoGroundAlignRayHits()
     {
-        // formerly flipped = down-facing in the ORIGINAL visual TIN meshes (which are untouched)
-        var tris = new List<Vector3>();
-        foreach (var mf in AllIn<MeshFilter>())
+        // formerly flipped = down-facing in the ORIGINAL glTF meshes (untouched assets), placed with the tile's own transform
+        var tris = new List<Vector3>(); var doneIds = new HashSet<string>();
+        foreach (var col in AllIn<MeshCollider>().Where(m => m.gameObject.layer == 3 && m.sharedMesh != null))
         {
-            string ap = AssetPath(mf.sharedMesh); if (!IsTin(ap) || ap.StartsWith("Assets/Models/TIN/Repaired/")) continue;
-            var v = mf.sharedMesh.vertices; var t = mf.sharedMesh.triangles; var m = mf.transform.localToWorldMatrix;
-            for (int i = 0; i < t.Length; i += 3)
+            string rp = AssetPath(col.sharedMesh); if (!rp.StartsWith("Assets/Models/TIN/Repaired/")) continue;
+            string id = col.sharedMesh.name.Substring("Ground_".Length); id = id.Substring(0, id.LastIndexOf('_')); if (!doneIds.Add(id + col.transform.position)) continue;
+            string folder = col.sharedMesh.name.EndsWith("PracticeArea") ? "/Models/TIN/White/" : "/Models/TIN/Textured/";
+            string gp = AssetDatabase.FindAssets(id + " t:GameObject").Select(AssetDatabase.GUIDToAssetPath).FirstOrDefault(x => x.EndsWith(".gltf") && x.Contains(folder)); if (gp == null) continue;
+            var orig = AssetDatabase.LoadAllAssetsAtPath(gp).OfType<Mesh>().FirstOrDefault(); if (orig == null) continue;
+            var v = orig.vertices; var tt = orig.triangles; var m = col.transform.localToWorldMatrix;
+            for (int i = 0; i < tt.Length; i += 3)
             {
-                var a = m.MultiplyPoint3x4(v[t[i]]); var b = m.MultiplyPoint3x4(v[t[i + 1]]); var d = m.MultiplyPoint3x4(v[t[i + 2]]); var n = Vector3.Cross(b - a, d - a);
+                var a = m.MultiplyPoint3x4(v[tt[i]]); var b = m.MultiplyPoint3x4(v[tt[i + 1]]); var d = m.MultiplyPoint3x4(v[tt[i + 2]]); var n = Vector3.Cross(b - a, d - a);
                 if (0.5f * n.magnitude >= 0.05f && n.y < -1e-3f * n.magnitude) tris.Add((a + b + d) / 3f);
             }
         }
@@ -123,22 +215,23 @@ public class GroundNavRegressionTests
     }
 
     [Test]
-    public void BakedNavMesh_HasNoRooftopPolygons()
+    public void BakedNavMesh_RoofLikePolygons_AreOnlyThoseOfNonBuildingSources()
     {
+        // roof-like = all three corners > 1 m above the highest Ground surface under that corner. Building rooftops must never produce one; a teleport-anchor disc that stands on a roof may (it is not a building).
+        var nonBuildingBounds = new List<Bounds>();
+        foreach (var s in CollectSources(Surface())) { string ap = AssetPath(s.sourceObject); if (s.area == 1 || ap.Contains("/Models/TIN/") || ap.Contains("/Models/PONT/")) continue; var r = s.component as Renderer; if (r != null) { var b = r.bounds; b.Expand(1f); nonBuildingBounds.Add(b); } }
         var tr = NavMesh.CalculateTriangulation(); Assert.Greater(tr.indices.Length, 0, "no NavMesh loaded from the additive scene");
-        int roof = 0, total = tr.indices.Length / 3; var hits = new RaycastHit[16];
+        int roof = 0, unexplained = 0, total = tr.indices.Length / 3; var hits = new RaycastHit[16];
+        Func<Vector3, float> top = q => { int k = Physics.RaycastNonAlloc(new Vector3(q.x, 600f, q.z), Vector3.down, hits, 1200f, 1 << 3, QueryTriggerInteraction.Ignore); float h = float.NegativeInfinity; for (int i = 0; i < k; i++) h = Mathf.Max(h, hits[i].point.y); return h; };
         for (int t = 0; t < total; t++)
         {
-            Vector3 a = tr.vertices[tr.indices[3 * t]], b = tr.vertices[tr.indices[3 * t + 1]], c = tr.vertices[tr.indices[3 * t + 2]]; bool allAbove = true;
-            foreach (var q in new[] { a, b, c })
-            {
-                int n = Physics.RaycastNonAlloc(new Vector3(q.x, 600f, q.z), Vector3.down, hits, 1200f, 1 << 3, QueryTriggerInteraction.Ignore); if (n == 0) { allAbove = false; break; }
-                float top = float.MinValue; for (int h = 0; h < n; h++) top = Mathf.Max(top, hits[h].point.y);
-                if (q.y < top + 1.0f) { allAbove = false; break; }   // a bridge deck (Ground layer) counts as ground, a roof does not: roofs have no Ground collider under their rays
-            }
-            if (allAbove) roof++;
+            Vector3 a = tr.vertices[tr.indices[3 * t]], b = tr.vertices[tr.indices[3 * t + 1]], c = tr.vertices[tr.indices[3 * t + 2]];
+            float ta = top(a), tb = top(b), tc = top(c);
+            if (float.IsNegativeInfinity(ta) || float.IsNegativeInfinity(tb) || float.IsNegativeInfinity(tc)) continue;
+            if (a.y > ta + 1f && b.y > tb + 1f && c.y > tc + 1f) { roof++; var ce = (a + b + c) / 3f; if (!nonBuildingBounds.Any(bd => bd.Contains(ce))) unexplained++; }
         }
-        Assert.AreEqual(0, roof, roof + " of " + total + " NavMesh polygons float > 1 m above every ground surface (rooftops)");
+        TestContext.Out.WriteLine("roof-like polygons=" + roof + " of " + total + "; not explained by a non-building source=" + unexplained);
+        Assert.AreEqual(0, unexplained, unexplained + " roof-like NavMesh polygons are not explained by any non-building source (= building rooftops walkable)");
     }
 
     // ---- GroundFallRecovery on synthetic ground (script lives in Assembly-CSharp, so reflection)
@@ -148,7 +241,7 @@ public class GroundNavRegressionTests
     static int Count(Component c) { return (int)RecType().GetProperty("RecoveryCount").GetValue(c); }
 
     GameObject MakeGround() { var g = new GameObject("__ground") { layer = 3 }; var b = g.AddComponent<BoxCollider>(); b.size = new Vector3(2000, 1, 2000); g.transform.position = new Vector3(0, -0.5f, 0); Physics.SyncTransforms(); return g; }
-    Component MakeRig(GameObject rig) { var c = rig.AddComponent(RecType()); Set(c, "rig", rig.transform); Set(c, "groundMask", (LayerMask)(1 << 3)); Set(c, "noSupportSeconds", 0f); return c; }
+    Component MakeRig(GameObject rig) { var c = rig.AddComponent(RecType()); Set(c, "rig", rig.transform); Set(c, "groundMask", (LayerMask)(1 << 3)); Set(c, "noSupportSeconds", 0f); Set(c, "writeDiagnosticsFile", false); return c; }
 
     [Test]
     public void GroundFallRecovery_RestoresAFallenRig_ToTheLastSafePosition()
@@ -175,5 +268,22 @@ public class GroundNavRegressionTests
             Assert.AreEqual(0, Count(c)); Assert.AreEqual(500f, rig.transform.position.x, 0.001f); Assert.AreEqual(-30f, rig.transform.position.y, 0.001f);
         }
         finally { UnityEngine.Object.DestroyImmediate(rig); UnityEngine.Object.DestroyImmediate(ground); }
+    }
+
+    // ---- ExplorationBoundary: the logged onset of sessions 20261106T140500Z / T142958Z, replayed against the REAL Exploration Area volumes
+    [Test]
+    public void ExplorationBoundary_ContainmentShift_AtLoggedOnsetPositions_IsASmallHorizontalCorrection()
+    {
+        var ebType = Type.GetType("ExplorationBoundary, Assembly-CSharp"); Assert.IsNotNull(ebType);
+        var eb = (Component)_scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren(ebType, true)).FirstOrDefault(); Assert.IsNotNull(eb, "ExplorationBoundary not in scene");
+        Physics.SyncTransforms();
+        var inside = ebType.GetMethod("IsInsideArea"); var rec = ebType.GetMethod("TryRecoverShift", BindingFlags.Instance | BindingFlags.NonPublic);
+        foreach (var head in new[] { new Vector3(1966.93f, 205.60f, 866.09f), new Vector3(1966.80f, 205.60f, 866.09f), new Vector3(1971.77f, 203.77f, 843.01f) })
+        {
+            Assert.IsFalse((bool)inside.Invoke(eb, new object[] { head }), "test position expected to be just outside the area: " + head);
+            var args = new object[] { head, Vector3.zero }; Assert.IsTrue((bool)rec.Invoke(eb, args)); var shift = (Vector3)args[1];
+            Assert.Less(shift.magnitude, 2f, "containment shift " + shift + " at head " + head + " must be a small correction, not ~600+ m (z - height bug)");
+            Assert.IsTrue((bool)inside.Invoke(eb, new object[] { head + shift }), "head must be inside the area after ONE correction (no runaway loop)");
+        }
     }
 }

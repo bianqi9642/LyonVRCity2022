@@ -290,6 +290,13 @@ public class ExperimentManager : MonoBehaviour
              "generic XRI teleports are still refused by GuardedTeleportationProvider 'panel_open').")]
     public bool lockParticipantWhileDestination2Panel = true;
 
+    [Header("Participant control at the Part 2 Continue panel")]
+    [Tooltip("If true (default), the participant is locked (the same ParticipantControlEnabled gate and checkpoint-lock helpers as the Part 3 Destination 2 panel: continuous move, turn providers, " +
+             "XRI and river-point teleports, building selection) from the moment the Part 2 Continue panel is shown until its Continue button is pressed. Head tracking, controller rays and the panel UI " +
+             "stay usable; NPCs, audio, gaze / trajectory capture and the experiment clocks are not touched. The scripted Continue teleport to the next area is unchanged and is not gated by this flag. " +
+             "False = previous behaviour (free movement while the panel is open).")]
+    public bool lockParticipantWhilePart2ContinuePanel = true;
+
     [Header("Session lifecycle")]
     [Tooltip("Log one line when the session ends (End panel confirmed). Never logged per frame.")]
     public bool enableLifecycleLogs = true;
@@ -1431,16 +1438,21 @@ public class ExperimentManager : MonoBehaviour
 
         bool teleported = false;
         SetPhase("p2_continue_pending", "Part2");   // Continue panel being read: the trial is open and recorded, but this is NOT task time
+        // Mandatory checkpoint (same mechanism as the Part 3 Destination 2 panel): lock the participant BEFORE the panel is shown, release only at the Continue click.
+        if (lockParticipantWhilePart2ContinuePanel) LockParticipantForCheckpoint("P2", "part2_continue_panel_shown");
         RaiseEvt("panel_shown", "Part2", label: "part2_continue");
         uiManager.ShowPart2ContinuePanel(() =>
         {
+            if (teleported) return;   // a duplicate Continue event must not teleport or restart the second period twice
             RaiseEvt("panel_confirmed", "Part2", label: "part2_continue");
             TeleportPlayerTo(chosenTeleport ?? (group.teleportPositions != null && group.teleportPositions.Length > 0 ? group.teleportPositions[0] : null));
             teleported = true;
             SetPhase("p2_task2", "Part2");   // active task, second timed period (part2SecondDuration), from the confirm click / teleport
+            ReleaseParticipantCheckpointLock("P2", "part2_continue_confirmed");   // after the scripted teleport and phase change: the next area starts unlocked
         });
 
         yield return new WaitUntil(() => teleported);
+        ReleaseParticipantCheckpointLock("P2", "part2_continue_confirmed");   // safety net only (idempotent): the callback above already released it
 
         yield return WaitExperimentSeconds(_effective.Part2SecondDuration);
 

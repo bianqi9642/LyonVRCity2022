@@ -43,6 +43,9 @@
 //     policy is Deny, requests attributed to an allowed group (part1AllowedAnchors = Practice, part3AllowedAnchors =
 //     Grid|Organic) are judged as AllowDuringTrial: trial running, no full panel open, not a river point. Other anchors,
 //     TeleportationAreas and every other Part are unchanged (Part 2 keeps the Exploration Area test).
+//   * Unexplored anchors (added): while the Part named in unexploredBlockedPart (default Part2) runs, a request whose destination is an anchor below
+//     an 'Unexplored' group of the Grid / Organic anchor roots is rejected ("unexplored_anchor_<Part>") whatever the Part policy says. UnexploredTeleportAvailability
+//     hides and disables those points during Part 2; this is the backstop for a target that was hovered / selected before Part 2 began.
 //   * Requests landing near a RiverTeleportPoint are rejected: river points are paired-teleport-only.
 //   * Fails closed: missing ExperimentManager / ExplorationBoundary / XR Origin => request rejected.
 //
@@ -123,6 +126,12 @@ public class GuardedTeleportationProvider : TeleportationProvider
              "attributed to that anchor. Anchors are >2.5 m apart in the scene.")]
     [SerializeField] private float anchorMatchRadius = 0.25f;
 
+    [Header("Unexplored anchors")]
+    [Tooltip("Name of the group object (below the Grid / Organic anchor roots) whose anchors are unexplored.")]
+    [SerializeField] private string unexploredGroupName = UnexploredTeleportAvailability.GroupName;
+    [Tooltip("Part during which requests to unexplored anchors are rejected. Empty = never rejected on this ground.")]
+    [SerializeField] private string unexploredBlockedPart = "Part2";
+
     [Header("River points")]
     [Tooltip("Generic requests whose destination is within this horizontal distance (m) of a RiverTeleportPoint are " +
              "rejected: river points teleport only through RiverTeleportPoint.TryTeleport() (availability, pairing, cooldown, event).")]
@@ -149,6 +158,7 @@ public class GuardedTeleportationProvider : TeleportationProvider
     private RiverTeleportPoint[] riverPoints;
     private TeleportationAnchor[] anchorCache;
     private AnchorCategory[] anchorCacheCategories;
+    private bool[] anchorCacheUnexplored;
     private string lastAnchorLabel = "";
 
     /// <summary>True from OnTrialStart to OnTrialEnd of the running Part.</summary>
@@ -271,7 +281,15 @@ public class GuardedTeleportationProvider : TeleportationProvider
         // Anchor-category allowance: a Part whose generic policy is Deny may still permit specific anchor groups
         // (Practice in Part 1, Grid/Organic in Part 3). Such a request is judged under AllowDuringTrial, so the trial,
         // panel and river-point gates below still apply. Any other anchor stays denied.
-        AnchorCategory category = ResolveAnchorCategory(request.destinationPosition, out lastAnchorLabel);
+        AnchorCategory category = ResolveAnchorCategory(request.destinationPosition, out lastAnchorLabel, out bool unexploredAnchor);
+
+        // Unexplored anchors are unavailable while the blocked Part runs (their markers / interactables are switched off by UnexploredTeleportAvailability;
+        // this rejects a request that was already pending, or one raised through any path that bypasses the switched-off components).
+        if (unexploredAnchor && !string.IsNullOrEmpty(unexploredBlockedPart) && part == unexploredBlockedPart)
+        {
+            reason = "unexplored_anchor_" + part;
+            return false;
+        }
         if (policy == GenericTeleportPolicy.Deny && category != AnchorCategory.None &&
             (AllowedAnchorsFor(part) & category) != 0)
         {
@@ -365,9 +383,10 @@ public class GuardedTeleportationProvider : TeleportationProvider
     /// transform). The anchor list is cached and rebuilt once when no anchor matches (anchors may be activated later).
     /// Returns None for TeleportationArea requests and for anchors outside the three groups.
     /// </summary>
-    private AnchorCategory ResolveAnchorCategory(Vector3 destination, out string label)
+    private AnchorCategory ResolveAnchorCategory(Vector3 destination, out string label, out bool unexplored)
     {
         label = "";
+        unexplored = false;
         for (int attempt = 0; attempt < 2; attempt++)
         {
             if (anchorCache == null || attempt == 1) BuildAnchorCache();
@@ -386,6 +405,7 @@ public class GuardedTeleportationProvider : TeleportationProvider
             if (best >= 0)
             {
                 label = anchorCache[best].name + "/" + anchorCacheCategories[best];
+                unexplored = anchorCacheUnexplored[best];
                 return anchorCacheCategories[best];
             }
         }
@@ -396,8 +416,13 @@ public class GuardedTeleportationProvider : TeleportationProvider
     {
         anchorCache = FindObjectsOfType<TeleportationAnchor>(true);
         anchorCacheCategories = new AnchorCategory[anchorCache.Length];
+        anchorCacheUnexplored = new bool[anchorCache.Length];
+        string[] areaRoots = { gridRootName, organicRootName };
         for (int i = 0; i < anchorCache.Length; i++)
+        {
             anchorCacheCategories[i] = CategoryOf(anchorCache[i]);
+            anchorCacheUnexplored[i] = UnexploredTeleportAvailability.IsUnexplored(anchorCache[i].transform, unexploredGroupName, areaRoots);
+        }
     }
 
     private AnchorCategory CategoryOf(TeleportationAnchor anchor)

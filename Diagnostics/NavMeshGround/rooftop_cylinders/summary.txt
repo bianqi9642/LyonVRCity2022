@@ -1,0 +1,5 @@
+fresh in-memory bake done (groups activated in memory only, nothing saved)
+mesh objects scanned (incl. inactive): 4550; cylinder-like candidates (excluding city building / terrain / bridge meshes): 582; building meshes used for the roof test: 2028 (BATI_Discard excluded)
+Confirmed rooftop: 0 | Likely rooftop: 1 | Near a rooftop, not confirmed: 0 | Not on a rooftop: 581
+recommendations: Safe to delete visually=0 Review=1 Keep=581
+scan time 13.0 s; read-only, scene unchanged

@@ -98,6 +98,9 @@ public class ExplorationBoundary : MonoBehaviour
     [SerializeField] private bool containHeadPosition = true;
     [Tooltip("Corrected positions are placed this far (m) inside the area edge so the next frame is not outside again.")]
     [SerializeField] private float containmentRecoverInset = 0.1f;
+    [Tooltip("Safety cap (m): a containment correction larger than this is refused (and warned about once) instead of applied. " +
+             "Real corrections are centimetres to a couple of metres; a larger value means the area / head geometry is wrong, and teleporting the rig that far would throw the participant out of the map.")]
+    [SerializeField] private float maxContainmentShift = 30f;
 
     [Header("Part gating")]
     [Tooltip("Protection active only while the ExperimentManager part with this name runs. Matches the " +
@@ -363,6 +366,8 @@ public class ExplorationBoundary : MonoBehaviour
         wasOutside = true;
     }
 
+    private bool warnedShiftCap;
+
     // Horizontal shift that moves 'q' to just inside (by containmentRecoverInset) the nearest point of the area.
     private bool TryRecoverShift(Vector3 q, out Vector3 shift)
     {
@@ -372,7 +377,19 @@ public class ExplorationBoundary : MonoBehaviour
         float over = toIn.magnitude;
         if (over <= safetyCheckSkin) return false;           // within tolerance: leave it to the walls
         Vector2 target = new Vector2(closest.x, closest.z) + toIn / over * containmentRecoverInset;
-        shift = new Vector3(target.x - q.x, 0f, target.y - q.y);
+        // target is (x, z) packed in a Vector2, so its .y is the WORLD Z. The vertical component of q (q.y = height) must never be used here:
+        // an earlier revision subtracted q.y, which added (z - height) ~ 640-980 m to the rig whenever the head left the area (sessions 20261106T140500Z / T142958Z).
+        shift = new Vector3(target.x - q.x, 0f, target.y - q.z);
+        if (shift.sqrMagnitude > maxContainmentShift * maxContainmentShift)
+        {
+            if (!warnedShiftCap)
+            {
+                warnedShiftCap = true;
+                Debug.LogWarning($"[ExplorationBoundary] containment correction of {shift.magnitude:F1} m refused (cap {maxContainmentShift:F0} m); check the Exploration Area volumes. Position {q}.");
+            }
+            shift = Vector3.zero;
+            return false;
+        }
         return true;
     }
 

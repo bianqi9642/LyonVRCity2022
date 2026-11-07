@@ -1,0 +1,566 @@
+// InteractableHoverFeedback.cs
+//
+// Role
+// ----
+// Purely cosmetic, HOVER-ONLY interaction affordance for objects that are selected through the existing UGUI EventSystem pointer path (the same path that
+// delivers OnPointerClick to TargetSelectable). While a controller ray - or the mouse, in the Editor - is hovering the object's selectable Collider, this
+// component changes how the object's Renderer(s) look; the change is removed the instant the last pointer leaves.
+//
+// It intentionally does NOT provide: a persistent highlight, marker, arrow, icon, label, flashing/pulsing/animated effect, or any correct/incorrect
+// (green/red) distinction. It expresses nothing about the object's identity, its targetId, or whether it is the "correct" destination. The only message is:
+// "my controller ray is currently pointing at something that can respond to selection".
+//
+// Two hover looks (chosen per frame of events, never per frame of rendering)
+// -------------------------------------------------------------------------
+//   ENHANCED (Part 1 and Part 3 only, while the participant is allowed to select): a clearly visible amber OUTLINE around the whole building plus a
+//            moderate warm colour/brightness lift of its own textures (and an emission lift where the material really supports emission).
+//   LEGACY   (every other situation, e.g. Part 2 or the Editor without a running Part): the original subtle +hoverBrightness albedo lift - unchanged.
+//   NONE     (Part 1 / Part 3 running but the participant is locked - Start panel, Destination 2 panel, End panel, session end): the click would be ignored by
+//            TargetSelectable, so the building is not presented as selectable.
+// Which look applies is derived from the existing ExperimentManager state (RunningPartName + ParticipantControlEnabled) - no scene-name checks - and is
+// re-evaluated on the relevant ExperimentManager events, so a hover that is active while the phase changes is cleared or switched immediately.
+//
+// Integration
+// -----------
+// - Attach to the SAME GameObject as TargetSelectable. ExperimentManager.SetCandidateInteractable already enables/disables this component together with
+//   TargetSelectable, so only buildings that are currently valid targets can ever be hovered. It never references TargetSelectable and changes no
+//   experiment state; it only READS ExperimentManager (RunningPartName, ParticipantControlEnabled) and listens to its events.
+// - Hover detection reuses the existing interaction pipeline through IPointerEnterHandler / IPointerExitHandler (TrackedDevicePhysicsRaycaster /
+//   PhysicsRaycaster hit a child collider -> the event bubbles to this handler -> the WHOLE building, i.e. every Renderer below this object, is highlighted).
+//   Left + right controller rays (and the Editor mouse) are tracked by pointer id, so the highlight clears only when the LAST pointer leaves.
+//
+// Rendering (verified against the project: URP 14.0.11, every BATI building material is URP/Lit with the _EMISSION keyword OFF)
+// ---------------------------------------------------------------------------------------------------------------------------
+// - Colour lift: MaterialPropertyBlock on '_BaseColor' (multiplicative, so texture detail is kept). No .mat asset and no shared material is ever modified.
+//   The block present before the hover is saved per Renderer and restored exactly on exit (a Renderer that had no block gets none back, so it returns to
+//   the SRP Batcher path).
+// - Emission: '_EmissionColor' is written ONLY for materials whose _EMISSION keyword is enabled (a MaterialPropertyBlock cannot enable it); here it is a
+//   no-op for the current buildings and is reported honestly in the debug log instead of being assumed to work.
+// - Outline: one disabled child MeshRenderer ('__HoverOutline') per MeshRenderer, created lazily on the first enhanced hover, sharing the building's mesh
+//   and drawing it with the shared "Hidden/Lyon/TargetHoverOutline" material (inverted hull, see the shader). It is only ENABLED while hovered. One shared
+//   runtime Material for all buildings; colour/width are per-outline MaterialPropertyBlock values. No post-processing, no extra camera, no stencil.
+//
+// Performance
+// -----------
+// - Event-driven only; no Update()/LateUpdate(). Allocation happens once (blocks per Renderer at Awake, outline objects at the first enhanced hover).
+//   Hover apply/restore afterwards allocates nothing. Cost while hovered: one extra draw per submesh of the hovered building.
+//
+// All comments in English per project convention.
+
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.EventSystems;
+
+[DisallowMultipleComponent]
+public class InteractableHoverFeedback : MonoBehaviour, IPointerEnterHandler, IPointerExitHandler
+{
+    [Header("Renderers affected by the hover feedback")]
+    [Tooltip("Renderers that change while this object is hovered. Leave EMPTY to auto-collect every " +
+             "Renderer on this GameObject and its children at Awake. Populate explicitly to restrict the " +
+             "effect to a subset (useful when real building geometry replaces the current test proxy).")]
+    [SerializeField] private Renderer[] targetRenderers;
+
+    [Tooltip("When auto-collecting (list left empty), also include Renderers on inactive child GameObjects.")]
+    [SerializeField] private bool includeInactiveRenderers = true;
+
+    [Header("Legacy feedback strength (used outside Part 1 / Part 3, unchanged)")]
+    [Tooltip("Colour property overridden on the material while hovered. URP Lit uses '_BaseColor'. " +
+             "If the material lacks this property, the component falls back to '_Color' (built-in / Standard). " +
+             "If neither exists, that Renderer is skipped and a warning is logged when debug logs are on.")]
+    [SerializeField] private string colorProperty = "_BaseColor";
+
+    [Tooltip("Fractional brightness increase applied to the base colour on hover (0.12 = +12%). " +
+             "Keep this small: noticeable when the ray is on the object, but not a glow from a distance.")]
+    [Range(0f, 0.5f)]
+    [SerializeField] private float hoverBrightness = 0.30f;
+
+    [Header("Enhanced hover (Part 1 and Part 3)")]
+    [Tooltip("Master switch of the enhanced look (outline + warm colour lift). False = every hover uses the legacy brightness lift, as before this feature.")]
+    [SerializeField] private bool enhancedHover = true;
+
+    [Tooltip("Use the enhanced look while Part 1 is running.")]
+    [SerializeField] private bool enhanceInPart1 = true;
+
+    [Tooltip("Use the enhanced look while Part 3 is running.")]
+    [SerializeField] private bool enhanceInPart3 = true;
+
+    [Tooltip("Show the enhanced look only while participant control is enabled (selection is accepted). While locked in Part 1 / Part 3 (Start panel, Destination 2 panel, " +
+             "End panel, session end) no hover look is shown, because a click would be ignored.")]
+    [SerializeField] private bool requireParticipantControl = true;
+
+    [Header("Enhanced hover - outline")]
+    [Tooltip("Outline colour. Warm amber contrasts with both the light stone and the dark roof/window textures of the Lyon model.")]
+    [SerializeField] private Color outlineColor = new Color(1.0f, 0.72f, 0.10f, 1f);
+
+    [Tooltip("Outline thickness: world-space extrusion per metre of camera distance, so the on-screen thickness stays roughly constant (0.004 is about 3 pixels in a Quest eye buffer). " +
+             "0 disables the outline (colour lift only). Raise for a thicker outline, lower for a thinner one.")]
+    [Range(0f, 0.02f)]
+    [SerializeField] private float outlineWidth = 0.004f;
+
+    [Tooltip("Lower clamp of the outline thickness in metres (keeps it visible when the participant stands close to the building).")]
+    [Range(0f, 0.5f)]
+    [SerializeField] private float outlineMinWidthMeters = 0.03f;
+
+    [Tooltip("Upper clamp of the outline thickness in metres (stops a distant building from getting a fat outline).")]
+    [Range(0.05f, 3f)]
+    [SerializeField] private float outlineMaxWidthMeters = 0.6f;
+
+    [Header("Enhanced hover - colour / emission lift")]
+    [Tooltip("Warm tint multiplied into the building's own colour/texture while hovered (multiplicative, so texture detail is preserved).")]
+    [SerializeField] private Color hoverTint = new Color(1.0f, 0.86f, 0.58f, 1f);
+
+    [Tooltip("How much of the tint is applied (0 = none, 1 = full tint). Moderate values keep the building realistic.")]
+    [Range(0f, 1f)]
+    [SerializeField] private float hoverTintStrength = 0.35f;
+
+    [Tooltip("Fractional brightness increase applied together with the tint (0.25 = +25%). Keep it moderate to avoid washing out the facade or an uncomfortable glare in VR.")]
+    [Range(0f, 0.8f)]
+    [SerializeField] private float enhancedBrightness = 0.25f;
+
+    [Tooltip("Emission lift (amber) added ONLY where the material's _EMISSION keyword is enabled. The current BATI materials have it disabled, so this has no effect on them " +
+             "(a MaterialPropertyBlock cannot enable the keyword and no shared material is edited).")]
+    [Range(0f, 2f)]
+    [SerializeField] private float emissionIntensity = 0.35f;
+
+    [Header("References (explicit slot -> auto-find)")]
+    [Tooltip("ExperimentManager that supplies the running Part and the participant-control state (read-only). Leave empty to find it automatically; " +
+             "with none present (plain Editor scene) only the legacy hover look is used.")]
+    [SerializeField] private ExperimentManager experimentManager;
+
+    [Header("Debug")]
+    [Tooltip("Log setup and hover on/off transitions. Never logs per-frame or per-sample data.")]
+    [SerializeField] private bool enableDebugLogs = false;
+
+    // ---- shader / property ids ----
+    private const string OutlineShaderName = "Hidden/Lyon/TargetHoverOutline";
+    private const string OutlineObjectName = "__HoverOutline";
+    private static readonly int OutlineColorId = Shader.PropertyToID("_OutlineColor");
+    private static readonly int OutlineWidthId = Shader.PropertyToID("_OutlineWidth");
+    private static readonly int OutlineMinWidthId = Shader.PropertyToID("_OutlineMinWidth");
+    private static readonly int OutlineMaxWidthId = Shader.PropertyToID("_OutlineMaxWidth");
+    private static readonly int EmissionColorId = Shader.PropertyToID("_EmissionColor");
+
+    // One shared runtime material for every hovered building (colour / width come from per-outline property blocks). Never serialized, never saved.
+    private static Material sharedOutlineMaterial;
+    private static bool outlineShaderWarned;
+
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+    private static void ResetStatics()
+    {
+        if (sharedOutlineMaterial != null) Destroy(sharedOutlineMaterial);
+        sharedOutlineMaterial = null;
+        outlineShaderWarned = false;
+    }
+
+    private static Material GetOutlineMaterial()
+    {
+        if (sharedOutlineMaterial != null) return sharedOutlineMaterial;
+        Shader shader = Shader.Find(OutlineShaderName);
+        if (shader == null || !shader.isSupported)
+        {
+            if (!outlineShaderWarned)
+            {
+                outlineShaderWarned = true;
+                Debug.LogWarning("[InteractableHoverFeedback] Outline shader '" + OutlineShaderName + "' was not found or is unsupported; the enhanced hover shows the colour lift only.");
+            }
+            return null;
+        }
+        sharedOutlineMaterial = new Material(shader) { name = "TargetHoverOutline (runtime)", hideFlags = HideFlags.HideAndDontSave, enableInstancing = true };
+        return sharedOutlineMaterial;
+    }
+
+    // Cached per-Renderer state so hover apply/restore never allocates and never touches a shared material.
+    private sealed class RendererState
+    {
+        public Renderer Renderer;
+        public MaterialPropertyBlock Block;      // working block
+        public MaterialPropertyBlock Saved;      // the block the Renderer carried before the hover (valid when HadBlock)
+        public bool HadBlock;
+        public int PropertyId;
+        public Color OriginalColor;
+        public bool Supported;
+        public bool EmissionSupported;           // material really has _EMISSION enabled
+        public Color OriginalEmission;
+        public MeshRenderer Outline;             // lazily created child outline renderer (disabled unless hovered)
+    }
+
+    private enum HoverMode { None, Legacy, Enhanced }
+
+    private readonly List<RendererState> states = new List<RendererState>();
+
+    // Distinct pointer ids (left ray, right ray, mouse, ...) currently hovering this object.
+    private readonly HashSet<int> hoveringPointerIds = new HashSet<int>();
+
+    private HoverMode appliedMode = HoverMode.None;
+    private bool subscribed;
+    private bool outlinesBuilt;
+
+    private void Awake()
+    {
+        ResolveRenderers();
+        BuildRendererStates();
+    }
+
+    private void OnEnable()
+    {
+        Subscribe();
+    }
+
+    // --- Setup -------------------------------------------------------------------------------------
+
+    private void ResolveRenderers()
+    {
+        // Explicit inspector list wins.
+        if (targetRenderers != null && targetRenderers.Length > 0)
+        {
+            return;
+        }
+
+        // Otherwise auto-collect from this GameObject and its children (future building geometry may be nested).
+        Renderer[] all = GetComponentsInChildren<Renderer>(includeInactiveRenderers);
+        List<Renderer> list = new List<Renderer>(all.Length);
+        for (int i = 0; i < all.Length; i++)
+        {
+            if (all[i] != null && all[i].gameObject.name != OutlineObjectName) list.Add(all[i]);   // never treat an outline helper as part of the building
+        }
+        targetRenderers = list.ToArray();
+
+        if (targetRenderers.Length == 0 && enableDebugLogs)
+        {
+            Debug.LogWarning($"[InteractableHoverFeedback] No Renderer found on '{name}' or its children; " +
+                             "hover feedback will do nothing.", this);
+        }
+    }
+
+    private void BuildRendererStates()
+    {
+        states.Clear();
+
+        if (targetRenderers == null)
+        {
+            return;
+        }
+
+        int preferredId = Shader.PropertyToID(string.IsNullOrEmpty(colorProperty) ? "_BaseColor" : colorProperty);
+        int fallbackId = Shader.PropertyToID("_Color");
+
+        foreach (Renderer r in targetRenderers)
+        {
+            if (r == null)
+            {
+                continue;
+            }
+
+            RendererState state = new RendererState
+            {
+                Renderer = r,
+                Block = new MaterialPropertyBlock(),
+                Saved = new MaterialPropertyBlock(),
+                Supported = false
+            };
+
+            // sharedMaterial is read-only access here and does NOT instantiate a material.
+            Material mat = r.sharedMaterial;
+            if (mat != null)
+            {
+                if (mat.HasProperty(preferredId))
+                {
+                    state.PropertyId = preferredId;
+                    state.OriginalColor = mat.GetColor(preferredId);
+                    state.Supported = true;
+                }
+                else if (mat.HasProperty(fallbackId))
+                {
+                    state.PropertyId = fallbackId;
+                    state.OriginalColor = mat.GetColor(fallbackId);
+                    state.Supported = true;
+                }
+
+                // Emission only counts when the material really renders it: a property block cannot switch the keyword on.
+                if (mat.HasProperty(EmissionColorId) && mat.IsKeywordEnabled("_EMISSION"))
+                {
+                    state.EmissionSupported = true;
+                    state.OriginalEmission = mat.GetColor(EmissionColorId);
+                }
+            }
+
+            if (!state.Supported && enableDebugLogs)
+            {
+                Debug.LogWarning($"[InteractableHoverFeedback] Renderer '{r.name}' material has neither " +
+                                 $"'{colorProperty}' nor '_Color'; it will not react to the colour lift.", this);
+            }
+
+            states.Add(state);
+        }
+    }
+
+    // --- ExperimentManager state (READ-ONLY) ---------------------------------------------------------
+
+    private void Subscribe()
+    {
+        if (subscribed) return;
+        if (experimentManager == null) experimentManager = FindObjectOfType<ExperimentManager>();
+        if (experimentManager == null) return;   // no experiment (plain Editor scene): legacy look only
+        experimentManager.OnParticipantControlChanged += OnControlChanged;
+        experimentManager.OnExperimentEvent += OnExperimentEvent;
+        experimentManager.OnSessionEnded += OnSessionEnded;
+        subscribed = true;
+    }
+
+    private void Unsubscribe()
+    {
+        if (!subscribed) return;
+        subscribed = false;
+        if (experimentManager == null) return;
+        experimentManager.OnParticipantControlChanged -= OnControlChanged;
+        experimentManager.OnExperimentEvent -= OnExperimentEvent;
+        experimentManager.OnSessionEnded -= OnSessionEnded;
+    }
+
+    private void OnControlChanged(bool _) { RefreshHover(); }
+    private void OnSessionEnded() { RefreshHover(); }
+    private void OnExperimentEvent(ExperimentEventInfo e)
+    {
+        if (e.type == "part_start" || e.type == "part_end") RefreshHover();
+    }
+
+    // The look that applies right now, from the existing experiment state. Never uses scene names.
+    private HoverMode DesiredMode()
+    {
+        if (hoveringPointerIds.Count == 0) return HoverMode.None;
+        if (!enhancedHover || experimentManager == null) return HoverMode.Legacy;
+
+        string part = experimentManager.RunningPartName;
+        bool enhancedPart = (part == "Part1" && enhanceInPart1) || (part == "Part3" && enhanceInPart3);
+        if (!enhancedPart) return HoverMode.Legacy;   // Part 2, or no Part running (Editor): the previous behaviour
+
+        if (requireParticipantControl && !experimentManager.ParticipantControlEnabled) return HoverMode.None;
+        return HoverMode.Enhanced;
+    }
+
+    // Makes the applied look match the desired one (apply / switch / clear). Idempotent.
+    private void RefreshHover()
+    {
+        HoverMode desired = DesiredMode();
+        if (desired == appliedMode) return;
+        if (appliedMode != HoverMode.None) RestoreAppearance();
+        if (desired != HoverMode.None) ApplyAppearance(desired);
+    }
+
+    // --- EventSystem hover callbacks (same pipeline that delivers OnPointerClick to TargetSelectable) ---
+
+    public void OnPointerEnter(PointerEventData eventData)
+    {
+        if (eventData == null)
+        {
+            return;
+        }
+
+        // Add() is idempotent, so a duplicate enter without an exit cannot double-apply.
+        hoveringPointerIds.Add(eventData.pointerId);
+        RefreshHover();
+    }
+
+    public void OnPointerExit(PointerEventData eventData)
+    {
+        if (eventData == null)
+        {
+            return;
+        }
+
+        // Only clear once the LAST hovering pointer has left (DesiredMode is None when the set is empty).
+        hoveringPointerIds.Remove(eventData.pointerId);
+        RefreshHover();
+    }
+
+    // --- Visual apply / restore ------------------------------------------------------------------
+
+    private void ApplyAppearance(HoverMode mode)
+    {
+        appliedMode = mode;
+        bool enhanced = mode == HoverMode.Enhanced;
+
+        Color tint = Color.Lerp(Color.white, hoverTint, hoverTintStrength);
+        float k = 1f + (enhanced ? enhancedBrightness : hoverBrightness);
+
+        if (enhanced) EnsureOutlines();
+
+        for (int i = 0; i < states.Count; i++)
+        {
+            RendererState s = states[i];
+            if (s.Renderer == null)
+            {
+                continue;
+            }
+
+            if (s.Supported)
+            {
+                Color c = s.OriginalColor;
+                Color hover = enhanced
+                    ? new Color(c.r * tint.r * k, c.g * tint.g * k, c.b * tint.b * k, c.a)
+                    : new Color(c.r * k, c.g * k, c.b * k, c.a);
+
+                // Remember what the Renderer carried before (so the exit restores it exactly), then override only our keys on top of it.
+                s.HadBlock = s.Renderer.HasPropertyBlock();
+                if (s.HadBlock) s.Renderer.GetPropertyBlock(s.Saved);
+                s.Renderer.GetPropertyBlock(s.Block);
+                s.Block.SetColor(s.PropertyId, hover);
+                if (enhanced && s.EmissionSupported && emissionIntensity > 0f)
+                {
+                    Color e = s.OriginalEmission + new Color(1.0f, 0.62f, 0.12f, 1f) * emissionIntensity;
+                    s.Block.SetColor(EmissionColorId, e);
+                }
+                s.Renderer.SetPropertyBlock(s.Block);
+            }
+            else
+            {
+                s.HadBlock = false;
+            }
+
+            if (s.Outline != null)
+            {
+                ConfigureOutlineBlock(s.Outline);
+                s.Outline.enabled = enhanced && outlineWidth > 0f && s.Renderer.enabled && s.Renderer.gameObject.activeInHierarchy;
+            }
+        }
+
+        if (enableDebugLogs)
+        {
+            Debug.Log($"[InteractableHoverFeedback] Hover ON  ('{name}', mode {mode}, {hoveringPointerIds.Count} pointer(s)).", this);
+        }
+    }
+
+    private void RestoreAppearance()
+    {
+        HoverMode was = appliedMode;
+        appliedMode = HoverMode.None;
+
+        for (int i = 0; i < states.Count; i++)
+        {
+            RendererState s = states[i];
+            if (s.Outline != null) s.Outline.enabled = false;
+            if (!s.Supported || s.Renderer == null)
+            {
+                continue;
+            }
+
+            // Back to exactly what the Renderer carried before the hover: its old block, or no block at all (SRP Batcher path again).
+            s.Renderer.SetPropertyBlock(s.HadBlock ? s.Saved : null);
+            s.HadBlock = false;
+        }
+
+        if (enableDebugLogs)
+        {
+            Debug.Log($"[InteractableHoverFeedback] Hover OFF ('{name}', was {was}).", this);
+        }
+    }
+
+    // --- Outline helpers ---------------------------------------------------------------------------
+
+    // Creates the disabled outline child renderers once (first enhanced hover). Skinned / mesh-less renderers get none.
+    private void EnsureOutlines()
+    {
+        if (outlinesBuilt) return;
+        outlinesBuilt = true;
+
+        Material outlineMaterial = GetOutlineMaterial();
+        if (outlineMaterial == null) return;
+
+        for (int i = 0; i < states.Count; i++)
+        {
+            RendererState s = states[i];
+            MeshRenderer src = s.Renderer as MeshRenderer;
+            if (src == null) continue;
+            MeshFilter mf = src.GetComponent<MeshFilter>();
+            if (mf == null || mf.sharedMesh == null) continue;
+
+            GameObject go = new GameObject(OutlineObjectName);
+            go.layer = src.gameObject.layer;
+            go.hideFlags = HideFlags.DontSave;
+            Transform t = go.transform;
+            t.SetParent(src.transform, false);   // identity local transform: the outline mesh sits exactly on the building mesh
+
+            MeshFilter omf = go.AddComponent<MeshFilter>();
+            omf.sharedMesh = mf.sharedMesh;
+
+            MeshRenderer mr = go.AddComponent<MeshRenderer>();
+            int subMeshes = Mathf.Max(1, mf.sharedMesh.subMeshCount);
+            Material[] mats = new Material[subMeshes];
+            for (int m = 0; m < subMeshes; m++) mats[m] = outlineMaterial;
+            mr.sharedMaterials = mats;
+            mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            mr.receiveShadows = false;
+            mr.lightProbeUsage = UnityEngine.Rendering.LightProbeUsage.Off;
+            mr.reflectionProbeUsage = UnityEngine.Rendering.ReflectionProbeUsage.Off;
+            mr.motionVectorGenerationMode = MotionVectorGenerationMode.ForceNoMotion;
+            mr.renderingLayerMask = src.renderingLayerMask;
+            mr.allowOcclusionWhenDynamic = src.allowOcclusionWhenDynamic;
+            mr.enabled = false;   // only enabled while hovered
+            s.Outline = mr;
+        }
+    }
+
+    private void ConfigureOutlineBlock(MeshRenderer outline)
+    {
+        MaterialPropertyBlock b = outlinePropertyBlock ?? (outlinePropertyBlock = new MaterialPropertyBlock());
+        b.SetColor(OutlineColorId, outlineColor);
+        b.SetFloat(OutlineWidthId, outlineWidth);
+        b.SetFloat(OutlineMinWidthId, outlineMinWidthMeters);
+        b.SetFloat(OutlineMaxWidthId, Mathf.Max(outlineMaxWidthMeters, outlineMinWidthMeters));
+        outline.SetPropertyBlock(b);
+    }
+
+    private MaterialPropertyBlock outlinePropertyBlock;
+
+    private void DestroyOutlines()
+    {
+        for (int i = 0; i < states.Count; i++)
+        {
+            RendererState s = states[i];
+            if (s.Outline != null) Destroy(s.Outline.gameObject);
+            s.Outline = null;
+        }
+        outlinesBuilt = false;
+    }
+
+    // --- Safety cleanup -------------------------------------------------------------------------
+
+    private void OnDisable()
+    {
+        // The object can be disabled mid-hover (e.g. ExperimentManager toggling targets between phases).
+        // Drop all pointer state and guarantee the original appearance is restored.
+        Unsubscribe();
+        hoveringPointerIds.Clear();
+
+        if (appliedMode != HoverMode.None)
+        {
+            RestoreAppearance();
+        }
+    }
+
+    private void OnDestroy()
+    {
+        // Safety net: restore before the Renderer is torn down if we are destroyed while hovered, and remove the outline helpers.
+        Unsubscribe();
+        if (appliedMode != HoverMode.None)
+        {
+            RestoreAppearance();
+        }
+        DestroyOutlines();
+    }
+
+#if UNITY_EDITOR
+    // Keeps the auto-collected renderer list fresh while editing in the Editor; no runtime effect.
+    private void OnValidate()
+    {
+        if (hoverBrightness < 0f)
+        {
+            hoverBrightness = 0f;
+        }
+        if (outlineMaxWidthMeters < outlineMinWidthMeters)
+        {
+            outlineMaxWidthMeters = outlineMinWidthMeters;
+        }
+    }
+#endif
+}

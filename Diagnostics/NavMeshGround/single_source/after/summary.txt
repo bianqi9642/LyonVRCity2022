@@ -1,0 +1,55 @@
+scene=Assets/Scenes/LyonVRVity35.unity time=2026-11-07T15:17:03  (in-memory activation only; nothing saved; no modifier touched)
+== NavMeshModifier components (state as saved) ==
+ENABLED  BATI_Discard | ignoreFromBuild=False overrideArea=True area=1 applyToChildren=True
+ENABLED  Grid Area/3EME | ignoreFromBuild=False overrideArea=True area=1 applyToChildren=True
+ENABLED  Grid Area/3EMEPeripheral | ignoreFromBuild=False overrideArea=True area=1 applyToChildren=True
+ENABLED  Grid Area/6EMEPeripheral | ignoreFromBuild=False overrideArea=True area=1 applyToChildren=True
+DISABLED Grid Area/TIN_Textured | ignoreFromBuild=True overrideArea=False area=0 applyToChildren=True
+ENABLED  Organic Area/5EME | ignoreFromBuild=False overrideArea=True area=1 applyToChildren=True
+ENABLED  Organic Area/5EMEPeripheral | ignoreFromBuild=False overrideArea=True area=1 applyToChildren=True
+DISABLED Organic Area/TIN_Textured | ignoreFromBuild=True overrideArea=False area=0 applyToChildren=True
+DISABLED Organic Area/TIN_Textured/SouthRiver_TIN_GapPatch | ignoreFromBuild=True overrideArea=False area=0 applyToChildren=True
+ENABLED  Practice Area/2EME | ignoreFromBuild=False overrideArea=True area=1 applyToChildren=True
+DISABLED Practice Area/gml_198275d7-1842-4ff1-abc3-123f14b587d4 | ignoreFromBuild=True overrideArea=False area=0 applyToChildren=True
+DISABLED Practice Area/gml_38179d6d-9886-48a9-9634-4e5eb1016a06 | ignoreFromBuild=True overrideArea=False area=0 applyToChildren=True
+DISABLED Practice Area/gml_8bf87428-0e6e-485c-894d-eebcb42a5e76 | ignoreFromBuild=True overrideArea=False area=0 applyToChildren=True
+DISABLED Practice Area/gml_9fb11684-5d01-442f-8e2a-781b88d720b7 | ignoreFromBuild=True overrideArea=False area=0 applyToChildren=True
+DISABLED Practice Area/gml_ca89eda0-46ef-4c3b-8e69-8b65157d50ea | ignoreFromBuild=True overrideArea=False area=0 applyToChildren=True
+DISABLED Practice Area/gml_dd4fd483-1c11-4e3b-9b11-02d15babedd8 | ignoreFromBuild=True overrideArea=False area=0 applyToChildren=True
+ENABLED  XR Interaction Setup | ignoreFromBuild=True overrideArea=False area=0 applyToChildren=True
+modifiers total=17 disabled=9 enabled=8
+== saved NavMeshData (Assets/Scenes/LyonVRVity35/NavMesh-NavMesh_RepairedTIN.asset) ==
+  PONT: polygons=122 area=13213 m2, elevated(roof)=0
+  Practice: polygons=15433 area=777342 m2, elevated(roof)=0
+  Organic: polygons=30402 area=975326 m2, elevated(roof)=11
+  Grid: polygons=18825 area=876459 m2, elevated(roof)=0
+  Other: polygons=144 area=62 m2, elevated(roof)=0
+== FRESH bake with the modifiers as saved (12 s, in memory) ==
+  PONT: polygons=122 area=13213 m2, elevated(roof)=0
+  Practice: polygons=16688 area=777168 m2, elevated(roof)=0
+  Organic: polygons=30425 area=975322 m2, elevated(roof)=11
+  Grid: polygons=18825 area=876459 m2, elevated(roof)=0
+  Other: polygons=143 area=62 m2, elevated(roof)=0
+== source collection (modifiers as saved) vs fresh-bake polygons ==
+| Region | visual TIN sources (tris) | repaired sources (tris) | bridge sources (tris) | building sources (walkable) | other sources | polygons saved asset | polygons fresh bake | roof polygons saved / fresh |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| PONT | 0 (0) | 0 (0) | 7 (68) | 0 (0) | 0 | 122 | 122 | 0 / 0 |
+| Practice | 0 (0) | 6 (35010) | 0 (0) | 574 (0) | 0 | 15433 | 16688 | 0 / 0 |
+| Organic | 0 (0) | 6 (153773) | 0 (0) | 629 (0) | 0 | 30402 | 30425 | 11 / 11 |
+| Grid | 0 (0) | 8 (46879) | 0 (0) | 825 (0) | 0 | 18825 | 18825 | 0 / 0 |
+| Other | 0 (0) | 0 (0) | 0 (0) | 0 (0) | 576 | 144 | 143 | 0 / 0 |
+TOTAL building sources walkable=0; elevated (roof) polygons fresh=11; saved=11
+== sampled coverage (TIN footprint 2 m grid; bridge decks 1 m grid) ==
+coverage saved: Grid Area navPresent=185862/188108 (98.81%, excl. wall-edge band 99.77%); Organic Area navPresent=212424/217315 (97.75%, excl. wall-edge band 98.34%); Practice Area navPresent=177796/179757 (98.91%, excl. wall-edge band 99.52%); PONT decks navPresent=7172/7406 (96.84%); physical-ground-missing=0; candidate-hole samples=4865
+  [saved] connectivity within_grid: PathComplete 35/40
+  [saved] connectivity within_organic: PathComplete 35/40
+  [saved] connectivity grid_to_organic: PathComplete 29/40
+  [saved] connectivity start_anchors: PathComplete 21/28
+  [saved] D6 NPC route points (EnvironmentConfig/Npc/**) with NavMesh within 0.5 m: 944/987
+coverage fresh: Grid Area navPresent=185862/188108 (98.81%, excl. wall-edge band 99.77%); Organic Area navPresent=212421/217315 (97.75%, excl. wall-edge band 98.34%); Practice Area navPresent=177760/179757 (98.89%, excl. wall-edge band 99.51%); PONT decks navPresent=7172/7406 (96.84%); physical-ground-missing=0; candidate-hole samples=4899
+  [fresh] connectivity within_grid: PathComplete 35/40
+  [fresh] connectivity within_organic: PathComplete 35/40
+  [fresh] connectivity grid_to_organic: PathComplete 29/40
+  [fresh] connectivity start_anchors: PathComplete 21/28
+  [fresh] D6 NPC route points (EnvironmentConfig/Npc/**) with NavMesh within 0.5 m: 944/987
+modifier enabled-states unchanged by this report: True

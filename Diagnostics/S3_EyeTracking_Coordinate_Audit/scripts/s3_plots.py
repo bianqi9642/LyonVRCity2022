@@ -1,0 +1,30 @@
+import os, json, warnings
+warnings.filterwarnings('ignore')
+import numpy as np, matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
+OUT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')); A = np.load(OUT + '/_arrays.npz', allow_pickle=True); R = json.load(open(OUT + '/s3_results.json'))
+t = A['t']; P = OUT + '/plots/'; os.makedirs(P, exist_ok=True); TR = R['candidate_transitions_rise_gt_0.15m_vs_session_median']
+def shade(ax):
+    for k, T in enumerate(TR): ax.axvspan(T['start_t'], T['end_t'] + 0.3, color='orange', alpha=0.25, lw=0, label='candidate vertical rise (>0.15 m above session median)' if k == 0 else None)
+def done(fig, name, title): fig.suptitle(title + '\nS3 20261106T145652Z_0980aa930c32 - orange = candidate vertical-rise periods (NOT confirmed sitting/standing)', fontsize=9); fig.tight_layout(); fig.savefig(P + name, dpi=110); plt.close(fig)
+CAM = 1.36144
+fig, ax = plt.subplots(2, 1, figsize=(13, 6), sharex=True); ax[0].plot(t, A['hmd'][:, 1], lw=0.7); ax[0].set_ylabel('hmd_world_y (m)'); ax[1].plot(t, A['hh'], lw=0.7, color='C1'); ax[1].set_ylabel('hmd_height_above_ground (m)'); [shade(a) for a in ax]; ax[1].set_xlabel('t_abs (s)'); ax[0].legend(fontsize=7)
+done(fig, '01_hmd_vertical_position.png', '1 HMD vertical position (world Y = terrain + XR Origin; ground-relative = world Y - ground_y)')
+fig, ax = plt.subplots(2, 1, figsize=(13, 6), sharex=True); ax[0].plot(t, A['rawY'], lw=0.8, label='OVRPlugin eye position Y (eye-level tracking space = head height relative to the recentre point), mean of both eyes'); ax[0].plot(t, A['hh'] - CAM, lw=0.6, alpha=0.7, label='hmd_height_above_ground - 1.36144 (world-side)'); ax[0].legend(fontsize=7); ax[0].set_ylabel('m'); ax[0].axhline(0, color='gray', lw=0.5)
+ax[1].plot(t, A['hh'] - CAM - A['rawY'], lw=0.6, color='C3'); ax[1].set_ylabel('difference (m) = rig base above ground'); ax[1].set_ylim(-0.3, 0.3); [shade(a) for a in ax]; ax[1].set_xlabel('t_abs (s)')
+done(fig, '02_hmd_local_vs_world_vertical.png', '2 HMD local (tracking-space) vs world vertical: world = base + 1.36144 + local, difference ~ 0')
+fig, ax = plt.subplots(figsize=(13, 4)); ax.plot(t, A['Co'][:, 1] - 0, lw=0.6, label='combined gaze-origin world Y'); ax.plot(t, A['hmd'][:, 1], lw=0.6, alpha=0.6, label='HMD world Y'); shade(ax); ax.legend(fontsize=7); ax.set_ylabel('m (world Y)'); ax.set_xlabel('t_abs (s)')
+done(fig, '03_gaze_origin_vertical_position.png', '3 Gaze-origin vertical position (world Y) over time with HMD')
+fig, ax = plt.subplots(figsize=(13, 4)); oh = A['off_h']; ax.plot(t, oh[:, 1] * 100, lw=0.6, color='C3', label='vertical offset in head frame'); mx = A['origin_mixed']; ax.plot(t[mx], oh[mx, 1] * 100, 'k.', ms=3, label='origin coherence > 3 cm (mixed-frame rows)'); sf = A['src']; ax.plot(t[sf], oh[sf, 1] * 100, 'b.', ms=3, label='origin replaced by eye anchor'); shade(ax); ax.set_ylabel('cm'); ax.legend(fontsize=7); ax.set_xlabel('t_abs (s)')
+done(fig, '04_gaze_origin_relative_to_hmd.png', '4 Gaze origin relative to HMD (combined origin - HMD), vertical component in the HMD frame')
+fig, ax = plt.subplots(3, 1, figsize=(13, 8), sharex=True)
+for k, nm in enumerate(['lateral (+right)', 'vertical (+up)', 'forward']): ax[k].plot(t, oh[:, k] * 100, lw=0.5); ax[k].set_ylabel(nm + ' (cm)'); shade(ax[k])
+ax[2].set_xlabel('t_abs (s)'); done(fig, '05_gaze_origin_offset_components.png', '5 Components of (combined gaze origin - HMD) in the HMD frame (inverse of hmd_world_rot applied)')
+fig, ax = plt.subplots(3, 1, figsize=(13, 8), sharex=True); ax[0].plot(t, A['gv'], lw=0.6); ax[0].set_ylabel('gaze vs HMD forward (deg), world frame'); ax[1].plot(t, A['el_h'], lw=0.6, label='recorded gaze (rotated into head frame)'); ax[1].plot(t, A['pel'], lw=0.6, alpha=0.7, label='provider left head-space direction (SDK conversion)'); ax[1].set_ylabel('gaze elevation in head frame (deg)'); ax[1].legend(fontsize=7); ax[2].plot(t, A['pitch'], lw=0.6, color='C2'); ax[2].set_ylabel('head pitch (+ up, deg)')
+[shade(a) for a in ax]; ax[2].set_xlabel('t_abs (s)'); done(fig, '06_gaze_vs_head_forward_angle.png', '6 Gaze direction vs HMD forward (both world frame) and gaze elevation in the head frame')
+fig, ax = plt.subplots(4, 1, figsize=(13, 8), sharex=True); ax[0].plot(t, np.ones_like(t) * 0, lw=0); ax[0].fill_between(t, 0, 1, where=np.ones_like(t, bool), color='tab:red', alpha=0.4); ax[0].set_yticks([]); ax[0].set_ylabel('recorded eye_tracking_state\n(start_failed on 100 %)', fontsize=7)
+ax[1].plot(t, A['rawL'].astype(int) + A['rawR'].astype(int), '.', ms=2); ax[1].set_ylabel('eyes with raw provider\nIsValid evidence (0-2)', fontsize=7); ax[2].plot(t, A['src'].astype(int), '.', ms=2, color='b'); ax[2].set_ylabel('origin = eye-anchor\nfallback (0/1)', fontsize=7); ax[3].plot(t, A['origin_mixed'].astype(int), '.', ms=2, color='k'); ax[3].set_ylabel('origin coherence > 3 cm\n(mixed-frame, 0/1)', fontsize=7)
+[shade(a) for a in ax]; ax[3].set_xlabel('t_abs (s)'); done(fig, '07_provider_validity_and_fallback_state.png', '7 Provider validity evidence and fallback state over time')
+fig, ax = plt.subplots(1, 3, figsize=(15, 4)); ax[0].plot(t[1:], A['dt'], lw=0.5); ax[0].set_ylabel('row interval (s)'); ax[0].set_xlabel('t_abs'); ax[1].hist(A['dt'], bins=60); ax[1].set_xlabel('interval (s)'); ax[1].axvline(0.05, color='r', ls=':', label='nominal 0.05 s'); ax[1].legend(fontsize=7)
+ax[2].plot(A['dt'], A['ptd'], '.', ms=2); ax[2].plot([0.2, 0.5], [0.2, 0.5], 'k:', lw=0.8); ax[2].set_xlabel('row interval (s)'); ax[2].set_ylabel('provider sample interval (s)')
+fig.suptitle('8 Sampling intervals: %.2f Hz; frame_index step = 1 on every row (one row per Unity frame); provider timestamp advances on every row' % (3096 / (t[-1] - t[0])), fontsize=9); fig.tight_layout(); fig.savefig(P + '08_sampling_intervals.png', dpi=110); plt.close(fig)
+print(os.listdir(P))

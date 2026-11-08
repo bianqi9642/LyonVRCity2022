@@ -261,6 +261,8 @@ public class GazeRecorder : MonoBehaviour
     // ---- acquisition evidence (schema v8) ----
     /// <summary>Eye samples whose confidence passed the threshold but whose provider flag said invalid (stale confidence) - recorded as invalid.</summary>
     public long RowsStaleConfidenceRejected { get; private set; }
+    /// <summary>Rows whose real OVREyeGaze reading was rejected because provider validity was neither readable from the same-row raw provider read nor from the lifecycle probe.</summary>
+    public long RowsProviderUnverified { get; private set; }
     /// <summary>Per-eye readings suppressed because the OVREyeGaze is hosted on an OVRCameraRig eye anchor.</summary>
     public long RowsHostConflictBlocked { get; private set; }
     /// <summary>Provider-vs-rig-anchor origin diagnostics (counts by origin source, deviation summary). Written to the manifest eye_tracking block.</summary>
@@ -652,6 +654,7 @@ public class GazeRecorder : MonoBehaviour
         public bool confidenceAvailable;   // a usable RAW provider confidence exists for this sample (see GazeConfidence); false = the confidence columns stay blank
         public bool hasProviderWorld;      // a real OVREyeGaze reading (not injected): providerWorldOrigin / Dir are its WorldSpace transform BEFORE any fallback replaced the origin
         public Vector3 providerWorldOrigin, providerWorldDir;
+        public bool providerUnverified;    // a real OVREyeGaze reading whose provider validity could not be established for this row (not accepted as an eye sample)
         public string fallbackReason;      // (null = none) why the recorded origin is not the provider's: provider_exceeds_deviation_gate | provider_origin_non_finite ("" = provider origin used / not applicable)
     }
 
@@ -687,6 +690,9 @@ public class GazeRecorder : MonoBehaviour
             // The threshold only ACCEPTS or REJECTS a measured value. A provider-valid eye with no usable confidence is not rejected by it (nothing was measured to compare), and a missing
             // confidence never turns a valid ray into an invalid one.
             sample.valid = GazeConfidence.IsValid(sample.confidence, sample.confidenceAvailable, minConfidenceForValid, providerKnown, providerValid);
+            // A real OVREyeGaze reading whose provider validity cannot be established (neither the same-row raw read nor the lifecycle probe answered) is UNVERIFIED: OVREyeGaze keeps its last Confidence and
+            // transform when the provider flags a sample invalid, so a non-null transform and a confidence above the threshold prove nothing about THIS sample. It is not accepted as an eye sample.
+            if (!GazeConfidence.ProviderEstablished(requireProviderValidity, providerKnown)) { sample.providerUnverified = true; if (sample.valid) { sample.valid = false; RowsProviderUnverified++; } }
             if (validateProviderOrigin)
             {
                 // Origin and direction must live in the same world frame. The direction is a rotation (unaffected by a translation between tracking origins); the origin is
@@ -709,7 +715,7 @@ public class GazeRecorder : MonoBehaviour
         if (sample.valid && hostBlocked) { sample.valid = false; RowsHostConflictBlocked++; }
         else if (sample.valid && providerKnown && !providerValid) { sample.valid = false; RowsStaleConfidenceRejected++; }
         // The SDK keeps its previous Confidence when the provider flags the eye invalid: that number is not an observation of THIS sample.
-        sample.confidenceAvailable = GazeConfidence.AvailableAfterProvider(sample.confidenceAvailable, providerKnown, providerValid);
+        sample.confidenceAvailable = GazeConfidence.AvailableAfterProvider(sample.confidenceAvailable, providerKnown, providerValid) && !sample.providerUnverified;   // an unverified sample's Confidence may be stale: never written as a measurement
         return sample;
     }
 
@@ -725,6 +731,8 @@ public class GazeRecorder : MonoBehaviour
     }
 
     // One OVRPlugin read per row (the public call OVREyeGaze.Update itself makes). Unavailable = every raw column stays blank.
+    RawGazeState _rowRaw; bool _rowRawOk;   // the raw provider read of the row being built (one OVRPlugin read per row)
+
     bool ReadRawGaze(out RawGazeState r)
     {
         r = default;
@@ -779,7 +787,7 @@ public class GazeRecorder : MonoBehaviour
         const int N = 37;
         string[] c = new string[N]; for (int i = 0; i < N; i++) c[i] = "";
         if (!recordProviderPipeline) return string.Join(",", c);
-        bool rawOk = ReadRawGaze(out RawGazeState raw);
+        bool rawOk = _rowRawOk; RawGazeState raw = _rowRaw;   // the read taken at the top of this row (SamplingLoop)
         Vector3 lHeadPos = default, lHeadDir = default, rHeadPos = default, rHeadDir = default; bool lHead = false, rHead = false;
         if (rawOk)
         {
@@ -835,7 +843,7 @@ public class GazeRecorder : MonoBehaviour
         }
         // why the recorded origin is not (all) the provider's
         string reason = "";
-        if (gazeRaySource == "head_fallback") reason = "no_valid_eye";
+        if (gazeRaySource == "head_fallback") reason = (left.providerUnverified || right.providerUnverified) ? "provider_validity_unverified" : "no_valid_eye";
         else
         {
             string lr = (left.valid ? left.fallbackReason : null) ?? "", rr = (right.valid ? right.fallbackReason : null) ?? "";
@@ -1122,8 +1130,17 @@ public class GazeRecorder : MonoBehaviour
 
             // Acquisition context (cheap, no allocation): the provider probe is only trusted while the lifecycle says it is running and the last query succeeded.
             EyeTrackingLifecycle lc = Lifecycle;
-            bool probeKnown = requireProviderValidity && lc != null && lc.ProviderProbeAvailable &&
-                              (lc.State == EyeTrackingState.Running || lc.State == EyeTrackingState.TrackingUnavailable);
+            // Provider validity of THIS row. Source 1 (preferred): the provider's own per-eye IsValid from ONE OVRPlugin.GetEyeGazesState read taken now (the same call OVREyeGaze.Update makes; the result is reused by
+            // PipelineColumns, so there is still one read per row). It does not depend on the lifecycle state: in a session whose lifecycle stayed 'start_failed' while the provider was in fact enabled and delivering,
+            // the lifecycle probe was never available, the flags were blank and validity fell back to a possibly stale OVREyeGaze.Confidence. Source 2: the lifecycle probe (Running / TrackingUnavailable only).
+            // Neither available = provider validity UNKNOWN (blank flags; the sample is not accepted as an eye sample, see ReadEye).
+            _rowRawOk = ReadRawGaze(out _rowRaw);
+            bool rawKnown = requireProviderValidity && _rowRawOk;
+            bool lifecycleKnown = requireProviderValidity && lc != null && lc.ProviderProbeAvailable &&
+                                  (lc.State == EyeTrackingState.Running || lc.State == EyeTrackingState.TrackingUnavailable);
+            bool probeKnown = rawKnown || lifecycleKnown;
+            bool leftProviderValid = rawKnown ? _rowRaw.left.valid : (lc != null && lc.LeftProviderValid);
+            bool rightProviderValid = rawKnown ? _rowRaw.right.valid : (lc != null && lc.RightProviderValid);
             bool hostBlocked = blockEyeSamplesOnHostConflict && lifecycleController != null && lifecycleController.HostConflict.Length > 0;
             ViewFrameSample vf = default; bool vfOk = false;
             if (recordViewFrame)
@@ -1141,8 +1158,8 @@ public class GazeRecorder : MonoBehaviour
                     else GroundUnavailableSamples++;
                 }
             }
-            EyeSample left = ReadEye(leftEyeGaze, testLeftEye, probeKnown, lc != null && lc.LeftProviderValid, hostBlocked, leftEyeAnchor, vfOk ? vf.leftWorld : (Vector3?)null);
-            EyeSample right = ReadEye(rightEyeGaze, testRightEye, probeKnown, lc != null && lc.RightProviderValid, hostBlocked, rightEyeAnchor, vfOk ? vf.rightWorld : (Vector3?)null);
+            EyeSample left = ReadEye(leftEyeGaze, testLeftEye, probeKnown, leftProviderValid, hostBlocked, leftEyeAnchor, vfOk ? vf.leftWorld : (Vector3?)null);
+            EyeSample right = ReadEye(rightEyeGaze, testRightEye, probeKnown, rightProviderValid, hostBlocked, rightEyeAnchor, vfOk ? vf.rightWorld : (Vector3?)null);
             bool leftInjected = testLeftEye != null && testLeftEye.active && !testLeftEye.applyProviderGate, rightInjected = testRightEye != null && testRightEye.active && !testRightEye.applyProviderGate;
 
             bool combinedValid;
@@ -1292,8 +1309,8 @@ public class GazeRecorder : MonoBehaviour
                 F4(tAbs), Inv(Time.frameCount), SafeCsvField(sessionId),
                 Inv(unixMs),
                 pipelineCols,   // the 37 v14 provider-pipeline columns, pre-joined
-                GazeConfidence.Format(left.confidence, left.confidenceAvailable), left.valid ? "1" : "0", (probeKnown && !leftInjected) ? (lc.LeftProviderValid ? "1" : "0") : "",
-                GazeConfidence.Format(right.confidence, right.confidenceAvailable), right.valid ? "1" : "0", (probeKnown && !rightInjected) ? (lc.RightProviderValid ? "1" : "0") : "",
+                GazeConfidence.Format(left.confidence, left.confidenceAvailable), left.valid ? "1" : "0", (probeKnown && !leftInjected) ? (leftProviderValid ? "1" : "0") : "",
+                GazeConfidence.Format(right.confidence, right.confidenceAvailable), right.valid ? "1" : "0", (probeKnown && !rightInjected) ? (rightProviderValid ? "1" : "0") : "",
                 GazeConfidence.Format(combinedConfOut, combinedConfAvailable),
                 F4(headPos.x), F4(headPos.y), F4(headPos.z), F4(headRot.x), F4(headRot.y), F4(headRot.z), F4(headRot.w),
                 V3(vfOk, vf.leftLocal), V3(vfOk, vf.rightLocal), V3(vfOk, vf.leftWorld), V3(vfOk, vf.rightWorld),

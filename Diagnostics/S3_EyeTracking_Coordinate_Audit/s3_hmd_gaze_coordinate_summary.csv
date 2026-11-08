@@ -1,0 +1,31 @@
+quantity,unit,n,mean,median,sd,p01,p05,p95,p99,min,max,evidence_label,note
+"combined_origin - hmd_world, WORLD axes x(east)",m,3096,0.0,0.0,7e-05,0.0,0.0,0.0,0.0,-0.001,0.001,Confirmed,same frame: both are Unity world coordinates (hmd_world = Camera.main; origin = OVREyeGaze WorldSpace via Camera.main)
+"combined_origin - hmd_world, WORLD axes y(up)",m,3096,0.00536,0.0,0.01821,-0.02433,-0.009,0.0279,0.0971,-0.0756,0.1185,Confirmed,same frame: both are Unity world coordinates (hmd_world = Camera.main; origin = OVREyeGaze WorldSpace via Camera.main)
+"combined_origin - hmd_world, WORLD axes z(north)",m,3096,-0.0,0.0,3e-05,-0.0001,0.0,0.0,0.0001,-0.0006,0.0005,Confirmed,same frame: both are Unity world coordinates (hmd_world = Camera.main; origin = OVREyeGaze WorldSpace via Camera.main)
+"combined_origin - hmd, HEAD frame lateral(+right)",m,3096,0.00013,0.0,0.00176,-0.00433,-0.00093,0.00147,0.00544,-0.02237,0.04949,Confirmed,head frame = inverse(hmd_world_rot); all rows
+"combined_origin - hmd, HEAD frame vertical(+up)",m,3096,0.00505,0.0,0.01719,-0.02239,-0.00858,0.02686,0.09224,-0.07098,0.11238,Confirmed,head frame = inverse(hmd_world_rot); all rows
+"combined_origin - hmd, HEAD frame forward",m,3096,0.00167,0.0,0.00578,-0.00747,-0.00273,0.00851,0.03107,-0.02464,0.05122,Confirmed,head frame = inverse(hmd_world_rot); all rows
+"combined_origin - hmd, HEAD frame lateral(+right) [coherent provider rows]",m,2871,5e-05,0.0,0.00068,-0.00229,-0.00076,0.00111,0.00214,-0.00558,0.00533,Confirmed,rows with origin_coherence <= 3 cm
+"combined_origin - hmd, HEAD frame vertical(+up) [coherent provider rows]",m,2871,0.00233,0.0,0.00702,-0.01487,-0.00806,0.01381,0.02518,-0.02876,0.02926,Confirmed,rows with origin_coherence <= 3 cm
+"combined_origin - hmd, HEAD frame forward [coherent provider rows]",m,2871,0.00079,0.0,0.00237,-0.00508,-0.00257,0.00524,0.00793,-0.00942,0.01179,Confirmed,rows with origin_coherence <= 3 cm
+"LEFT origin - hmd, head frame lateral [coherent]",m,2871,-0.03245,-0.03247,0.00073,-0.03484,-0.03336,-0.03129,-0.03033,-0.03816,-0.02723,Confirmed,expected -0.0325 lateral if the eye position is the nominal head-space offset
+"LEFT origin - hmd, head frame vertical [coherent]",m,2871,0.00233,7e-05,0.00702,-0.01482,-0.00804,0.01381,0.02526,-0.02875,0.02923,Confirmed,expected -0.0325 lateral if the eye position is the nominal head-space offset
+"LEFT origin - hmd, head frame forward [coherent]",m,2871,0.00079,0.00012,0.00239,-0.005,-0.00254,0.00535,0.0081,-0.00949,0.01188,Confirmed,expected -0.0325 lateral if the eye position is the nominal head-space offset
+"RIGHT origin - hmd, head frame lateral [coherent]",m,2871,0.03255,0.03252,0.00074,0.0302,0.03162,0.03365,0.03465,0.02701,0.0379,Confirmed,expected +0.0325 lateral
+"RIGHT origin - hmd, head frame vertical [coherent]",m,2871,0.00233,8e-05,0.00702,-0.01492,-0.00805,0.01377,0.02524,-0.02868,0.02938,Confirmed,expected +0.0325 lateral
+"RIGHT origin - hmd, head frame forward [coherent]",m,2871,0.00079,0.0001,0.00239,-0.00503,-0.00262,0.00528,0.00806,-0.00935,0.0124,Confirmed,expected +0.0325 lateral
+provider head-space eye position left x (diagnostic column),m,3096,-0.0325,-0.0325,4e-05,-0.0326,-0.0325,-0.0325,-0.0324,-0.0331,-0.0321,Confirmed,SDK head-space conversion of the raw provider eye pose
+provider head-space eye position left y,m,3096,-0.0,0.0,1e-05,0.0,0.0,0.0,0.0,-0.0006,0.0002,Confirmed,
+provider head-space eye position left z,m,3096,-0.0,0.0,2e-05,0.0,0.0,0.0,0.0,-0.0008,0.0001,Confirmed,
+provider head-space eye position right x,m,3096,0.0325,0.0325,4e-05,0.0324,0.0325,0.0325,0.0326,0.0319,0.0329,Confirmed,
+|left_dir| - 1,,3096,-0.0,0.0,3e-05,-6e-05,-5e-05,4e-05,5e-05,-7e-05,7e-05,Confirmed,
+|right_dir| - 1,,3096,0.0,0.0,3e-05,-5e-05,-5e-05,5e-05,5e-05,-6e-05,7e-05,Confirmed,
+|combined_dir| - 1,,3096,0.0,0.0,3e-05,-6e-05,-5e-05,5e-05,5e-05,-7e-05,7e-05,Confirmed,
+gaze dir in HEAD frame: elevation (+ = up),deg,3096,-17.02825,-16.72754,8.73945,-39.17336,-31.53919,-3.38286,2.29143,-59.75276,16.05123,Confirmed,combined_dir rotated by inverse(hmd_world_rot)
+gaze dir in HEAD frame: azimuth (+ = right),deg,3096,7.97542,8.09927,10.10749,-15.79521,-8.83049,24.12042,31.19905,-25.94823,47.01254,Confirmed,
+provider LEFT head-space direction: elevation,deg,3096,-16.96049,-16.6756,8.70519,-38.96809,-31.40822,-3.37818,2.27701,-59.449,16.03937,Confirmed,independent of Camera.main: SDK head-space conversion of the raw provider pose
+provider LEFT head-space direction: azimuth,deg,3096,9.58061,9.71903,10.07042,-14.25617,-7.22829,25.59413,32.58135,-24.41215,48.08271,Confirmed,
+angle between recorded left_dir and camera*provider head dir,deg,3096,7e-05,0.0,0.00134,0.0,0.0,0.0,0.0,0.0,0.028,Confirmed,
+angle gaze(combined) vs HMD forward,deg,3096,21.46058,21.38173,8.10902,4.23845,8.17184,35.13794,40.20697,0.95751,63.64326,Confirmed,both in world frame
+head pitch (+ = looking up) from hmd_world_rot,deg,3096,19.50025,18.90158,5.7196,6.72845,10.9273,29.66256,34.16562,-2.63608,42.48498,Confirmed,
+angle hmd_world_rot vs OVR head anchor rot,deg,3096,0.39392,0.14042,0.67628,0.00224,0.01237,1.65348,3.32967,0.0,7.96669,Confirmed,

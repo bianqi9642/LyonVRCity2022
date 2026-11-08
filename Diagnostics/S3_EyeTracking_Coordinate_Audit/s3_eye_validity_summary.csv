@@ -1,0 +1,13 @@
+item,value,evidence,label
+rows,3096,"gaze.csv / gaze_diagnostics.csv one-to-one on (session_id, frame_index, t_abs)",Confirmed
+eye_tracking_state=start_failed rows,3096,gaze.csv column eye_tracking_state (all rows),Confirmed
+left/right_provider_valid blank rows,3096,columns written only when the LIFECYCLE probe was available (GazeRecorder.cs line ~1295 before the fix),Confirmed
+rows with raw provider read (both eyes present),3096,left/right_raw_tracking_pos_* non-blank only if the provider flagged that eye IsValid (GazeRecorder.PipelineColumns); ReadRawGaze returns false unless OVRPlugin.eyeTrackingEnabled,Confirmed
+provider timestamp advanced,3095,provider_time_changed (EyeGazesState.Time),Confirmed
+recorded direction == current provider sample (dev < 0.1 deg),3096,left/right_worldspace_vs_composed_dir_deg (max 0.028 deg),Confirmed
+origin replaced by eye anchor,57,gaze_origin_source != provider; reason={'provider_exceeds_deviation_gate': 57},Confirmed
+provider-origin rows with origin coherence > 3 cm (mixed frame),168,left/right_worldspace_vs_composed_origin_m,Confirmed
+confidence distinct values,1,combined_confidence; value ['0.998'],Confirmed
+category C1_provider_valid_confirmed_by_raw_read,3038,s3_eye_sample_provenance.csv,Strongly supported
+category C4_fallback_origin (direction provider-derived),57,s3_eye_sample_provenance.csv,Confirmed
+category C5_missing_provenance_fields,1,s3_eye_sample_provenance.csv,Confirmed

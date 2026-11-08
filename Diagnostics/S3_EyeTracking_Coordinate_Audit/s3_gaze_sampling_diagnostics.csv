@@ -1,0 +1,20 @@
+item,value,evidence,label
+rows,3096,gaze.csv,Confirmed
+duration_s,959.64,t_abs,Confirmed
+rate_hz,3.225,rows / duration,Confirmed
+interval_median_s,0.3023,t_abs diffs,Confirmed
+interval_p05_p95_s,0.245 / 0.393,t_abs diffs,Confirmed
+interval_max_s,0.494,t_abs diffs,Confirmed
+frame_index step: min/median/max,1 / 1 / 1,frame_index diffs: every Unity frame yields exactly one row,Confirmed
+implied Unity frame rate (frames/s),3.225,sum(frame_index diffs)/duration,Confirmed
+duplicate t_abs,0,t_abs,Confirmed
+non-monotonic t_abs,0,t_abs,Confirmed
+rows >1 s gap,0,t_abs,Confirmed
+provider_time advanced rows,3095,provider_time_s,Confirmed
+provider_time repeated rows,0,provider_time_s,Confirmed
+provider sample interval median (s),0.3055,provider_time_s diffs (OVRPlugin clock),Confirmed
+provider vs row interval corr,0.8965,provider_time_s diffs vs t_abs diffs,Confirmed
+rows with anchors_updated_frame == frame_index,3095,OVRCameraRig.UpdatedAnchors in the same frame,Confirmed
+unix offset spread (ms),15.9,unix_time_ms - 1000*t_abs,Confirmed
+frame-rate limited vs scheduler limited,frame-rate limited: nominal sample interval 0.05 s (20 Hz) cannot be met when one frame lasts 0.30 s; the scheduler writes at most one row per frame,frame_index step == 1 on all rows (a 3.3 Hz recorder interval would give steps > 1),Strongly supported
+cause of the low frame rate (NPC count?),not determinable from S3: frame timing block of the manifest is missing; S3 events record 3521 active NPCs at the Start gate (npc_behaviour_paused value_num) and 5247 lifetimes,"events.csv, npc_lifetimes.csv",Uncertain

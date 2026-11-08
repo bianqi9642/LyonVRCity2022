@@ -32,6 +32,12 @@ public static class GazeConfidence
     public static bool IsValid(float confidence, bool confidenceAvailable, float threshold, bool providerKnown, bool providerValid)
         => confidenceAvailable ? confidence >= threshold : (providerKnown && providerValid);
 
+    /// <summary>
+    /// A real-provider sample is accepted as an eye sample only if its PROVIDER validity was established for this row (same-row raw provider read or the lifecycle probe), unless provider validity is not required.
+    /// An unknown provider is not 'valid': OVREyeGaze keeps its last transform and Confidence when a sample is flagged invalid, so those carry no information about this sample.
+    /// </summary>
+    public static bool ProviderEstablished(bool requireProviderValidity, bool providerKnown) => !requireProviderValidity || providerKnown;
+
     /// <summary>The SDK keeps its previous Confidence when the provider flags an eye invalid: such a number is not an observation of this sample.</summary>
     public static bool AvailableAfterProvider(bool usable, bool providerKnown, bool providerValid) => usable && !(providerKnown && !providerValid);
 

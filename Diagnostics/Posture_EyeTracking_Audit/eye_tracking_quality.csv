@@ -1,0 +1,10 @@
+session,part,phase,rows,duration_s,rate_hz,combined_valid_pct,provider_origin_pct,eye_anchor_fallback_pct,eye_tracking_state,mean_confidence,confidence_constant,provider_time_changed_pct,ray_hit_pct,ground_unavailable_pct,hmd_h_median,hmd_h_p05,hmd_h_p95,eye_h_median,eye_hmd_dy_median,eye_hmd_dy_std,pitch_down_median,blink_rows
+S1,Part2,p2_continue_pending,31,9.2,3.26,100.0,100.0,0.0,start_failed,0.998,True,100.0,71.0,0.0,1.438,1.422,1.444,1.438,0.0,0.0,-24.2,0
+S1,Part2,p2_task1,1015,300.1,3.38,100.0,99.31,0.69,start_failed,0.998,True,99.9,91.2,0.79,1.425,1.409,1.439,1.425,0.0,0.0139,-13.7,17
+S1,Part2,p2_task2,653,207.8,3.14,100.0,94.95,5.05,start_failed,0.998,True,99.85,78.1,20.98,1.427,1.281,1.515,1.421,0.0,0.0197,-11.6,23
+S2,Part2,p2_continue_pending,249,13.3,18.7,100.0,99.6,0.4,running;start_failed,0.998,True,99.6,4.4,95.58,1.499,1.462,1.506,1.49,0.0,0.0014,-14.6,5
+S2,Part2,p2_task1,4961,300.0,16.53,100.0,98.79,1.21,running,0.998,True,99.98,98.5,0.0,1.405,1.364,1.487,1.404,0.0,0.0159,-12.9,125
+S3,Part3,d1_pending,102,28.2,3.58,100.0,100.0,0.0,start_failed,0.998,True,99.02,76.5,0.0,0.977,0.963,0.985,0.977,0.0,0.0,-25.9,1
+S3,Part3,d1_search,1989,599.8,3.31,100.0,97.64,2.36,start_failed,0.998,True,100.0,82.7,0.0,0.982,0.959,1.008,0.984,0.0012,0.0181,-18.0,21
+S3,Part3,d2_pending,107,31.3,3.39,100.0,100.0,0.0,start_failed,0.998,True,100.0,82.2,0.0,1.009,0.988,1.019,1.009,0.0,0.0,-24.6,0
+S3,Part3,d2_search,898,299.4,3.0,100.0,98.89,1.11,start_failed,0.998,True,100.0,88.2,0.0,0.983,0.962,1.011,0.984,0.0,0.0202,-19.8,21

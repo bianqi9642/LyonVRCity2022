@@ -2439,7 +2439,7 @@ public class DataCaptureManager : MonoBehaviour
         {
             GazeRecorder g = _gazeRecorder;
             et.rows_valid_combined = g.RowsValidEye; et.rows_fallback = g.RowsFallback; et.rows_fallback_not_acquiring = g.RowsFallbackNotAcquiring;
-            et.rows_stale_confidence_rejected = g.RowsStaleConfidenceRejected; et.rows_host_conflict_blocked = g.RowsHostConflictBlocked;
+            et.rows_stale_confidence_rejected = g.RowsStaleConfidenceRejected; et.rows_provider_unverified = g.RowsProviderUnverified; et.rows_host_conflict_blocked = g.RowsHostConflictBlocked;
             et.rows_left_valid = g.RowsLeftValid; et.rows_right_valid = g.RowsRightValid;
             et.first_valid_row_t_abs = double.IsNaN(g.FirstValidRowT) ? -1 : g.FirstValidRowT;
             et.last_valid_row_t_abs = double.IsNaN(g.LastValidRowT) ? -1 : g.LastValidRowT;

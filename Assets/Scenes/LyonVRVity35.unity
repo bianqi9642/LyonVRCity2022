@@ -246555,6 +246555,7 @@ MonoBehaviour:
     gazeCaptureEnabled: 1
     trajectoryCaptureEnabled: 1
   lockParticipantWhileDestination2Panel: 1
+  lockParticipantWhilePart2ContinuePanel: 1
   enableLifecycleLogs: 1
   npcWarmupDuration: 20
   holdNpcsUntilStart: 1
@@ -290960,7 +290961,7 @@ MonoBehaviour:
   maxWanderingPointsPerAgent: 8
   wanderLookAheadDistance: 15
   agentPrefab: {fileID: 3132995531446026970, guid: c34a3349d586043c09271e3b19db0437, type: 3}
-  maxAgents: 1000
+  maxAgents: 3000
   spawnInterval: 0.1
   spawnSampleRadius: 1
   spawnSampleMaxAttempts: 8
@@ -290978,7 +290979,7 @@ MonoBehaviour:
   entranceSpawnRadius: 5
   entranceSpawnMaxAttempts: 12
   usePooling: 1
-  poolPrewarm: 1000
+  poolPrewarm: 3000
   navmeshWaitTimeout: 5
   prewarmFrameBudgetMs: 8
   agentFactory: {fileID: 2139592827}

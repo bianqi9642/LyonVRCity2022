@@ -151,6 +151,8 @@ public sealed class EyeTrackingLifecycleOptions
     public double permissionPollInterval = 0.5;
     public double trackingUnavailableAfterSeconds = 3.0;
     public int maxTransitions = 96;
+    /// <summary>After the bounded start retries are exhausted the lifecycle keeps OBSERVING (no further start request): every this many seconds it checks whether the provider is enabled and the components are enabled, so a late successful start is reported as Running instead of staying start_failed for the whole session. 0 disables the late check.</summary>
+    public double exhaustedRecheckInterval = 2.0;
 }
 
 public sealed class EyeTrackingLifecycle
@@ -197,6 +199,7 @@ public sealed class EyeTrackingLifecycle
     public int DroppedTransitions { get; private set; }
 
     double _nextActionT;
+    double _nextLateCheckT;
     int _episodeAttempts;
     bool _exhausted;
     int _requestEpoch;
@@ -282,6 +285,7 @@ public sealed class EyeTrackingLifecycle
                 break;
             case EyeTrackingState.StartFailed:
                 if (!_exhausted && now >= _nextActionT) Move(now, "retry", EyeTrackingState.Starting, "retry_after_backoff");
+                else if (_exhausted && Options.exhaustedRecheckInterval > 0 && now >= _nextLateCheckT) { _nextLateCheckT = now + Options.exhaustedRecheckInterval; TryLateStartObservation(now); }
                 break;
             case EyeTrackingState.Running:
             case EyeTrackingState.TrackingUnavailable: Monitor(now); break;
@@ -437,6 +441,22 @@ public sealed class EyeTrackingLifecycle
         string reason = failed.Length > 0 ? "component_self_disabled:" + failed : "tracking_not_enabled_after_start";
         Move(now, "start_failure", EyeTrackingState.StartFailed, reason);
         ScheduleRetryOrExhaust(now);
+    }
+
+    // Passive observation after the bounded retries are exhausted (no start request is issued here, so the SDK start path stays single and bounded). The provider can become enabled LATE
+    // (for example the runtime only enables eye tracking once the headset is worn / the session is focused); without this check the state stayed 'start_failed' for the rest of the session
+    // although OVRPlugin.eyeTrackingEnabled was true and valid samples were flowing. A transition is recorded, so the earlier failure remains visible in the manifest transitions.
+    void TryLateStartObservation(double now)
+    {
+        for (int i = 0; i < 2; i++)
+        {
+            bool present = Platform.Call(() => Platform.ComponentPresent != null && Platform.ComponentPresent(i));
+            if (present && !Platform.Call(() => Platform.ComponentEnabled != null && Platform.ComponentEnabled(i))) return;   // a component that is still disabled is a failure, not a late start
+        }
+        if (!Platform.Call(Platform.TrackingEnabled)) return;
+        StartupSuccesses++; LastResult = "success";
+        RunningSinceT = now; LastProviderReset(); _exhausted = false; _episodeAttempts = 0;
+        Move(now, "late_start_success", EyeTrackingState.Running, "provider_enabled_after_" + StartupFailures + "_failures_and_retry_exhaustion");
     }
 
     void ScheduleRetryOrExhaust(double now)
@@ -635,7 +655,7 @@ public class EyeTrackingManifest
     public double first_valid_provider_t_abs = -1, last_valid_provider_t_abs = -1, seconds_since_last_valid_provider = -1;
 
     // recorder-level: counted from gaze.csv rows actually written
-    public long rows_valid_combined, rows_fallback, rows_fallback_not_acquiring, rows_stale_confidence_rejected, rows_host_conflict_blocked, rows_left_valid, rows_right_valid;
+    public long rows_valid_combined, rows_fallback, rows_fallback_not_acquiring, rows_stale_confidence_rejected, rows_provider_unverified, rows_host_conflict_blocked, rows_left_valid, rows_right_valid;
     public double first_valid_row_t_abs = -1, last_valid_row_t_abs = -1, longest_no_valid_eye_s;
 
     // gaze origin validation (schema v10): provider eye origin vs the rig's own eye anchor, counted over valid eye samples (see EyeGazeOrigin). origin_mean_offset_* is

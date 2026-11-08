@@ -1,0 +1,272 @@
+{
+ "files_present": [
+  {
+   "file": "building_registry.csv",
+   "size_bytes": 180213,
+   "rows": 990,
+   "columns": 23,
+   "note": ""
+  },
+  {
+   "file": "events.csv",
+   "size_bytes": 21790,
+   "rows": 169,
+   "columns": 20,
+   "note": ""
+  },
+  {
+   "file": "gaze.csv",
+   "size_bytes": 1463725,
+   "rows": 3096,
+   "columns": 61,
+   "note": ""
+  },
+  {
+   "file": "gaze_diagnostics.csv",
+   "size_bytes": 1819501,
+   "rows": 3096,
+   "columns": 85,
+   "note": ""
+  },
+  {
+   "file": "npc_events.csv",
+   "size_bytes": 64110482,
+   "rows": 315663,
+   "columns": 21,
+   "note": ""
+  },
+  {
+   "file": "npc_lifetimes.csv",
+   "size_bytes": 3608648,
+   "rows": 5247,
+   "columns": 64,
+   "note": ""
+  },
+  {
+   "file": "npc_profiles.csv",
+   "size_bytes": 10152,
+   "rows": 1,
+   "columns": 5,
+   "note": ""
+  },
+  {
+   "file": "audio/audio_anchors.csv",
+   "size_bytes": 103160,
+   "rows": 837,
+   "columns": 9,
+   "note": ""
+  },
+  {
+   "file": "audio/audio_index.csv",
+   "size_bytes": 136095,
+   "rows": 836,
+   "columns": 18,
+   "note": ""
+  },
+  {
+   "file": "audio/audio_metadata.json",
+   "size_bytes": 3192,
+   "rows": "",
+   "columns": "",
+   "note": ""
+  },
+  {
+   "file": "audio/part3_audio.wav",
+   "size_bytes": 92178238,
+   "rows": "",
+   "columns": "",
+   "note": ""
+  }
+ ],
+ "timestamps": {
+  "unit": "s, CaptureClock.TAbs = Time.realtimeSinceStartupAsDouble (process-relative, absolute within the process; not UTC)",
+  "monotonic_strict": true,
+  "duplicates": 0,
+  "first": 757.7157,
+  "last": 1717.3606,
+  "rows": 3096,
+  "session_id": [
+   "20261106T145652Z_0980aa930c32"
+  ],
+  "subject": [
+   "4"
+  ]
+ },
+ "events_window": [
+  [
+   "18.3510",
+   "session_start"
+  ],
+  [
+   "18.3724",
+   "part_start"
+  ],
+  [
+   "757.6539",
+   "trial_start"
+  ],
+  [
+   "1718.6657",
+   "trial_end"
+  ],
+  [
+   "1731.9649",
+   "part_end"
+  ],
+  [
+   "1731.9661",
+   "session_end"
+  ]
+ ],
+ "categories": {
+  "C1_provider_valid_confirmed_by_raw_read": 3038,
+  "C4_fallback_origin (direction provider-derived)": 57,
+  "C5_missing_provenance_fields": 1
+ },
+ "origin_mixed_frame_rows": 168,
+ "candidate_transitions_rise_gt_0.15m_vs_session_median": [
+  {
+   "start_t": 1143.3,
+   "end_t": 1157.5118,
+   "duration_s": 14.21180000000004,
+   "raw_y_median": 0.094475
+  },
+  {
+   "start_t": 1714.6458,
+   "end_t": 1717.3606,
+   "duration_s": 2.7147999999999683,
+   "raw_y_median": 0.10755
+  }
+ ],
+ "fast_vertical_changes_gt_0.2m_in_1.5s": [
+  [
+   1141.75,
+   1143.3,
+   -0.32505,
+   -0.10705
+  ],
+  [
+   1155.6438,
+   1157.5118,
+   0.08990000000000001,
+   -0.20584999999999998
+  ],
+  [
+   1713.2,
+   1715.0118,
+   -0.31865,
+   0.0572
+  ]
+ ],
+ "metrics_low_baseline": {
+  "rows": 3043,
+  "raw_eye_y_m": -0.37834999999999996,
+  "hmd_world_y_m": 167.2717,
+  "hmd_height_above_ground_m": 0.9821,
+  "head_pitch_up_deg": 18.950647592172796,
+  "head_roll_deg": 1.0926933130103478,
+  "gaze_origin_world_y_m": 167.2894,
+  "origin_minus_hmd_world_xyz_m": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "origin_minus_hmd_head_frame_lat_vert_fwd_m": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "gaze_dir_world_elev_deg": 0.06875495191689397,
+  "gaze_dir_head_frame_elev_deg": -16.739682831689617,
+  "gaze_dir_head_frame_azim_deg": 8.046480208968394,
+  "gaze_vs_head_forward_deg": 21.422168804133296,
+  "provider_valid_evidence_pct": 100.0,
+  "origin_fallback_pct": 1.8731514952349655,
+  "origin_mixed_pct": 5.520867564903057
+ },
+ "metrics_high_candidate": {
+  "rows": 53,
+  "raw_eye_y_m": 0.09509999999999999,
+  "hmd_world_y_m": 167.7653,
+  "hmd_height_above_ground_m": 1.459,
+  "head_pitch_up_deg": 15.035615379557614,
+  "head_roll_deg": -0.5414165045200285,
+  "gaze_origin_world_y_m": 167.7678,
+  "origin_minus_hmd_world_xyz_m": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "origin_minus_hmd_head_frame_lat_vert_fwd_m": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "gaze_dir_world_elev_deg": -1.9083022515373085,
+  "gaze_dir_head_frame_elev_deg": -15.407778094824685,
+  "gaze_dir_head_frame_azim_deg": 11.419419406175178,
+  "gaze_vs_head_forward_deg": 19.711668821824333,
+  "provider_valid_evidence_pct": 100.0,
+  "origin_fallback_pct": 0.0,
+  "origin_mixed_pct": 0.0
+ },
+ "gaze_vs_head_by_group": {
+  "low": 21.422168804133296,
+  "high": 19.711668821824333
+ },
+ "head_frame_elev_by_group": {
+  "low": -16.739682831689617,
+  "high": -15.407778094824685
+ },
+ "corr_offset_vs_row_displacement": {
+  "horizontal": 0.4026362983679515,
+  "vertical": 0.3150363928601072
+ },
+ "offset_gt3cm_by_row_horizontal_move_m": {
+  "offset_gt3cm_median_row_move": 0.45946105406489096,
+  "others": 0.3915528572237216
+ },
+ "r3": {
+  "hmd_world_minus_head_anchor_y": {
+   "median": 1.3614000000000033,
+   "std": 0.0006763098655093447,
+   "min": 1.347200000000015,
+   "max": 1.3792999999999722
+  },
+  "hmd_world_minus_head_anchor_xz_max": 0.0169008875506201,
+  "hmd_rot_vs_head_anchor_rot_deg": {
+   "median": 0.14042036450908557,
+   "max": 7.966691634276597
+  },
+  "rig_base_est_minus_ground": {
+   "median": -0.0011499999999955435,
+   "p05": -0.021399999999999864,
+   "p95": 0.01994999999999436,
+   "std": 0.013546817836383472
+  },
+  "hmd_height_above_ground_minus_(1.36144+raw_y)": {
+   "median": -0.0011900000000000244,
+   "std": 0.013585756685030528
+  },
+  "raw_eye_y_stats": {
+   "median": -0.37815,
+   "min": -0.41435,
+   "max": 0.1247,
+   "std": 0.060676556387410395
+  },
+  "left_minus_right_raw_y": {
+   "median": -0.0011999999999999789,
+   "std": 0.006422120707957915
+  }
+ },
+ "dir_headframe_elev": {
+  "recorded_median": -16.727536755465692,
+  "provider_median": -16.675602302253022,
+  "diff_median": -0.0598321494200853,
+  "diff_max_abs": 0.8012734637022376
+ },
+ "dir_headframe_azim": {
+  "recorded_median": 8.09926844658057,
+  "provider_median": 9.719028977167454
+ }
+}

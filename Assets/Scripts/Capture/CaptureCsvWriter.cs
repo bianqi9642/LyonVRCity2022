@@ -150,20 +150,31 @@ public sealed class CaptureCsvWriter
     {
         if (IsDisabled) return;
         if (IsClosed) { RowsRejectedAfterClose++; return; }
-        Commit(null, line, 1);
+        Commit(null, line, 1, null);
+    }
+
+    /// <summary>
+    /// One commit for rows that were already assembled (comma-joined, each terminated by Environment.NewLine) in a StringBuilder, e.g. by CsvRowBuilder. Identical file content, counters, failure policy and
+    /// fault-injection steps as WriteLines with the same rows; it only avoids building one big string and one big byte[] per commit.
+    /// </summary>
+    public void WriteRows(StringBuilder rows, int rowCount)
+    {
+        if (IsDisabled || rows == null || rowCount <= 0) return;
+        if (IsClosed) { RowsRejectedAfterClose += rowCount; return; }
+        Commit(null, null, rowCount, rows);
     }
 
     public void WriteLines(IReadOnlyList<string> lines)
     {
         if (IsDisabled || lines == null || lines.Count == 0) return;
         if (IsClosed) { RowsRejectedAfterClose += lines.Count; return; }
-        Commit(lines, null, lines.Count);
+        Commit(lines, null, lines.Count, null);
     }
 
-    void Commit(IReadOnlyList<string> lines, string single, int n)
+    void Commit(IReadOnlyList<string> lines, string single, int n, StringBuilder builder)
     {
         long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-        try { CommitCore(lines, single, n); }
+        try { CommitCore(lines, single, n, builder); }
         finally
         {
             double sec = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) / (double)System.Diagnostics.Stopwatch.Frequency;
@@ -172,7 +183,7 @@ public sealed class CaptureCsvWriter
         }
     }
 
-    void CommitCore(IReadOnlyList<string> lines, string single, int n)
+    void CommitCore(IReadOnlyList<string> lines, string single, int n, StringBuilder builder)
     {
         RowsAttempted += n;
         if (State == WriterState.Failed && !TryRecover()) { RowsDroppedAfterFailure += n; return; }
@@ -180,16 +191,35 @@ public sealed class CaptureCsvWriter
         try
         {
             EnsureHeader();
+#if NPC_PERF_DIAG
+            long _pd0 = NpcPerfDiag.Now;
+#endif
             long bytes = 0;
-            _batch.Length = 0;
-            if (lines == null) { _batch.Append(single).Append(Environment.NewLine); bytes = Encoding.UTF8.GetByteCount(single) + s_newlineBytes; }
+            if (builder != null)
+            {
+                bytes = CaptureIO.AppendBuilder(_path, builder);
+#if NPC_PERF_DIAG
+                if (_name != null && _name.StartsWith("npc_state")) { NpcPerfDiag.AppendTicks += NpcPerfDiag.Now - _pd0; NpcPerfDiag.Bytes += bytes; }
+#endif
+            }
             else
-                for (int i = 0; i < lines.Count; i++)
-                {
-                    _batch.Append(lines[i]).Append(Environment.NewLine);
-                    bytes += Encoding.UTF8.GetByteCount(lines[i]) + s_newlineBytes;
-                }
-            CaptureIO.AppendText(_path, _batch.ToString());
+            {
+                _batch.Length = 0;
+                if (lines == null) { _batch.Append(single).Append(Environment.NewLine); bytes = Encoding.UTF8.GetByteCount(single) + s_newlineBytes; }
+                else
+                    for (int i = 0; i < lines.Count; i++)
+                    {
+                        _batch.Append(lines[i]).Append(Environment.NewLine);
+                        bytes += Encoding.UTF8.GetByteCount(lines[i]) + s_newlineBytes;
+                    }
+    #if NPC_PERF_DIAG
+                long _pd1 = NpcPerfDiag.Now;
+    #endif
+                CaptureIO.AppendText(_path, _batch.ToString());
+    #if NPC_PERF_DIAG
+                if (_name != null && _name.StartsWith("npc_state")) { NpcPerfDiag.BatchBuildTicks += _pd1 - _pd0; NpcPerfDiag.AppendTicks += NpcPerfDiag.Now - _pd1; NpcPerfDiag.Bytes += bytes; }
+    #endif
+            }
             BytesWritten += bytes;
             RowsWritten += n;
             double t = CaptureClock.TAbs;

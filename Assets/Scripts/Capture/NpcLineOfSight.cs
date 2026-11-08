@@ -43,6 +43,20 @@ public static class NpcLineOfSight
         }
     }
 
+    /// <summary>
+    /// Same point as TryGetNpcEyePoint, with the humanoid head bone cached by the caller (Animator.GetBoneTransform resolved once per NPC instead of once per snapshot). The bone of an Animator's avatar does not change
+    /// while the NPC lives; a destroyed (null) cache is resolved again.
+    /// </summary>
+    public static bool TryGetNpcEyePointCached(Transform npcRoot, NavMeshAgent agent, Animator animator, ref Transform headBoneCache, out Vector3 eye)
+    {
+        if (npcRoot != null && animator != null && animator.isHuman)
+        {
+            if (headBoneCache == null) headBoneCache = animator.GetBoneTransform(HumanBodyBones.Head);
+            if (headBoneCache != null) { eye = headBoneCache.position; return true; }
+        }
+        return TryGetNpcEyePoint(npcRoot, agent, animator, out eye);
+    }
+
     /// <summary>The NPC's observation (eye) point: humanoid head bone, else 90 % of agent/collider height above the root. False if no transform exists.</summary>
     public static bool TryGetNpcEyePoint(Transform npcRoot, NavMeshAgent agent, Animator animator, out Vector3 eye)
     {
@@ -67,9 +81,10 @@ public static class NpcLineOfSight
         return true;
     }
 
+    /// <summary>The reference implementation (collects EVERY hit along the whole segment). Kept verbatim: it is the fallback of <see cref="Query"/> and the oracle the equivalence tests compare against.</summary>
     /// <param name="npcEye">Ray origin (use TryGetNpcEyePoint); null = unavailable.</param>
     /// <param name="participantTarget">The participant's head position target; null transform = unavailable.</param>
-    public static LosStatus Query(Vector3? npcEye, Transform npcRoot, Transform participantTarget, Transform participantRoot, int layerMask)
+    public static LosStatus QueryExhaustive(Vector3? npcEye, Transform npcRoot, Transform participantTarget, Transform participantRoot, int layerMask)
     {
         try
         {
@@ -83,10 +98,16 @@ public static class NpcLineOfSight
             Vector3 dir = delta / dist;
 
             int n = Physics.RaycastNonAlloc(origin, dir, s_small, dist, layerMask, QueryTriggerInteraction.Ignore);
+#if NPC_PERF_DIAG
+            NpcPerfDiag.Raycasts++;
+#endif
             RaycastHit[] buf = s_small; int cap = SmallBuffer;
             if (n >= SmallBuffer)
             {
                 n = Physics.RaycastNonAlloc(origin, dir, s_large, dist, layerMask, QueryTriggerInteraction.Ignore);
+#if NPC_PERF_DIAG
+                NpcPerfDiag.Raycasts++;
+#endif
                 buf = s_large; cap = LargeBuffer;
             }
             for (int i = 0; i < n; i++)
@@ -102,5 +123,67 @@ public static class NpcLineOfSight
             return n >= cap ? LosStatus.HitBufferOverflow : LosStatus.Clear;
         }
         catch (System.Exception) { return LosStatus.QueryError; }
+    }
+
+    /// <summary>Segment length covered by the first, short query (metres). Everything belonging to the querying NPC lies within a body length of its eye point.</summary>
+    public const float NearZoneMeters = 3f;
+
+    /// <summary>
+    /// Same answer as <see cref="QueryExhaustive"/>, cheaper. The reference collects every collider crossed by the whole eye -> participant segment (up to 32, and again up to 256 when the first buffer filled),
+    /// although one foreign collider already decides "blocked". This version splits the segment at NearZoneMeters:
+    ///   1. near zone [0, 3 m]: the same all-hits query as the reference (it contains the NPC's own colliders), evaluated with the same rules;
+    ///   2. far zone (3 m, dist]: ONE closest-hit query starting exactly at the split point. A collider entered beyond the split is found by it, a collider entered before the split was already seen by step 1,
+    ///      so no obstacle can be missed; the closest hit decides: foreign => blocked, none => clear.
+    /// Anything that is not unambiguous (a full near-zone buffer whose hits are ALL the NPC's own / the participant's, or the closest far-zone hit being the NPC's own / the participant's collider) falls back to the reference, so the result is the reference's in every case.
+    /// </summary>
+    public static LosStatus Query(Vector3? npcEye, Transform npcRoot, Transform participantTarget, Transform participantRoot, int layerMask)
+    {
+        try
+        {
+            if (participantTarget == null) return LosStatus.MissingParticipantTarget;
+            if (npcEye == null || npcRoot == null) return LosStatus.MissingNpcOrigin;
+
+            Vector3 origin = npcEye.Value, target = participantTarget.position;
+            Vector3 delta = target - origin;
+            float dist = delta.magnitude;
+            if (float.IsNaN(dist) || float.IsInfinity(dist) || dist < 1e-3f) return LosStatus.InvalidGeometry;
+            Vector3 dir = delta / dist;
+
+            float nearLen = dist < NearZoneMeters ? dist : NearZoneMeters;
+            int n = Physics.RaycastNonAlloc(origin, dir, s_small, nearLen, layerMask, QueryTriggerInteraction.Ignore);
+#if NPC_PERF_DIAG
+            NpcPerfDiag.Raycasts++;
+#endif
+            for (int i = 0; i < n; i++)
+            {
+                Transform ct = s_small[i].collider != null ? s_small[i].collider.transform : null;
+                if (ct == null) continue;
+                if (IsOwnOrParticipant(ct, npcRoot, participantRoot, participantTarget)) continue;
+                return LosStatus.Blocked;   // a genuine foreign collider lies on the segment: conclusive even when the buffer is full (the reference makes the same call)
+            }
+            if (n >= SmallBuffer) return QueryExhaustive(npcEye, npcRoot, participantTarget, participantRoot, layerMask);   // full buffer and every returned hit is the NPC's / participant's own: the list may be incomplete, let the reference decide
+            if (dist <= nearLen) return LosStatus.Clear;
+
+            Vector3 farOrigin = origin + dir * nearLen;
+            RaycastHit hit;
+            bool any = Physics.Raycast(farOrigin, dir, out hit, dist - nearLen, layerMask, QueryTriggerInteraction.Ignore);
+#if NPC_PERF_DIAG
+            NpcPerfDiag.Raycasts++;
+#endif
+            if (!any) return LosStatus.Clear;
+            Transform farT = hit.collider != null ? hit.collider.transform : null;
+            if (farT == null) return QueryExhaustive(npcEye, npcRoot, participantTarget, participantRoot, layerMask);
+            if (!IsOwnOrParticipant(farT, npcRoot, participantRoot, participantTarget)) return LosStatus.Blocked;
+            return QueryExhaustive(npcEye, npcRoot, participantTarget, participantRoot, layerMask);   // the closest far hit is the NPC's / participant's own: not conclusive, use the reference
+        }
+        catch (System.Exception) { return LosStatus.QueryError; }
+    }
+
+    /// <summary>True when the collider's transform belongs to the querying NPC or to the participant (neither is an obstacle). Shared by the synchronous query and NpcLosBatch.</summary>
+    public static bool IsOwnOrParticipant(Transform ct, Transform npcRoot, Transform participantRoot, Transform participantTarget)
+    {
+        if (ct.IsChildOf(npcRoot)) return true;                                   // the querying NPC's own colliders (any depth)
+        if (participantRoot != null && ct.IsChildOf(participantRoot)) return true;  // the participant is the endpoint, not an obstacle
+        return ct == participantTarget || ct.IsChildOf(participantTarget);
     }
 }

@@ -115,6 +115,11 @@ public class DataCaptureManager : MonoBehaviour
              "Values below the base interval are raised to it (no throttling room).")]
     public float npcStateMaxIntervalSeconds = 2f;
 
+    [Tooltip("Run the NPC -> participant line-of-sight queries of one npc_state snapshot as a single batch on the Unity job system (worker threads) instead of one synchronous raycast sequence per NPC on the main thread. " +
+             "The answer for every NPC is identical (same queries, same physics scene, same filtering; see NpcLosBatch.cs / NpcLineOfSight.Query); only where the work runs changes. Turn off to use the previous single-threaded path. " +
+             "The batch disables itself for the rest of the session if the job system reports an error.")]
+    public bool npcStateBatchedLineOfSight = true;
+
     [Header("NPC state sampling - live readout (written by the recorder, read-only)")]
     [SerializeField, Tooltip("Interval currently used between complete snapshots (equals the base interval unless the budget is throttling).")]
     float readoutEffectiveIntervalSeconds;
@@ -348,6 +353,11 @@ public class DataCaptureManager : MonoBehaviour
         public bool destAssigned;       // the FIRST valid destination of this lifetime has been observed (N2: that observation is an initial assignment, never a "change")
         public Animator anim;           // humanoid animator for the LOS eye point (resolved once)
         public bool animLooked;
+        public Transform headBone;      // the humanoid head bone used as the LOS eye point (resolved once, re-resolved if it was destroyed)
+        public string agentIdS;         // S(agentId), computed once: agentId never changes for a registry entry
+        public LosStatus losPre;        // line-of-sight status computed by the snapshot's batch pre-pass (valid only while losPreValid)
+        public bool losPreValid;
+        public int losIdx;              // index of this NPC's query inside the batch
     }
     readonly int[] _losCounts = new int[7];   // per LosStatus, cumulative over the session
     // Registry of OPEN lifetimes (one entry per pooled object that is currently an active NPC).
@@ -359,7 +369,10 @@ public class DataCaptureManager : MonoBehaviour
     int _losMask;
 
     readonly List<string> _rf = new List<string>(48);       // reusable row buffer
-    readonly List<string> _npcLines = new List<string>(64); // reusable batch buffer
+    readonly CsvRowBuilder _npcRows = new CsvRowBuilder(1 << 20);   // npc_state.csv rows of the current snapshot (CsvRowBuilder.cs)
+    NpcLosBatch _losBatch;                                          // batched line-of-sight queries of the current snapshot (NpcLosBatch.cs)
+    bool _losBatchFailed;
+    readonly List<NpcRec> _losRecs = new List<NpcRec>(256);
 
     RiverTeleportPoint[] _riverPoints;
 
@@ -609,6 +622,7 @@ public class DataCaptureManager : MonoBehaviour
 
     void OnDestroy()
     {
+        if (_losBatch != null) { _losBatch.Dispose(); _losBatch = null; }   // native arrays of the batched line-of-sight queries
         if (_hookedEyeLifecycle != null) { _hookedEyeLifecycle.Transitioned -= OnEyeTrackingTransition; _hookedEyeLifecycle = null; }
         if (RecordingBlocked) { NpcLifecycleBus.ClearGate(_npcGate); return; }
         if (_experimentManager != null)
@@ -1305,8 +1319,51 @@ public class DataCaptureManager : MonoBehaviour
 
     string CapturePeriod() => _npcWarmupActive ? "warmup" : (_trialActive ? "trial" : "pre_trial");
 
+    // Pre-pass of SampleNpcs: the line-of-sight status of every sampled NPC in ONE batch of physics raycasts on the job system (NpcLosBatch). The NPCs and their order are exactly those of the row loop below.
+    void RunLosBatch()
+    {
+        _losRecs.Clear();
+        try
+        {
+#if NPC_PERF_DIAG
+            long _p0 = NpcPerfDiag.Now;
+#endif
+            if (_losBatch == null) _losBatch = new NpcLosBatch();
+            _losBatch.Begin(ViewTransform != null ? ViewTransform : _centerEye, _playerRig, _losMask);
+            foreach (var kv in _npcByAgent)
+            {
+                NpcRec rec = kv.Value;
+                if (rec.tr == null || rec.pa == null) continue;
+                if (!rec.pa.HasOpenLifetime || rec.pa.LifetimeId != rec.lifetimeId) continue;
+                if (rec.anim == null && !rec.animLooked) { rec.anim = rec.pa.GetComponentInChildren<Animator>(true); rec.animLooked = true; }
+                Vector3 eye;
+                Vector3? eyeOpt = NpcLineOfSight.TryGetNpcEyePointCached(rec.tr, rec.agent, rec.anim, ref rec.headBone, out eye) ? eye : (Vector3?)null;
+                rec.losIdx = _losBatch.Add(eyeOpt, rec.tr);
+                _losRecs.Add(rec);
+            }
+#if NPC_PERF_DIAG
+            long _p1 = NpcPerfDiag.Now; NpcPerfDiag.EyeTicks += _p1 - _p0;
+#endif
+            _losBatch.Run();
+            for (int i = 0; i < _losRecs.Count; i++) { _losRecs[i].losPre = _losBatch.Result(_losRecs[i].losIdx); _losRecs[i].losPreValid = true; }
+#if NPC_PERF_DIAG
+            NpcPerfDiag.LosTicks += NpcPerfDiag.Now - _p1;
+            NpcPerfDiag.Raycasts += _losRecs.Count;
+#endif
+        }
+        catch (Exception e)
+        {
+            _losBatchFailed = true;
+            for (int i = 0; i < _losRecs.Count; i++) _losRecs[i].losPreValid = false;   // this snapshot falls back to the per-NPC path, and so does every later one
+            WarnOnce("los_batch", "batched line-of-sight failed, using the per-NPC path from now on: " + e.GetType().Name + ": " + e.Message);
+        }
+    }
+
     void SampleNpcs()
     {
+#if NPC_PERF_DIAG
+        long _dT0 = NpcPerfDiag.Now;
+#endif
         if (!NpcStateSamplingActive) return;
 
         // Cheap safety net: the registry should always hold exactly the spawner's live population.
@@ -1321,7 +1378,12 @@ public class DataCaptureManager : MonoBehaviour
         string tAbsS = F(tAbs), tUnixS = tUnix.ToString(CultureInfo.InvariantCulture), frameS = frame.ToString(CultureInfo.InvariantCulture);
         string sessionS = S(SessionId), partS = S(CurrentPart), phaseS = S(CurrentPhase), periodS = CapturePeriod();
 
-        _npcLines.Clear();
+        _npcRows.Clear();
+        // Values shared by every row of this snapshot are escaped once (CsvRowBuilder.Field would re-check them for every NPC).
+        string tAbsE = CsvRowBuilder.Escape(tAbsS), tUnixE = CsvRowBuilder.Escape(tUnixS), frameE = CsvRowBuilder.Escape(frameS), sessionE = CsvRowBuilder.Escape(sessionS),
+               partE = CsvRowBuilder.Escape(partS), phaseE = CsvRowBuilder.Escape(phaseS), periodE = CsvRowBuilder.Escape(periodS);
+
+        if (npcStateBatchedLineOfSight && !_losBatchFailed) RunLosBatch();
 
         foreach (var kv in _npcByAgent)
         {
@@ -1329,6 +1391,9 @@ public class DataCaptureManager : MonoBehaviour
             if (rec.tr == null || rec.pa == null) continue;
             if (!rec.pa.HasOpenLifetime || rec.pa.LifetimeId != rec.lifetimeId) continue;   // ended / replaced: never sampled under an old ID
 
+#if NPC_PERF_DIAG
+            long _d1 = NpcPerfDiag.Now;
+#endif
             Vector3 pos = rec.tr.position;
             float yaw = rec.tr.eulerAngles.y;
             Quaternion rot = rec.tr.rotation;
@@ -1354,50 +1419,72 @@ public class DataCaptureManager : MonoBehaviour
             if (rec.mt != null)
                 mtTarget = rec.mt.targetTransform != null ? rec.mt.targetTransform.position : rec.mt.targetPosition;
 
+#if NPC_PERF_DIAG
+            long _d2 = NpcPerfDiag.Now; NpcPerfDiag.ReadTicks += _d2 - _d1;
+#endif
             // F-10: NPC eye point -> participant head, ignoring the NPC's own colliders and the participant's; blank (never 0) when it cannot be answered.
-            if (rec.anim == null && !rec.animLooked) { rec.anim = rec.pa.GetComponentInChildren<Animator>(true); rec.animLooked = true; }
-            Vector3 eye;
-            Vector3? eyeOpt = NpcLineOfSight.TryGetNpcEyePoint(rec.tr, rec.agent, rec.anim, out eye) ? eye : (Vector3?)null;
-            LosStatus losStatus = NpcLineOfSight.Query(eyeOpt, rec.tr, ViewTransform != null ? ViewTransform : _centerEye, _playerRig, _losMask);   // aim at the RENDERED view (schema v13); the OVR anchor sits a Camera Floor Offset lower
+            // With the batched path the status was already computed for every NPC by RunLosBatch (same eye point, same queries); otherwise it is computed here, one NPC at a time.
+            LosStatus losStatus;
+            if (rec.losPreValid) { losStatus = rec.losPre; rec.losPreValid = false; }
+            else
+            {
+                if (rec.anim == null && !rec.animLooked) { rec.anim = rec.pa.GetComponentInChildren<Animator>(true); rec.animLooked = true; }
+                Vector3 eye;
+                Vector3? eyeOpt = NpcLineOfSight.TryGetNpcEyePointCached(rec.tr, rec.agent, rec.anim, ref rec.headBone, out eye) ? eye : (Vector3?)null;
+#if NPC_PERF_DIAG
+                long _d3 = NpcPerfDiag.Now; NpcPerfDiag.EyeTicks += _d3 - _d2;
+#endif
+                losStatus = NpcLineOfSight.Query(eyeOpt, rec.tr, ViewTransform != null ? ViewTransform : _centerEye, _playerRig, _losMask);   // aim at the RENDERED view (schema v13); the OVR anchor sits a Camera Floor Offset lower
+#if NPC_PERF_DIAG
+                NpcPerfDiag.LosTicks += NpcPerfDiag.Now - _d3;
+#endif
+            }
+#if NPC_PERF_DIAG
+            long _d4 = NpcPerfDiag.Now;
+#endif
             _losCounts[(int)losStatus]++;
             string los = losStatus == LosStatus.Clear ? "1" : (losStatus == LosStatus.Blocked ? "0" : "");
 
             rec.sampleSeq++;
 
-            _rf.Clear();
-            _rf.Add(tAbsS);
-            _rf.Add(tUnixS);
-            _rf.Add(frameS);
-            _rf.Add(S(rec.agentId));
-            _rf.Add(rec.lifetimeId);
-            _rf.Add(F(pos.x)); _rf.Add(F(pos.y)); _rf.Add(F(pos.z));
-            _rf.Add(F(yaw));
-            _rf.Add(F(vel.x)); _rf.Add(F(vel.y)); _rf.Add(F(vel.z));
-            _rf.Add(F(navDest.x)); _rf.Add(F(navDest.y)); _rf.Add(F(navDest.z));
-            _rf.Add(state);
-            _rf.Add(F(speed));
-            _rf.Add(F(desired.x)); _rf.Add(F(desired.z));
-            _rf.Add(F(mtTarget.x)); _rf.Add(F(mtTarget.y)); _rf.Add(F(mtTarget.z));
-            _rf.Add(hasPath ? "1" : "0");
-            _rf.Add(pathPending ? "1" : "0");
-            _rf.Add(los);
+            // Row assembled directly in the snapshot's StringBuilder (CsvRowBuilder): the same fields, in the same order, with the same formatting and quoting as the former List<string> + Join path.
+            CsvRowBuilder rb = _npcRows;
+            rb.Verbatim(tAbsE);
+            rb.Verbatim(tUnixE);
+            rb.Verbatim(frameE);
+            rb.Field(rec.agentIdS ?? (rec.agentIdS = S(rec.agentId)));
+            rb.Field(rec.lifetimeId);
+            rb.F4(pos.x); rb.F4(pos.y); rb.F4(pos.z);
+            rb.F4(yaw);
+            rb.F4(vel.x); rb.F4(vel.y); rb.F4(vel.z);
+            rb.F4(navDest.x); rb.F4(navDest.y); rb.F4(navDest.z);
+            rb.Field(state);
+            rb.F4(speed);
+            rb.F4(desired.x); rb.F4(desired.z);
+            rb.F4(mtTarget.x); rb.F4(mtTarget.y); rb.F4(mtTarget.z);
+            rb.Verbatim(hasPath ? "1" : "0");
+            rb.Verbatim(pathPending ? "1" : "0");
+            rb.Verbatim(los);
             // ---- appended (schema v2) ----
-            _rf.Add(sessionS); _rf.Add(partS); _rf.Add(phaseS); _rf.Add(periodS);
-            _rf.Add(rec.sampleSeq.ToString(CultureInfo.InvariantCulture));
-            _rf.Add(rec.lifetimeIndex.ToString(CultureInfo.InvariantCulture));
-            _rf.Add(F(rot.x)); _rf.Add(F(rot.y)); _rf.Add(F(rot.z)); _rf.Add(F(rot.w));
-            _rf.Add(onMesh ? F(agentSpeed) : "");
-            _rf.Add(rec.pa.CurrentItineraryIndex.ToString(CultureInfo.InvariantCulture));
-            _rf.Add(rec.pa.ItineraryCount.ToString(CultureInfo.InvariantCulture));
-            _rf.Add(S(rec.pa.CurrentTargetName));
-            _rf.Add(onMesh ? "1" : "0");
+            rb.Verbatim(sessionE); rb.Verbatim(partE); rb.Verbatim(phaseE); rb.Verbatim(periodE);
+            rb.Int(rec.sampleSeq);
+            rb.Int(rec.lifetimeIndex);
+            rb.F4(rot.x); rb.F4(rot.y); rb.F4(rot.z); rb.F4(rot.w);
+            if (onMesh) rb.F4(agentSpeed); else rb.Verbatim("");
+            rb.Int(rec.pa.CurrentItineraryIndex);
+            rb.Int(rec.pa.ItineraryCount);
+            rb.Field(S(rec.pa.CurrentTargetName));
+            rb.Verbatim(onMesh ? "1" : "0");
             // ---- appended (schema v3): UncertainBehavior, read from the production component's state machine at this sample ----
             bool uActive = rec.pa.UncertainActive;
-            _rf.Add(rec.pa.HasUncertainComponent ? (uActive ? "1" : "0") : "");
-            _rf.Add(uActive ? rec.pa.UncertainStateLabel : "");
-            _rf.Add(uActive ? rec.pa.UncertainLookPhaseLabel : "");
-            _rf.Add(NpcLineOfSight.Name(losStatus));   // schema v7: why los_clear_to_participant is 1 / 0 / blank
-            _npcLines.Add(_npcState.Join(_rf));
+            rb.Verbatim(rec.pa.HasUncertainComponent ? (uActive ? "1" : "0") : "");
+            rb.Field(uActive ? rec.pa.UncertainStateLabel : "");
+            rb.Field(uActive ? rec.pa.UncertainLookPhaseLabel : "");
+            rb.Verbatim(NpcLineOfSight.Name(losStatus));   // schema v7: why los_clear_to_participant is 1 / 0 / blank
+            rb.EndRow();
+#if NPC_PERF_DIAG
+            long _d5 = NpcPerfDiag.Now; NpcPerfDiag.FormatTicks += _d5 - _d4; NpcPerfDiag.Rows++;
+#endif
 
             // Edge detection of NAV destination changes (arrival / dwell edges are now raised directly by PedestrianAgent at the real moment).
             if (!rec.hasLastState) { rec.lastState = state; rec.hasLastState = true; }
@@ -1426,16 +1513,26 @@ public class DataCaptureManager : MonoBehaviour
                     "cause=" + cause + causeExtra + ";jump_m=" + F((navDest - rec.lastDest).magnitude) + ";prev_dest=" + F(rec.lastDest.x) + "|" + F(rec.lastDest.z), tAbs, tUnix);
                 rec.lastDest = navDest;
             }
+#if NPC_PERF_DIAG
+            NpcPerfDiag.EventTicks += NpcPerfDiag.Now - _d5;
+#endif
         }
 
-        if (_npcLines.Count > 0) _npcProduced = true;
+        if (_npcRows.Rows > 0) _npcProduced = true;
+#if NPC_PERF_DIAG
+        long _dW0 = NpcPerfDiag.Now;
+#endif
         long before = _npcState.BytesWritten;
         bool firstWrite = before == 0;
-        _npcState.WriteLines(_npcLines);   // one open/write/close per tick for the whole population (always the COMPLETE population)
-        if (_npcLines.Count == 0 || _npcState.BytesWritten == before) return;   // nothing reached the disk: no volume statistics
+        _npcState.WriteRows(_npcRows.Text, _npcRows.Rows);
+#if NPC_PERF_DIAG
+        NpcPerfDiag.WriteTicks += NpcPerfDiag.Now - _dW0; NpcPerfDiag.Snapshots++; NpcPerfDiag.TotalTicks += NpcPerfDiag.Now - _dT0;
+#endif
+          // one open/write/close per tick for the whole population (always the COMPLETE population)
+        if (_npcRows.Rows == 0 || _npcState.BytesWritten == before) return;   // nothing reached the disk: no volume statistics
 
         long rowBytes = _npcState.BytesWritten - before - (firstWrite ? _npcState.HeaderBytes : 0);
-        _rate.OnSnapshot(tAbs, _npcLines.Count, rowBytes, _npcByAgent.Count);
+        _rate.OnSnapshot(tAbs, _npcRows.Rows, rowBytes, _npcByAgent.Count);
         UpdateRateReadout();
     }
 

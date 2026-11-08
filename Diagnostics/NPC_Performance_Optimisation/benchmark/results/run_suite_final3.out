@@ -1,0 +1,7 @@
+exit=2
+{'total': '400', 'passed': '387', 'failed': '5', 'skipped': '8', 'inconclusive': '0'}
+FAIL NpcLifecycleTests.Gaze_RowsCarryPhaseAndCurrentTarget_EvaluatedAtTheSampleTimestamp   row @68.8826: the label written at record time equals the label reconstructed from phase events   Expected string length 9 but was 10. Strings differ at index 3.   Expected: "d1_search"   But was:  "d1_pending"   --------------^ 
+FAIL NpcLifecycleTests.Part2Flow_ParticipantControl_Task1Free_ContinuePanelLocked_ReleasedByTheContinue_ExactlyOnce_TeleportUnchanged   Expected: True   But was:  False 
+FAIL NpcLifecycleTests.Phase_Part2_ProductionFlow_SeparatesPanelReadingFromTaskTime_AndLabelsEverySample   GAZE row t_abs=141.6380 phases: p2_start_pending@140.7341, p2_task1@141.0350, p2_continue_pending@141.6381, p2_task2@142.2392, ended@142.8417   Expected string length 19 but was 8. Strings differ at index 3.   Expected: "p2_continue_pending"   But was:  "p2_task1"   --------------^ 
+FAIL TerrainLayerTests.AutoGroundAlign_IgnoresATerrainLeftOnTheDefaultLayer_ThisIsWhyTheLayerCorrectionChangesIt   the same terrain on Ground: the rig is aligned   Expected: 100.0d +/- 0.0020000000949949026d   But was:  100.00289154052734d 
+FAIL TerrainLayerTests.AutoGroundAlign_SettlesOnAGroundLayerTerrain_MonotonicallyWithoutOscillation_AndStaysThereWhenStationary   the base settles on the terrain surface   Expected: 100.0d +/- 0.0020000000949949026d   But was:  100.00254821777344d 

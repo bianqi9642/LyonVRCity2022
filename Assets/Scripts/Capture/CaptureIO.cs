@@ -71,6 +71,43 @@ public static class CaptureIO
         finally { fs?.Dispose(); }
     }
 
+    /// <summary>
+    /// Appends the content of a StringBuilder without materialising it as one string or one byte array (a snapshot of 5 000 NPC rows is ~1.6 MB: the old path built a ~3 MB string and a ~1.6 MB byte[]).
+    /// Same steps and fault-injection points as AppendText (open, append, flush) and the same bytes (UTF-8 without BOM; a stateful encoder keeps a surrogate pair split across blocks intact).
+    /// Returns the number of bytes written.
+    /// </summary>
+    public static long AppendBuilder(string path, StringBuilder text, string writeOp = "append")
+    {
+        FileStream fs = null;
+        long total = 0;
+        try
+        {
+            Step(path, "open", () => fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read));
+            Step(path, writeOp, () =>
+            {
+                Encoder enc = Utf8NoBom.GetEncoder();
+                int len = text.Length;
+                for (int i = 0; i < len; i += s_charBuf.Length)
+                {
+                    int c = Math.Min(s_charBuf.Length, len - i);
+                    text.CopyTo(i, s_charBuf, 0, c);
+                    int need = Utf8NoBom.GetMaxByteCount(c);
+                    if (s_encBuf.Length < need) s_encBuf = new byte[need];
+                    int n = enc.GetBytes(s_charBuf, 0, c, s_encBuf, 0, false);
+                    if (n > 0) { fs.Write(s_encBuf, 0, n); total += n; }
+                }
+                int tail = enc.GetBytes(s_charBuf, 0, 0, s_encBuf, 0, true);   // flush a dangling high surrogate (cannot happen for well-formed text)
+                if (tail > 0) { fs.Write(s_encBuf, 0, tail); total += tail; }
+            });
+            Step(path, "flush", () => fs.Flush(false));
+        }
+        finally { fs?.Dispose(); }
+        return total;
+    }
+
+    static byte[] s_encBuf = new byte[1 << 16];   // main-thread only (every capture write runs on the Unity main thread)
+    static readonly char[] s_charBuf = new char[1 << 14];
+
     /// <summary>True when the file is non-empty and its last byte is a line feed (or the file does not exist / is empty).</summary>
     public static bool EndsWithNewlineOrEmpty(string path)
     {

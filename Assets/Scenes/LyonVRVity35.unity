@@ -182988,6 +182988,7 @@ MonoBehaviour:
   npcStateSamplingIntervalSeconds: 0.1
   npcStateDataBudgetMBPerMinute: 0
   npcStateMaxIntervalSeconds: 2
+  npcStateBatchedLineOfSight: 1
   readoutEffectiveIntervalSeconds: 0
   readoutObservedMBPerMinute: 0
   readoutActiveNpcs: 0
@@ -246531,11 +246532,11 @@ MonoBehaviour:
   faceTrackingMaxWaitSeconds: 5
   faceTrackingRequired: 0
   restrictRiverTeleportToPart3: 1
-  part1Duration: 15
-  part2FirstDuration: 15
-  part2SecondDuration: 15
-  part3Destination1MaxSeconds: 30
-  part3TotalMaxSeconds: 60
+  part1Duration: 300
+  part2FirstDuration: 300
+  part2SecondDuration: 300
+  part3Destination1MaxSeconds: 600
+  part3TotalMaxSeconds: 900
   part1Config:
     npcEnabled: 0
     npcDirectedMovement: 0
@@ -246557,7 +246558,7 @@ MonoBehaviour:
   lockParticipantWhileDestination2Panel: 1
   lockParticipantWhilePart2ContinuePanel: 1
   enableLifecycleLogs: 1
-  npcWarmupDuration: 20
+  npcWarmupDuration: 450
   holdNpcsUntilStart: 1
   waitForHeadsetBeforeStartPanel: 1
   part1StartPosition: {fileID: 1571442372}
@@ -320816,7 +320817,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   participantId: 1
-  selectedPart: 2
+  selectedPart: 3
   part2GroupIndex: 0
   part3GroupIndex: 2
   autoStart: 1

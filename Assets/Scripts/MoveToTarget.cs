@@ -517,6 +517,9 @@ public class MoveToTarget : MonoBehaviour
             if (Time.time - lastTargetUpdateTime >= targetUpdateInterval)
             {
                 Vector3 targetPos = targetTransform.position;
+#if NPC_PERF_DIAG
+                NpcPerfDiag.TargetReissues++; if (agent.hasPath && !agent.pathPending && (agent.destination - targetPos).sqrMagnitude < 0.01f) NpcPerfDiag.TargetReissuesSameDest++;
+#endif
                 agent.SetDestination(targetPos);
                 lastTargetUpdateTime = Time.time;
                 resampleAttempts = 0;

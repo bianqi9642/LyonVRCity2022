@@ -1,0 +1,16 @@
+base 1 {'total': '2', 'passed': '2', 'failed': '0', 'skipped': '0', 'inconclusive': '0'} fails=0
+cur 1 {'total': '2', 'passed': '2', 'failed': '0', 'skipped': '0', 'inconclusive': '0'} fails=0
+base 2 {'total': '2', 'passed': '2', 'failed': '0', 'skipped': '0', 'inconclusive': '0'} fails=0
+cur 2 {'total': '2', 'passed': '2', 'failed': '0', 'skipped': '0', 'inconclusive': '0'} fails=0
+base 3 {'total': '2', 'passed': '1', 'failed': '1', 'skipped': '0', 'inconclusive': '0'} fails=1
+cur 3 {'total': '2', 'passed': '2', 'failed': '0', 'skipped': '0', 'inconclusive': '0'} fails=0
+base 4 {'total': '2', 'passed': '1', 'failed': '1', 'skipped': '0', 'inconclusive': '0'} fails=1
+cur 4 {'total': '2', 'passed': '2', 'failed': '0', 'skipped': '0', 'inconclusive': '0'} fails=0
+base 5 {'total': '2', 'passed': '2', 'failed': '0', 'skipped': '0', 'inconclusive': '0'} fails=0
+cur 5 {'total': '2', 'passed': '2', 'failed': '0', 'skipped': '0', 'inconclusive': '0'} fails=0
+base 6 {'total': '2', 'passed': '2', 'failed': '0', 'skipped': '0', 'inconclusive': '0'} fails=0
+cur 6 {'total': '2', 'passed': '2', 'failed': '0', 'skipped': '0', 'inconclusive': '0'} fails=0
+base 7 {'total': '2', 'passed': '2', 'failed': '0', 'skipped': '0', 'inconclusive': '0'} fails=0
+cur 7 {'total': '2', 'passed': '2', 'failed': '0', 'skipped': '0', 'inconclusive': '0'} fails=0
+base 8 {'total': '2', 'passed': '2', 'failed': '0', 'skipped': '0', 'inconclusive': '0'} fails=0
+cur 8 {'total': '2', 'passed': '2', 'failed': '0', 'skipped': '0', 'inconclusive': '0'} fails=0

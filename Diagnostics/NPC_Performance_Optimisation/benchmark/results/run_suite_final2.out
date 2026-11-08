@@ -1,0 +1,6 @@
+exit=2
+{'total': '399', 'passed': '387', 'failed': '4', 'skipped': '8', 'inconclusive': '0'}
+FAIL NpcLifecycleTests.Part2Flow_ParticipantControl_Task1Free_ContinuePanelLocked_ReleasedByTheContinue_ExactlyOnce_TeleportUnchanged   Expected: True   But was:  False 
+FAIL NpcLifecycleTests.Phase_Part2_ProductionFlow_SeparatesPanelReadingFromTaskTime_AndLabelsEverySample   GAZE row t_abs=141.5793 phases: p2_start_pending@140.6751, p2_task1@140.9760, p2_continue_pending@141.5794, p2_task2@142.1805, ended@142.7830   Expected string length 19 but was 8. Strings differ at index 3.   Expected: "p2_continue_pending"   But was:  "p2_task1"   --------------^ 
+FAIL TerrainLayerTests.AutoGroundAlign_IgnoresATerrainLeftOnTheDefaultLayer_ThisIsWhyTheLayerCorrectionChangesIt   the same terrain on Ground: the rig is aligned   Expected: 100.0d +/- 0.0020000000949949026d   But was:  100.00289916992188d 
+FAIL TerrainLayerTests.AutoGroundAlign_SettlesOnAGroundLayerTerrain_MonotonicallyWithoutOscillation_AndStaysThereWhenStationary   the base settles on the terrain surface   Expected: 100.0d +/- 0.0020000000949949026d   But was:  100.00238800048828d 

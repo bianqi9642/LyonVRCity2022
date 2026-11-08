@@ -1,0 +1,5 @@
+exit=2
+{'total': '399', 'passed': '388', 'failed': '3', 'skipped': '8', 'inconclusive': '0'}
+FAIL NpcLifecycleTests.Part2Flow_ParticipantControl_Task1Free_ContinuePanelLocked_ReleasedByTheContinue_ExactlyOnce_TeleportUnchanged   Expected: True   But was:  False 
+FAIL TerrainLayerTests.AutoGroundAlign_IgnoresATerrainLeftOnTheDefaultLayer_ThisIsWhyTheLayerCorrectionChangesIt   the same terrain on Ground: the rig is aligned   Expected: 100.0d +/- 0.0020000000949949026d   But was:  100.00279998779297d 
+FAIL TerrainLayerTests.AutoGroundAlign_SettlesOnAGroundLayerTerrain_MonotonicallyWithoutOscillation_AndStaysThereWhenStationary   the base settles on the terrain surface   Expected: 100.0d +/- 0.0020000000949949026d   But was:  100.0025634765625d 

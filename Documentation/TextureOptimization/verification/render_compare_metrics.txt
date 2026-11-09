@@ -1,0 +1,6 @@
+image                                      meanAbsΔ     p95Δ     fg%  meanBef  meanAft
+Traceback (most recent call last):
+  File "/private/tmp/claude-501/-Users-qiaoy--claude-spares-spare-2IQxn9/bbe05a9b-5b72-489c-88aa-64b0f0a92270/scratchpad/cmp.py", line 23, in <module>
+    names=sorted(os.listdir("render_before"))
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'render_before'

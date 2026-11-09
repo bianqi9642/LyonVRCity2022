@@ -8,6 +8,10 @@ PrefabInstance:
     serializedVersion: 3
     m_TransformParent: {fileID: 0}
     m_Modifications:
+    - target: {fileID: -5796455465781500386, guid: 9d6f2ca284b1e4a939b95491d867c263, type: 3}
+      propertyPath: m_Materials.Array.data[0]
+      value: 
+      objectReference: {fileID: 2100000, guid: bdf28e5c7b6594cd8b9fe48c985c824f, type: 2}
     - target: {fileID: 1977086440144698802, guid: 9d6f2ca284b1e4a939b95491d867c263, type: 3}
       propertyPath: m_Name
       value: 69386BM66

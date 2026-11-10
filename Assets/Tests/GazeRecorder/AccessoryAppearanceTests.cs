@@ -160,4 +160,83 @@ public class AccessoryAppearanceTests
         Assert.AreSame(placeholderMaterial, accessories.sharedMaterials[0]);
         Assert.AreEqual(-2, Get<int>(LastAccessories(), "optionIndex"));
     }
+
+    // ------------------------------------------------------------------ Part 3 rule: a wandering NPC wears no accessory (suppressAccessory)
+
+    void ApplySuppressed()
+    {
+        var m = app.GetType().GetMethod("ApplyProfile", new[] { profile.GetType(), T("AgentGender"), typeof(bool) });
+        Assert.IsNotNull(m, "AppearanceController.ApplyProfile(AgentProfile, AgentGender, bool suppressAccessory) not found");
+        m.Invoke(app, new object[] { profile, male, true });
+    }
+
+    [Test]
+    public void Suppressed_WearsNoAccessory_WhateverTheProfileShare_AndIsRecordedAsSuppressed()
+    {
+        foreach (var opts in new[] { new[] { Bracelet(meshL, 1f) }, new[] { Bracelet(meshL, 1f), None(1f) }, new[] { None(1f) } })   // 100 %, 50 %, 0 % accessory
+        {
+            SetOptions(opts);
+            for (int i = 0; i < 40; i++)
+            {
+                ApplySuppressed();
+                Assert.IsNull(accessories.sharedMesh, "no accessory mesh");
+                foreach (Material m in accessories.sharedMaterials) Assert.IsNull(m, "no accessory material");
+                Assert.AreEqual(-3, Get<int>(LastAccessories(), "optionIndex"), "recorded as deliberately suppressed");
+                Assert.AreEqual("", Get<string>(LastAccessories(), "MeshName"));
+            }
+        }
+    }
+
+    [Test]
+    public void Suppressed_ClearsTheAccessoryEvenWhenTheProfileOffersNoAccessoryOptions()
+    {
+        SetOptions();
+        ApplySuppressed();
+        Assert.IsNull(accessories.sharedMesh, "the prefab placeholder accessory is removed as well");
+        Assert.AreEqual(-3, Get<int>(LastAccessories(), "optionIndex"));
+    }
+
+    [Test]
+    public void PoolReuse_SuppressedAndNormalLifetimesAlternate_WithoutLeaks()
+    {
+        for (int cycle = 0; cycle < 8; cycle++)
+        {
+            ApplyOnly(Bracelet(meshL, 1f));                                  // Part 3 attractor with accessory
+            Assert.AreSame(meshL, accessories.sharedMesh);
+            ApplySuppressed();                                               // -> Part 3 wandering: none
+            Assert.IsNull(accessories.sharedMesh); Assert.IsNull(accessories.sharedMaterials[0]);
+            ApplySuppressed();                                               // wandering -> wandering: none
+            Assert.IsNull(accessories.sharedMesh);
+            ApplyOnly(Bracelet(meshR, 1f));                                  // wandering -> attractor: the profile decides again
+            Assert.AreSame(meshR, accessories.sharedMesh); Assert.Contains(accessories.sharedMaterials[0], colours);
+            ApplyOnly(Bracelet(meshL, 1f));                                  // attractor -> attractor: re-evaluated for the new lifetime
+            Assert.AreSame(meshL, accessories.sharedMesh);
+            ApplyOnly(None(1f));                                             // attractor without accessory
+            ApplySuppressed();
+            Assert.IsNull(accessories.sharedMesh);
+        }
+    }
+
+    [Test]
+    public void AfterASuppressedLifetime_AProfileWithoutAccessoryOptions_GetsThePrefabAccessoryBack()
+    {
+        ApplySuppressed();                       // very first application is a suppressed one: the authored look must still be remembered
+        Assert.IsNull(accessories.sharedMesh);
+        SetOptions();
+        Apply();                                 // Part 2 style lifetime with a profile that offers nothing: the prefab's own accessory, as always
+        Assert.AreSame(placeholderMesh, accessories.sharedMesh);
+        Assert.AreSame(placeholderMaterial, accessories.sharedMaterials[0]);
+        Assert.AreEqual(-2, Get<int>(LastAccessories(), "optionIndex"));
+    }
+
+    [Test]
+    public void Suppression_DrawsNothingForTheAccessory_SoTheOtherAppearanceDrawsAreIndependentOfProfileShare()
+    {
+        // With the accessory suppressed, no random value is consumed for it: the next UnityEngine.Random value does not depend on the profile's accessory options.
+        SetOptions(Bracelet(meshL, 1f), None(1f));
+        UnityEngine.Random.InitState(5); ApplySuppressed(); float a = UnityEngine.Random.value;
+        SetOptions(None(1f));
+        UnityEngine.Random.InitState(5); ApplySuppressed(); float b = UnityEngine.Random.value;
+        Assert.AreEqual(a, b);
+    }
 }

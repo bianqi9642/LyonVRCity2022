@@ -2493,6 +2493,7 @@ public class DataCaptureManager : MonoBehaviour
         string entrance = (_spawner != null && _spawner.EntranceRngSeeded) ? ("seed=" + _spawner.EntranceRngSeed.ToString(System.Globalization.CultureInfo.InvariantCulture) + " (TickCount-based)") : "not_yet_created";
         _manifest.npc_random_sources =
             "UnityEngine.Random: not seeded (Unity's own startup seed, not readable); entrance placement: private System.Random " + entrance +
+            "; Part 3 movement-strategy draw: private System.Random " + (_spawner != null ? "seed=" + _spawner.Part3MovementAssignmentSeedEffective.ToString(System.Globalization.CultureInfo.InvariantCulture) + " (draws=" + _spawner.Part3MovementDraws.ToString(System.Globalization.CultureInfo.InvariantCulture) + ")" : "not_available") +
             "; AttractorDwell: one TickCount-seeded System.Random per instance. A fixed warm-up duration standardises the preparation period only; NPC trajectories are NOT identical across sessions " +
             "and are not replayable.";
     }

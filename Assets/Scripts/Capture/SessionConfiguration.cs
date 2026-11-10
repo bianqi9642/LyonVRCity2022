@@ -66,6 +66,10 @@ public sealed class SceneSettings
     public bool AllowWrongCandidateSelection, RestrictRiverTeleportToPart3;
     public int SpawnerMaxAgents, SpawnerPoolPrewarm;
     public float SpawnerSpawnInterval, SpawnerDwellTimeMin, SpawnerDwellTimeMax;
+    /// <summary>SpawnerManager.part3AttractorMovementProbability (0..1): the PER-SPAWN probability that a new Part 3 NPC uses attractor movement. Defaults to 1 (all attractor).</summary>
+    public float SpawnerPart3AttractorProbability = Part3MovementStrategySelector.DefaultAttractorProbability;
+    /// <summary>The effective seed of the private Part 3 movement-strategy random stream (explicit Inspector value, or the clock-derived one).</summary>
+    public int SpawnerPart3MovementSeed;
     public string AgentProfileName = "", AgentProfileHash = "";
 }
 
@@ -138,6 +142,10 @@ public sealed class EffectiveSettings
     public float SpawnerSpawnInterval { get; private set; }
     public float SpawnerDwellTimeMin { get; private set; }
     public float SpawnerDwellTimeMax { get; private set; }
+    /// <summary>Part 3 NPC movement mixture: the configured per-spawn probability of attractor movement (frozen with the other scene-owned conditions).</summary>
+    public float SpawnerPart3AttractorProbability { get; private set; }
+    /// <summary>Effective seed of the private Part 3 movement-strategy stream.</summary>
+    public int SpawnerPart3MovementSeed { get; private set; }
     public string AgentProfileName { get; private set; }
     public string AgentProfileHash { get; private set; }
     /// <summary>Every effective setting (key, value text, source) in a stable order.</summary>
@@ -191,6 +199,11 @@ public sealed class EffectiveSettings
         e.SpawnerSpawnInterval = sc.SpawnerSpawnInterval; Add("spawner_spawn_interval_seconds", F(e.SpawnerSpawnInterval), scene);
         e.SpawnerDwellTimeMin = sc.SpawnerDwellTimeMin; Add("spawner_dwell_time_min_seconds", F(e.SpawnerDwellTimeMin), scene);
         e.SpawnerDwellTimeMax = sc.SpawnerDwellTimeMax; Add("spawner_dwell_time_max_seconds", F(e.SpawnerDwellTimeMax), scene);
+        // Part 3 per-spawn attractor probability + the effective seed of its private random stream. No other key describes this setting.
+        e.SpawnerPart3AttractorProbability = Part3MovementStrategySelector.SanitizeProbability(sc.SpawnerPart3AttractorProbability);
+        Add("spawner_part3_attractor_movement_probability", F(e.SpawnerPart3AttractorProbability), scene);
+        e.SpawnerPart3MovementSeed = sc.SpawnerPart3MovementSeed;
+        Add("spawner_part3_movement_assignment_seed", e.SpawnerPart3MovementSeed.ToString(System.Globalization.CultureInfo.InvariantCulture), scene);
         e.AgentProfileName = sc.AgentProfileName ?? ""; Add("agent_profile_name", e.AgentProfileName, scene);
         e.AgentProfileHash = sc.AgentProfileHash ?? ""; Add("agent_profile_hash", e.AgentProfileHash, scene);
 

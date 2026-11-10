@@ -24,6 +24,21 @@
 //   at the exit (-> OnAgentFinished -> pool). How each kind of waypoint is completed (arrival event + dwell for
 //   Part 3 attractors; 1.5 m look-ahead without dwell for Part 2 wandering points) is PedestrianAgent's job.
 //
+// PART 3 MOVEMENT MIX  (part3AttractorMovementProbability, default 1 = all attractor = the behaviour before the mix existed)
+//   In Part 3 each NPC gets ONE of the two modes above for its whole lifetime. The choice is an independent Bernoulli trial per spawn
+//   (Part3MovementStrategySelector): attractor with the configured probability a, wandering otherwise. Nothing about the live population or the history is
+//   consulted, nothing is balanced and no NPC is ever reassigned, so the realised share fluctuates around a. The draw uses a PRIVATE System.Random (seed =
+//   part3MovementAssignmentSeed, or clock-derived and recorded in the manifest), so UnityEngine.Random (routes, dwell, appearance) keeps its sequence, and
+//   Part 1, Part 2, no running Part and an unknown Part never draw (the selector runs only while RunningPartName is exactly "Part3" with npcDirectedMovement on). DecideMovementMode() is the only place the mode is chosen; the choice is recorded per lifetime by DataCaptureManager
+//   (npc_lifetimes.csv 'movement_mode') and the configured probability + effective seed in the manifest (setting_entries).
+//   ACCESSORY RULE (explicit Part 3 only): when ExperimentManager.RunningPartName is exactly "Part3" AND the NPC's mode is the wandering itinerary, it never wears
+//   the accessory (wristband): AppearanceController.ApplyProfile(..., suppressAccessory: true) clears it on every spawn. No running Part / Part 1 / Part 2 use the
+//   normal profile selection. The suppression clears it on every spawn, so a pooled object cannot keep the previous lifetime's. An attractor NPC uses the Agent Profile's existing accessoriesOptions unchanged.
+//   PART 2 ACCESSORY MATCHING: while RunningPartName is exactly "Part2", a spawn draws its accessory from the profile weights adjusted by AccessoryWeightAdjuster for the
+//   effective Part 3 attractor probability (EffectivePart3AttractorProbability: the configured value, or 0 when Part 3 has npcDirectedMovement off): wristband weights x a,
+//   the remainder to None, total unchanged, so the Part 2 accessory distribution equals the overall Part 3 one for the same profile. Non-destructive (the asset is not
+//   modified), no extra random draw, Part 2 movement untouched. Every other context uses the original weights.
+//
 // SPAWN GATES  (all ANDed in ShouldSpawnNow(), evaluated every tick)
 //   - End-Panel hard stop not active, NPCs enabled for the active Part (ExperimentManager.CurrentPartConfig),
 //     and (if gateSpawningByTrialState) a trial or the NPC warm-up window is open, and liveAgents < maxAgents.
@@ -78,7 +93,7 @@ public class SpawnerManager : MonoBehaviour
     // =================================================================================================================
 
     // Inspector order = declaration order. Sections, top to bottom:
-    //   References | Part 3 Itinerary Stops | Part 2 Itinerary Stops | Spawn Configuration & Population Limit |
+    //   References | Part 3 Itinerary Stops | Part 3 NPC Movement Configuration | Part 2 Itinerary Stops | Spawn Configuration & Population Limit |
     //   Spawn Interval & Position Sampling | Entrance Spawn Distribution | Object Pooling & Prewarm |
     //   Agent Profile & NPC Configuration | Experiment / Trial Spawn Gates | Debug & Diagnostics
     // The movement mode (Part 2 vs Part 3 itinerary) is NOT a field here: it is pulled per Part from
@@ -110,6 +125,20 @@ public class SpawnerManager : MonoBehaviour
              "when it spawns and is used for EVERY attractor visit of that NPC. NPCs never dwell at the entrance or " +
              "the exit, and Part 2 does not use this setting.")]
     public Vector2 dwellTimeSec = new Vector2(5f, 15f); // min/max dwell
+
+    [Header("Part 3 NPC Movement Configuration")]
+    [Tooltip("Part 3 only: the PROBABILITY that each newly spawned NPC uses ATTRACTOR movement (the existing Part 3 behaviour: " +
+             "Entrance -> attractors with dwell -> Exit). Otherwise it uses WANDERING-POINT movement (the existing Part 2 behaviour: " +
+             "Entrance -> wandering points, no dwell -> Exit). Every spawn is an independent trial: 0.0 = every new NPC wanders. 0.5 = each new NPC has a " +
+             "50% chance of attractor movement. 1.0 = every new NPC uses attractors (default; identical to the behaviour before this setting existed). " +
+             "The realised proportion is random and need not match the value exactly. Each NPC keeps its strategy for its whole lifetime; changing the value " +
+             "affects only NPCs spawned afterwards. Wandering NPCs in Part 3 never wear the accessory. Part 2 MOVEMENT ignores this setting, but Part 2 ACCESSORY weights are scaled by it (wristband weights x the effective value, remainder to None; 0 when Part 3 directed movement is off) so Part 2 matches the overall Part 3 accessory distribution. Out-of-range values are clamped to 0..1.")]
+    [Range(0f, 1f)]
+    public float part3AttractorMovementProbability = Part3MovementStrategySelector.DefaultAttractorProbability;
+
+    [Tooltip("Seed of the private random stream that draws the Part 3 movement strategies. 0 = derive a seed from the clock (different every session; the " +
+             "effective seed is written to the session manifest). Any other value makes the sequence of draws reproducible.")]
+    public int part3MovementAssignmentSeed = 0;
 
     [Header("Part 2 Itinerary Stops (Wandering Points)")]
     [Tooltip("Predefined, experimenter-placed Transforms used ONLY as the intermediate stops of Part 2 " +
@@ -246,6 +275,12 @@ public class SpawnerManager : MonoBehaviour
     // Inactive, ready-to-reuse NPC instances.
     private List<GameObject> pool = new List<GameObject>();
 
+    // Part 3 movement mix: the private random stream and the cumulative assignment counts (see Part3MovementStrategySelector). Created on first use.
+    private Part3MovementStrategySelector movementSelector;
+    private Part3MovementStrategySelector MovementSelector =>
+        movementSelector ?? (movementSelector = new Part3MovementStrategySelector(
+            Part3MovementStrategySelector.ResolveSeed(part3MovementAssignmentSeed, GetInstanceID())));
+
     // Population accounting: 'liveAgents' counts spawned-and-not-yet-finished NPCs (the maxAgents cap);
     // 'activeAgents' is the same set as GameObjects, so trial-state pause/resume/despawn can act on them as a group.
     private int liveAgents = 0;
@@ -309,6 +344,16 @@ public class SpawnerManager : MonoBehaviour
     /// <summary>Cumulative number of NPCs spawned (not the active population, not the pool size).</summary>
     public int NpcSpawnedTotal => spawnedTotal;
 
+    /// <summary>The configured Part 3 attractor probability as the selector uses it (clamped to 0..1; NaN -> 1).</summary>
+    public float Part3AttractorMovementProbability => Part3MovementStrategySelector.SanitizeProbability(part3AttractorMovementProbability);
+    /// <summary>The effective seed of the Part 3 movement-strategy stream (explicit, or clock-derived on first use); recorded in the manifest.</summary>
+    public int Part3MovementAssignmentSeedEffective => MovementSelector.Seed;
+    /// <summary>Cumulative strategy assignments made by the Part 3 draw since the Part's NPC lifecycle began (spawns of an NPC-enabled Part 3 only).</summary>
+    public long AssignedAttractorMovementTotal => movementSelector != null ? movementSelector.AssignedAttractor : 0;
+    public long AssignedWanderingMovementTotal => movementSelector != null ? movementSelector.AssignedWandering : 0;
+    /// <summary>Random values drawn from the Part 3 movement stream so far (one per decision; Part 2 never draws).</summary>
+    public long Part3MovementDraws => movementSelector != null ? movementSelector.Draws : 0;
+
     /// <summary>True once the NavMesh wait and the pool prewarm finished and the spawn loop has been started (or immediately when pooling is off).</summary>
     public bool IsPoolReady => poolInitializationComplete;
     /// <summary>Configured number of inactive objects to prepare (0 when pooling is off).</summary>
@@ -353,6 +398,13 @@ public class SpawnerManager : MonoBehaviour
 
     // Fallback applied when the serialized pathfinding budget is invalid (< 1). Matches Unity's default.
     const int k_DefaultPathfindingIterationsPerFrame = 100;
+
+    // Keeps the Inspector value inside 0..1 (the [Range] slider cannot stop a typed or scripted value); only writes when the value actually changes.
+    void OnValidate()
+    {
+        float clamped = Part3MovementStrategySelector.SanitizeProbability(part3AttractorMovementProbability);
+        if (clamped != part3AttractorMovementProbability) part3AttractorMovementProbability = clamped;
+    }
 
     void Awake()
     {
@@ -470,6 +522,63 @@ public class SpawnerManager : MonoBehaviour
         var cfg = experimentManager.CurrentPartConfig;
         bool part3 = cfg == null || cfg.npcDirectedMovement;
         return part3 ? NpcMovementMode.Part3AttractorItinerary : NpcMovementMode.Part2WanderingItinerary;
+    }
+
+    // The movement strategy of THIS spawn. Step 1 is the unchanged per-Part decision (ActiveMovementMode: the Part 2 wandering itinerary, or the Part 3
+    // attractor itinerary, from the running Part's npcDirectedMovement). Step 2 happens ONLY while ExperimentManager explicitly reports Part 3 as the running Part
+    // (IsExplicitPart3Running) and step 1 selected attractor movement: ONE independent draw from the private Part 3 stream decides attractor (probability a) or
+    // wandering (1 - a) for this NPC. Part 1, Part 2, no running Part, an unknown Part or no ExperimentManager NEVER call the selector (no draw, stream untouched)
+    // and Part 3 with npcDirectedMovement = false is all wandering without a draw. 'mixApplied' tells the caller a draw was made (so the assignment is counted).
+    private NpcMovementMode DecideMovementMode(out bool mixApplied)
+    {
+        mixApplied = false;
+        NpcMovementMode partMode = ActiveMovementMode();
+        if (partMode != NpcMovementMode.Part3AttractorItinerary || !IsExplicitPart3Running())
+            return partMode;
+
+        mixApplied = true;
+        return MovementSelector.Choose(part3AttractorMovementProbability);
+    }
+
+    // True only while ExperimentManager explicitly reports Part 3 as the running Part (RunningPartName == "Part3"). No ExperimentManager, no running Part
+    // ("") or an unknown value all give false: the Part 3 accessory rule then does not apply and the normal Agent Profile accessory selection is used.
+    private bool IsExplicitPart3Running()
+    {
+        return experimentManager != null && experimentManager.RunningPartName == "Part3";
+    }
+
+    // Part 3 accessory rule: suppress the accessory (wristband) only when the running Part is explicitly Part 3 AND this NPC's movement mode is the wandering
+    // itinerary. The wandering mode alone is not evidence of Part 3 (Part 2 NPCs use it too, and the 'npcDirectedMovement = false' switch yields it).
+    private bool ShouldSuppressAccessory(NpcMovementMode mode)
+    {
+        return IsExplicitPart3Running() && mode == NpcMovementMode.Part2WanderingItinerary;
+    }
+
+    // True only while ExperimentManager explicitly reports Part 2 as the running Part.
+    private bool IsExplicitPart2Running()
+    {
+        return experimentManager != null && experimentManager.RunningPartName == "Part2";
+    }
+
+    /// <summary>
+    /// The attractor probability Part 3 effectively has: the configured part3AttractorMovementProbability (clamped) while Part 3 uses directed movement, 0 when the Part 3
+    /// configuration has npcDirectedMovement = false (every Part 3 NPC then wanders, so the configured value cannot produce attractor NPCs). Same value is used by
+    /// the Part 3 movement draw and by the Part 2 accessory reweighting.
+    /// </summary>
+    public float EffectivePart3AttractorProbability
+    {
+        get
+        {
+            bool directed = experimentManager == null || experimentManager.Part3NpcDirectedMovement;
+            return directed ? Part3MovementStrategySelector.SanitizeProbability(part3AttractorMovementProbability) : 0f;
+        }
+    }
+
+    // Accessory weight scale of THIS spawn: while Part 2 is explicitly running, the effective Part 3 attractor probability (Part 2 NPCs then draw their accessory
+    // from the profile weights adjusted to match the overall Part 3 distribution, AccessoryWeightAdjuster); 1 (the profile's own weights) in every other context.
+    private float AccessoryWeightScaleForSpawn()
+    {
+        return IsExplicitPart2Running() ? EffectivePart3AttractorProbability : 1f;
     }
 
     // The single "may a new NPC be created right now?" decision. Separate from HOW an NPC is created (SpawnAgent).
@@ -623,6 +732,7 @@ public class SpawnerManager : MonoBehaviour
         ReleaseNpcBehaviourPause("new_part");   // frozen NPCs never stay frozen into the next Part / Session
         endPanelActive = false;
         simulationActive = false;   // re-opened by BeginNpcSimulation() if the new Part has NPCs enabled
+        if (movementSelector != null) movementSelector.ResetCounts();   // the cumulative assignment counts are per Part; the random stream continues
         if (enableDebugLogs) Debug.Log("[SpawnerManager] New Part starting -> End-Panel hard stop cleared.");
     }
 
@@ -1024,7 +1134,11 @@ public class SpawnerManager : MonoBehaviour
         int entranceIndex;
         Transform chosenEntrance = ChooseEntrance(out entranceIndex);
         Vector3 spawnPos = ResolveSpawnPosition(chosenEntrance);
-        NpcMovementMode mode = ActiveMovementMode();
+        bool mixApplied;
+        NpcMovementMode mode = DecideMovementMode(out mixApplied);
+        // Part 3 accessory rule: explicit Part 3 running AND wandering strategy => no accessory (decided here and applied with the profile below).
+        bool suppressAccessory = ShouldSuppressAccessory(mode);
+        float accessoryWeightScale = AccessoryWeightScaleForSpawn();   // < 1 only in Part 2 (accessory distribution matching)
 
         // Part 3 only: attractor dwell time, drawn once per NPC (before the route) and reused for each of its
         // attractor visits. Entrances and exits never dwell.
@@ -1046,7 +1160,7 @@ public class SpawnerManager : MonoBehaviour
         PedestrianAgent agentScript = go.GetComponent<PedestrianAgent>();
         RecordPoolAcquired(agentScript, reused, acquireTAbs);
 
-        ApplyAgentProfile(go);
+        ApplyAgentProfile(go, suppressAccessory, accessoryWeightScale);
         BindMoverToAgent(go);
 
         if (reused)
@@ -1060,7 +1174,7 @@ public class SpawnerManager : MonoBehaviour
         InitializeAgentMovement(go, agentScript, mode, itinerary, chosenEntrance, dwell);
 
         // 4. REGISTER -----------------------------------------------------------------------------------------
-        RegisterSpawnedAgent(go, agentScript);
+        RegisterSpawnedAgent(go, agentScript, mixApplied);
 
         if (enableDebugLogs)
             LogSpawn(go, agentScript, mode, reused, entranceIndex, chosenEntrance, itinerary, dwell);
@@ -1719,12 +1833,12 @@ public class SpawnerManager : MonoBehaviour
 
     // Applies the default AgentProfile (appearance, speed, NavMeshAgent shape, UncertainBehavior roll) via the
     // factory; without a factory only the NavMeshAgent values are applied (best effort).
-    private void ApplyAgentProfile(GameObject go)
+    private void ApplyAgentProfile(GameObject go, bool suppressAccessory = false, float accessoryWeightScale = 1f)
     {
         if (agentFactory != null && defaultProfile != null)
         {
             // We already instantiated/reused the GameObject, so use ApplyProfileToInstance (not a create method).
-            agentFactory.ApplyProfileToInstance(go, defaultProfile);
+            agentFactory.ApplyProfileToInstance(go, defaultProfile, suppressAccessory, accessoryWeightScale);
         }
         else if (defaultProfile != null)
         {
@@ -1796,11 +1910,20 @@ public class SpawnerManager : MonoBehaviour
     }
 
     // Population accounting + completion hook + data-capture notification (after the list mutation).
-    private void RegisterSpawnedAgent(GameObject go, PedestrianAgent agentScript)
+    private void RegisterSpawnedAgent(GameObject go, PedestrianAgent agentScript, bool mixApplied)
     {
         liveAgents++;
         spawnedTotal++;
         activeAgents.Add(go); // track for trial-state pause/resume/despawn
+
+        // Movement-mix accounting (observation only): the NPC's strategy for THIS lifetime, counted when a Part 3 draw decided it.
+        if (mixApplied)
+        {
+            movementSelector.NoteAssigned(agentScript.MovementMode);
+            if (enableDebugLogs && movementSelector.AssignedTotal % 100 == 0)
+                Debug.Log($"[SpawnerManager][MovementMix] probability={Part3AttractorMovementProbability:F2} assigned since Part start: " +
+                          $"attractor={movementSelector.AssignedAttractor} wandering={movementSelector.AssignedWandering}");
+        }
         agentScript.onAgentFinished += OnAgentFinished;
         RaiseAgentSpawned(agentScript);
         // The npc_spawn lifecycle event itself is raised by PedestrianAgent.Initialize() (the lifetime boundary), before any movement event.

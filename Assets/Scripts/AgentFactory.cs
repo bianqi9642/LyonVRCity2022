@@ -15,11 +15,19 @@ public class AgentFactory : MonoBehaviour
     /// <summary>
     /// Apply profile to an already existing pooled agent (called when reusing from pool).
     /// </summary>
-    public void ApplyProfileToInstance(GameObject go, AgentProfile profile)
+    /// <param name="suppressAccessory">Part 3 only: true for a wandering NPC - the accessory is not drawn and the NPC wears none. False (default) = the profile's own
+    /// accessory selection, exactly as before.</param>
+    /// <param name="accessoryWeightScale">Part 2 only: the effective Part 3 attractor probability used to adjust the accessory weights (AccessoryWeightAdjuster). 1 (default) =
+    /// the profile's own weights.</param>
+    public void ApplyProfileToInstance(GameObject go, AgentProfile profile, bool suppressAccessory = false, float accessoryWeightScale = 1f)
     {
         if (go == null || profile == null) return;
         var app = go.GetComponent<AppearanceController>();
-        if (app != null) app.ApplyProfile(profile);
+        if (app != null)
+        {
+            if (suppressAccessory || accessoryWeightScale < 1f) app.ApplyProfile(profile, suppressAccessory, accessoryWeightScale);
+            else app.ApplyProfile(profile);
+        }
 
         var nav = go.GetComponent<NavMeshAgent>();
         var move = go.GetComponent<MoveToTarget>();

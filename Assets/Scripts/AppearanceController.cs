@@ -39,6 +39,11 @@ public class AppearanceController : MonoBehaviour
     // The prefab's own accessory material slots, cached before the first accessory reset. Only used as a fallback when a bracelet option
     // supplies a mesh but an empty material list (a profile configuration error), so the renderer never shows null (pink) materials.
     private Material[] authoredAccessoryMaterials;
+    // The prefab's own accessory mesh, cached with the materials. Only used to restore the authored look after a suppressed (no-accessory) lifetime
+    // when the next profile offers no accessory options at all.
+    private Mesh authoredAccessoryMesh;
+    // True while the accessory renderer is empty because of ApplyProfile(..., suppressAccessory: true) rather than because of a profile draw.
+    private bool accessoryClearedBySuppression;
 
     /// <summary>
     /// Gender assigned to this NPC by the most recent ApplyProfile call. Constant for the
@@ -62,7 +67,17 @@ public class AppearanceController : MonoBehaviour
     public void ApplyProfile(AgentProfile profile)
     {
         if (profile == null) return;
-        ApplyProfile(profile, profile.ChooseGender());
+        ApplyProfile(profile, profile.ChooseGender(), false);
+    }
+
+    /// <summary>
+    /// Part 3: as <see cref="ApplyProfile(AgentProfile)"/>, but with suppressAccessory = true the accessory (wristband) is NOT drawn from the profile: the renderer is
+    /// cleared and the NPC wears none (used for Part 3 wandering NPCs). suppressAccessory = false is identical to the single-argument overload.
+    /// </summary>
+    public void ApplyProfile(AgentProfile profile, bool suppressAccessory)
+    {
+        if (profile == null) return;
+        ApplyProfile(profile, profile.ChooseGender(), suppressAccessory);
     }
 
     /// <summary>
@@ -71,10 +86,37 @@ public class AppearanceController : MonoBehaviour
     /// </summary>
     public void ApplyProfile(AgentProfile profile, AgentGender gender)
     {
+        ApplyProfile(profile, gender, false);
+    }
+
+    /// <summary>Full form: forced gender and the Part 3 accessory switch (see <see cref="ApplyProfile(AgentProfile, bool)"/>).</summary>
+    public void ApplyProfile(AgentProfile profile, AgentGender gender, bool suppressAccessory)
+    {
+        ApplyProfileCore(profile, gender, suppressAccessory, 1f);
+    }
+
+    /// <summary>
+    /// Part 2 accessory distribution matching: as <see cref="ApplyProfile(AgentProfile, bool)"/>, with the accessory drawn from the profile's weights adjusted by
+    /// <see cref="AccessoryWeightAdjuster"/> for the effective Part 3 attractor probability accessoryWeightScale (wristband weights x scale, remainder to None). The
+    /// profile asset is not modified. accessoryWeightScale = 1 is identical to <see cref="ApplyProfile(AgentProfile, bool)"/>; it has no effect when suppressAccessory is true.
+    /// </summary>
+    public void ApplyProfile(AgentProfile profile, bool suppressAccessory, float accessoryWeightScale)
+    {
+        if (profile == null) return;
+        ApplyProfileCore(profile, profile.ChooseGender(), suppressAccessory, accessoryWeightScale);
+    }
+
+    /// <summary>Observation only: the accessory weight scale used by the most recent ApplyProfile call (1 = the profile's own weights).</summary>
+    public float LastAccessoryWeightScale { get; private set; } = 1f;
+
+    private void ApplyProfileCore(AgentProfile profile, AgentGender gender, bool suppressAccessory, float accessoryWeightScale)
+    {
         if (profile == null) return;
 
         // Gender is decided ONCE here and reused for every gender-restricted part below.
         CurrentGender = gender;
+        float scale = AccessoryWeightAdjuster.SanitizeScale(accessoryWeightScale);
+        LastAccessoryWeightScale = suppressAccessory ? 1f : scale;
 
         var applied = new AppliedAppearance { appliedTAbs = CaptureClock.TAbs, gender = gender };
         applied.body        = ApplyPart(profile, profile.bodyOptions,        bodyRenderer,        CurrentGender);
@@ -82,7 +124,9 @@ public class AppearanceController : MonoBehaviour
         applied.top         = ApplyPart(profile, profile.topOptions,         topRenderer,         CurrentGender);
         applied.bottom      = ApplyPart(profile, profile.bottomOptions,      bottomRenderer,      CurrentGender);
         applied.shoes       = ApplyPart(profile, profile.shoesOptions,       shoesRenderer,       CurrentGender);
-        applied.accessories = ApplyPart(profile, profile.accessoriesOptions, accessoriesRenderer, CurrentGender, isAccessory: true);
+        applied.accessories = suppressAccessory
+            ? SuppressAccessory()
+            : ApplyPart(profile, scale < 1f ? AccessoryWeightAdjuster.GetOptions(profile, scale) : profile.accessoriesOptions, accessoriesRenderer, CurrentGender, isAccessory: true);
         LastApplied = applied;
 
         if (enableDebugLogs && accessoriesRenderer != null)
@@ -93,6 +137,26 @@ public class AppearanceController : MonoBehaviour
                           ? $"bracelet mesh '{a.MeshName}', material '{a.MaterialNames}' (index {(a.materialIndices != null && a.materialIndices.Length > 0 ? a.materialIndices[0] : -1)})"
                           : "no bracelet (renderer cleared)"), this);
         }
+    }
+
+    /// <summary>
+    /// Part 3 rule for wandering NPCs: no accessory, whatever the profile offers. No profile draw happens (so no UnityEngine.Random value is consumed for the
+    /// accessory); the renderer is emptied exactly as ApplyPart empties it before a draw, so a pooled object cannot keep the previous lifetime's bracelet.
+    /// Recorded as option -3 (suppressed) with no mesh.
+    /// </summary>
+    private AppliedPartRecord SuppressAccessory()
+    {
+        var record = new AppliedPartRecord();
+        SkinnedMeshRenderer renderer = accessoriesRenderer;
+        if (renderer == null) return record;
+        record.hasRenderer = true;
+        if (authoredAccessoryMaterials == null) { authoredAccessoryMaterials = renderer.sharedMaterials; authoredAccessoryMesh = renderer.sharedMesh; }
+        ClearAccessoryRenderer(renderer);
+        accessoryClearedBySuppression = true;
+        record.optionIndex = AppliedPartRecord.SuppressedOption;
+        record.mesh = null;
+        record.materials = renderer.sharedMaterials;
+        return record;
     }
 
     /// <summary>
@@ -113,11 +177,25 @@ public class AppearanceController : MonoBehaviour
         record.hasRenderer = true;
         record.mesh = renderer.sharedMesh;
         record.materials = renderer.sharedMaterials;
-        if (options == null || options.Length == 0) return record;   // optionIndex stays -2: the profile offers nothing for this part
+        if (options == null || options.Length == 0)
+        {
+            // optionIndex stays -2: the profile offers nothing for this part (the prefab's own look stays). After a suppressed lifetime the renderer is empty,
+            // so the authored accessory is put back: a profile with no accessory options behaves as it always did.
+            if (isAccessory && accessoryClearedBySuppression && authoredAccessoryMaterials != null)
+            {
+                renderer.sharedMesh = authoredAccessoryMesh;
+                renderer.sharedMaterials = authoredAccessoryMaterials;
+                accessoryClearedBySuppression = false;
+                record.mesh = renderer.sharedMesh;
+                record.materials = renderer.sharedMaterials;
+            }
+            return record;
+        }
 
         if (isAccessory)
         {
-            if (authoredAccessoryMaterials == null) authoredAccessoryMaterials = renderer.sharedMaterials;
+            if (authoredAccessoryMaterials == null) { authoredAccessoryMaterials = renderer.sharedMaterials; authoredAccessoryMesh = renderer.sharedMesh; }
+            accessoryClearedBySuppression = false;
             ClearAccessoryRenderer(renderer);
             record.mesh = null;
             record.materials = renderer.sharedMaterials;

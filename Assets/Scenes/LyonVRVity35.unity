@@ -246558,7 +246558,7 @@ MonoBehaviour:
   lockParticipantWhileDestination2Panel: 1
   lockParticipantWhilePart2ContinuePanel: 1
   enableLifecycleLogs: 1
-  npcWarmupDuration: 450
+  npcWarmupDuration: 10
   holdNpcsUntilStart: 1
   waitForHeadsetBeforeStartPanel: 1
   part1StartPosition: {fileID: 1571442372}
@@ -290080,6 +290080,8 @@ MonoBehaviour:
   minAttractorsPerAgent: 1
   maxAttractorsPerAgent: 8
   dwellTimeSec: {x: 30, y: 60}
+  part3AttractorMovementProbability: 0.6
+  part3MovementAssignmentSeed: 0
   wanderingPoints:
   - {fileID: 204195053}
   - {fileID: 1017432391}
@@ -290962,7 +290964,7 @@ MonoBehaviour:
   maxWanderingPointsPerAgent: 8
   wanderLookAheadDistance: 15
   agentPrefab: {fileID: 3132995531446026970, guid: c34a3349d586043c09271e3b19db0437, type: 3}
-  maxAgents: 3000
+  maxAgents: 2000
   spawnInterval: 0.1
   spawnSampleRadius: 1
   spawnSampleMaxAttempts: 8
@@ -290980,7 +290982,7 @@ MonoBehaviour:
   entranceSpawnRadius: 5
   entranceSpawnMaxAttempts: 12
   usePooling: 1
-  poolPrewarm: 3000
+  poolPrewarm: 2000
   navmeshWaitTimeout: 5
   prewarmFrameBudgetMs: 8
   agentFactory: {fileID: 2139592827}
@@ -320817,7 +320819,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   participantId: 1
-  selectedPart: 3
+  selectedPart: 2
   part2GroupIndex: 0
   part3GroupIndex: 2
   autoStart: 1

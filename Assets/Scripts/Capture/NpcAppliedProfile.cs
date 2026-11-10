@@ -22,8 +22,11 @@ public sealed class AppliedPartRecord
     /// <summary>False when the AppearanceController has no renderer for this part (nothing is shown, nothing recorded).</summary>
     public bool hasRenderer;
     /// <summary>Index into the profile's option array of the option that was chosen. -1 = options exist but none is valid for the gender (renderer cleared);
-    /// -2 = the profile offers no options for this part (the prefab's own mesh/material stays).</summary>
+    /// -2 = the profile offers no options for this part (the prefab's own mesh/material stays);
+    /// -3 = the part was deliberately not drawn (accessory suppressed by the Part 3 wandering rule).</summary>
     public int optionIndex = -2;
+    /// <summary>optionIndex value of an accessory that was deliberately NOT drawn (Part 3 wandering NPCs wear none); the renderer is empty.</summary>
+    public const int SuppressedOption = -3;
     /// <summary>Mesh shown after application (renderer.sharedMesh). Null = none.</summary>
     public Mesh mesh;
     /// <summary>Material ASSETS applied per renderer slot (the chosen source materials, not the runtime "(Instance)" copies).</summary>

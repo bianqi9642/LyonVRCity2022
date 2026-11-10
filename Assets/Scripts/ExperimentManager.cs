@@ -528,6 +528,20 @@ public class ExperimentManager : MonoBehaviour
     /// <summary>The frozen effective settings, or null while the configuration is Invalid / unavailable (this call freezes them on first use).</summary>
     public EffectiveSettings Effective => EnsureSessionOverridesApplied() ? _effective : null;
 
+    /// <summary>
+    /// Whether Part 3 uses directed (attractor) movement: the frozen Part 3 config once the session settings are frozen (no side effect: this does not freeze them), otherwise the
+    /// Inspector Part 3 config; true when neither exists (the established default). Read-only; SpawnerManager uses it to derive the effective Part 3 attractor probability
+    /// (0 when false) that scales the Part 2 accessory weights.
+    /// </summary>
+    public bool Part3NpcDirectedMovement
+    {
+        get
+        {
+            PartCaptureConfig c = _effective != null ? _frozenPartConfigs[2] : part3Config;
+            return c == null || c.npcDirectedMovement;
+        }
+    }
+
     /// <summary>The frozen PartCaptureConfig of Part 1..3 (a private copy: Inspector edits do not reach it), or null while the configuration is unavailable.</summary>
     public PartCaptureConfig GetEffectivePartConfig(int partNumber)
         => partNumber >= 1 && partNumber <= 3 && EnsureSessionOverridesApplied() ? _frozenPartConfigs[partNumber - 1] : null;
@@ -551,6 +565,8 @@ public class ExperimentManager : MonoBehaviour
         {
             ss.SpawnerMaxAgents = sp.maxAgents; ss.SpawnerPoolPrewarm = sp.poolPrewarm; ss.SpawnerSpawnInterval = sp.spawnInterval;
             ss.SpawnerDwellTimeMin = sp.dwellTimeSec.x; ss.SpawnerDwellTimeMax = sp.dwellTimeSec.y;
+            ss.SpawnerPart3AttractorProbability = sp.Part3AttractorMovementProbability;
+            ss.SpawnerPart3MovementSeed = sp.Part3MovementAssignmentSeedEffective;
         }
         // The profile the NPC system will actually use: RunNpcWarmup assigns currentProfile to the spawner when a Part with NPCs starts.
         AgentProfile prof = currentProfile != null ? currentProfile : (sp != null ? sp.defaultProfile : null);

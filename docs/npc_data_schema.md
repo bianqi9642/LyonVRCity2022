@@ -604,6 +604,8 @@ All project-owned experiment / NPC randomness comes from `ExperimentRngManager` 
 * **Group-controlled conditions and the participant-specific draw (same schema, under `rng_config_version` 3):** manifest `rng` gains `stream_versions`, `rng_configuration_validation`,
   `automatic_entropy_source`, `abandoned_spawn_attempt_count` and `abandoned_spawn_attempts` (spawn attempts that consumed an `rng_spawn_index` without creating an NPC, as
   `Part:index:reason`); a new manifest block `assignments` records `part2_group_index`, `part2_start_point_id`, `part2_teleport_point_id`, `part3_group_index`, `part3_start_zone`,
-  `part3_start_point_id`, `target_building_stream`, `target_building_derivation` and, per destination N = 1, 2, `destinationN_region_id`, `destinationN_candidate_ids` (sorted),
-  `destinationN_candidate_fingerprint`, `destinationN_selected_id`, `destinationN_derived_seed`. **Every 64-bit seed is a JSON string of exactly 16 lowercase hex digits** (never a number);
-  the participant ID is the normal `participant_id` of the manifest. See `docs/rng_system.md` sections 0-3 and `docs/tools/npc_movement_mix.py` (`target_building_reconstruction`).
+  `part3_start_point_id`, `destination1_zone_id`, `destination2_zone_id`, `target1_building_id`, `target2_building_id`, `destinationN_candidate_ids` (sorted, exactly two),
+  `destinationN_candidate_fingerprint`, `target1_stream` / `target2_stream` (`Target1Building` / `Target2Building`), `target1_selection_seed` / `target2_selection_seed`, `target_selection_version` (2),
+  `target_selection_algorithm`, `target_selection_derivation` and four recorded self-checks (`destination_zones_distinct`, `target1_in_destination1_zone`, `target2_in_destination2_zone`,
+  `target_building_ids_distinct`). **Every 64-bit seed is a JSON string of exactly 16 lowercase hex digits** (never a number); the participant ID is the normal `participant_id` of the manifest.
+  See `docs/rng_system.md` sections 0-3 and `docs/tools/npc_movement_mix.py` (`target_assignment_verification`).

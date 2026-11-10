@@ -158,45 +158,52 @@ def rng_block(master, version=3):
     return block
 
 
-class TargetBuildingReaderTests(unittest.TestCase):
+class TargetAssignmentReaderTests(unittest.TestCase):
     @staticmethod
-    def manifest(d, pid, master, group, region, ids, selected=None, seed_hex=None, version=3):
+    def manifest(d, pid, master, group, version=3, **override):
         import experiment_rng as xr
-        sel, srt, seed = xr.choose_target_building(master, pid, group, region, ids)
-        a = {"part3_group_index": group, "destination1_region_id": region, "destination1_candidate_ids": ids,
-             "destination1_selected_id": selected or sel, "destination1_derived_seed": seed_hex or seed}
+        start, z1, z2 = xr.GROUP_TABLE[group]
+        c1, c2 = [z1 + "_A", z1 + "_B"], [z2 + "_A", z2 + "_B"]
+        t1, _, s1 = xr.choose_target(master, 1, pid, group, z1, c1)
+        t2, _, s2 = xr.choose_target(master, 2, pid, group, z2, c2)
+        a = {"target_selection_version": 2, "part3_group_index": group, "part3_start_zone": start, "destination1_zone_id": z1, "destination2_zone_id": z2,
+             "destination1_candidate_ids": c1, "destination2_candidate_ids": c2, "target1_building_id": t1, "target2_building_id": t2,
+             "target1_selection_seed": s1, "target2_selection_seed": s2}
+        a.update(override)
         with open(os.path.join(d, "session_manifest.json"), "w") as f:
-            json.dump({"schema_version": 17, "participant_id": pid, "setting_entries": [], "assignments": a,
-                       "rng": rng_block(master, version)}, f)
+            json.dump({"schema_version": 17, "participant_id": pid, "setting_entries": [], "assignments": a, "rng": rng_block(master, version)}, f)
+        return a
 
-    def test_recorded_selection_and_exact_64_bit_seed_are_reproduced(self):
+    def test_every_group_of_a_current_manifest_audits_clean(self):
+        for master in (31415, 0xFEDCBA9876543210):
+            for g in range(12):
+                with tempfile.TemporaryDirectory() as d:
+                    self.manifest(d, "P%03d" % (g + 1), master, g)
+                    r = mix.summarize(d)["target_assignment_verification"]
+                    self.assertTrue(r and all(r.values()), (master, g, r))
+
+    def test_a_wrong_target_zone_or_seed_is_flagged(self):
         with tempfile.TemporaryDirectory() as d:
-            self.manifest(d, "P004", 31415, 4, "OE", ["OE_A", "OE_B"])
-            r = mix.summarize(d)["target_building_reconstruction"]
-            self.assertEqual(r["destination1"], {"region": "OE", "seed_matches": True, "selection_matches": True, "selected_in_candidates": True})
+            a = self.manifest(d, "P004", 31415, 4)
+            self.manifest(d, "P004", 31415, 4, target2_building_id=a["target1_building_id"])
+            r = mix.summarize(d)["target_assignment_verification"]
+            self.assertFalse(r["target_ids_distinct"]); self.assertFalse(r["target2_in_destination2_zone"]); self.assertFalse(r["selections_match"])
+            self.manifest(d, "P004", 31415, 4, target1_selection_seed="ff0834e9791e17a3")
+            self.assertFalse(mix.summarize(d)["target_assignment_verification"]["seeds_match"])
+            self.manifest(d, "P004", 31415, 4, destination2_zone_id="OE")
+            self.assertFalse(mix.summarize(d)["target_assignment_verification"]["destination_zones_distinct"])
 
-    def test_a_current_manifest_with_an_upper_bits_seed_is_reproduced_exactly(self):
+    def test_unsupported_selection_versions_and_manifests_are_not_audited(self):
         with tempfile.TemporaryDirectory() as d:
-            self.manifest(d, "P001", 0xFEDCBA9876543210, 4, "OE", ["OE_B", "OE_A"])
-            r = mix.summarize(d)["target_building_reconstruction"]["destination1"]
-            self.assertEqual(r, {"region": "OE", "seed_matches": True, "selection_matches": True, "selected_in_candidates": True})
-            with open(os.path.join(d, "session_manifest.json")) as f:
-                m = json.load(f)
-            self.assertEqual(m["assignments"]["destination1_derived_seed"], "dd16edfe30842108")
-            self.assertEqual(m["assignments"]["destination1_selected_id"], "OE_A")
+            self.manifest(d, "P004", 31415, 4, target_selection_version=1)
+            self.assertIsNone(mix.summarize(d)["target_assignment_verification"])
+            self.manifest(d, "P004", 31415, 4, version=1)       # historical numeric-seed manifest: not reconstructable, so not audited
+            self.assertIsNone(mix.summarize(d)["target_assignment_verification"])
 
-    def test_a_wrong_seed_or_building_is_flagged(self):
-        with tempfile.TemporaryDirectory() as d:
-            self.manifest(d, "P004", 31415, 4, "OE", ["OE_A", "OE_B"], selected="OE_B")
-            r = mix.summarize(d)["target_building_reconstruction"]["destination1"]
-            self.assertFalse(r["selection_matches"]); self.assertTrue(r["seed_matches"])
-            self.manifest(d, "P004", 31415, 4, "OE", ["OE_A", "OE_B"], seed_hex="ff0834e9791e17a3")
-            self.assertFalse(mix.summarize(d)["target_building_reconstruction"]["destination1"]["seed_matches"])
-
-    def test_sessions_without_assignments_have_nothing_to_reconstruct(self):
+    def test_sessions_without_assignments_have_nothing_to_audit(self):
         with tempfile.TemporaryDirectory() as d:
             write_session(d, [("Part3", A, "P", "", "1")], [entry(mix.PROBABILITY_KEY, 0.5)])
-            self.assertIsNone(mix.summarize(d)["target_building_reconstruction"])
+            self.assertIsNone(mix.summarize(d)["target_assignment_verification"])
 
 
 class RngRecordTests(unittest.TestCase):

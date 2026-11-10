@@ -29,8 +29,10 @@ WHAT IT REPORTS (descriptive; nothing is asserted against the configured value)
   rng_recorded / rng_effective_master_seed (16 hex digits, always) / rng_seed_representation / rng_reconstructable / rng_reconstruction_note / rng_config_version / rng_seed_source / rng_seed_policy / rng_algorithm(_version)
   movement_mode_reconstruction           {checked, mismatches, mismatch_ids}: every Part 3 row's movement_mode re-derived from (root seed, Part 3, rng_spawn_index, probability) with
                                          docs/tools/experiment_rng.py; None when the data needed (RNG block, spawn indices, probability, directed movement on) is not recorded
-  target_building_reconstruction         per destination {region, seed_matches, selection_matches, selected_in_candidates}: the participant-specific target building re-derived from
-                                         (effective Master Seed, participant_id, Part 3 group index, region) and the recorded candidate ids; None when not recorded
+  target_assignment_verification         {table_matches, destination_zones_distinct, target1_in_destination1_zone, target2_in_destination2_zone, target_ids_distinct, seeds_match, selections_match}:
+                                         independent audit of manifest assignments (target_selection_version 2): zones against Table 5, both targets inside their own zone, the two ids
+                                         different, and both selections / seeds re-derived from (effective Master Seed, participant_id, group, zone, candidates) with one stream per
+                                         destination; None when not recorded or not version 2 (nothing is guessed)
   configured_semantics / configured_attractor_probability / effective_attractor_probability / part3_directed_movement
   part3_attractor_spawns, part3_wandering_spawns, realised percentages, z_score_vs_configured (informational)
   profile_distribution (Part 3), attractor_accessory_rate, part3_attractor_accessory_distribution {element: count, pct}
@@ -123,29 +125,15 @@ def read_assignments(session_dir):
     return m.get("participant_id"), (a if isinstance(a, dict) else None)
 
 
-def reconstruct_target_buildings(participant_id, assignments, rng_block):
+def verify_target_assignments(participant_id, assignments, rng_block):
     """
-    Re-derive the participant-specific Part 3 target building of each destination from the recorded effective Master Seed, participant_id, group index and region (docs/tools/experiment_rng.py).
-    Seeds are compared as exact 16-digit hex strings / Python ints (never floats). Returns None when the data is not recorded.
+    Audit the Part 3 target assignment of a session (docs/tools/experiment_rng.py verify_target_assignment). Needs a reconstructable (rng_config_version 3) manifest and an assignments block
+    of target_selection_version 2; returns None otherwise. Seeds are compared as exact 16-digit hex strings (never floats).
     """
     info = xrng.manifest_master_seed(rng_block)
-    if not assignments or not info["reconstructable"] or not participant_id or assignments.get("part3_group_index", -1) < 0:
+    if not assignments or not info["reconstructable"] or not participant_id:
         return None
-    out = {}
-    for d in ("destination1", "destination2"):
-        region = assignments.get(d + "_region_id") or ""
-        ids = assignments.get(d + "_candidate_ids") or []
-        if not region or not ids:
-            continue
-        selected, sorted_ids, seed_hex = xrng.choose_target_building(info["seed"], participant_id, assignments["part3_group_index"], region, ids)
-        recorded_seed = assignments.get(d + "_derived_seed") or ""
-        out[d] = {
-            "region": region,
-            "seed_matches": recorded_seed.lower() == seed_hex,
-            "selection_matches": assignments.get(d + "_selected_id") == selected,
-            "selected_in_candidates": assignments.get(d + "_selected_id") in ids,
-        }
-    return out or None
+    return xrng.verify_target_assignment(info["seed"], participant_id, assignments)
 
 
 def _f32(x):
@@ -318,7 +306,7 @@ def summarize(session_dir):
         "rng_algorithm": rng_block.get("rng_algorithm") if rng_block else None,
         "rng_algorithm_version": rng_block.get("rng_algorithm_version") if rng_block else None,
         "movement_mode_reconstruction": reconstruct_movement_modes(part3, rng_block, probability, directed),
-        "target_building_reconstruction": reconstruct_target_buildings(participant_id, assignments, rng_block),
+        "target_assignment_verification": verify_target_assignments(participant_id, assignments, rng_block),
         "part3_attractor_spawns": len(attractors),
         "part3_wandering_spawns": len(wanderers),
         "realised_attractor_pct": (100.0 * len(attractors) / n) if n else None,
@@ -412,8 +400,8 @@ def main(argv):
             print("%-24s %7d %5s %8s %10s %10s %10s %10s" % (t["profile"][:24], t["element"], "yes" if t["is_none"] else "", _fmt(t["original_weight"]),
                                                               _fmt(t["expected_part2"]), _fmt(t["expected_part3_overall"]), _fmt(t["observed_part2"]), _fmt(t["observed_part3"])))
     rec = result.get("movement_mode_reconstruction")
-    tb = result.get("target_building_reconstruction")
-    tb_bad = bool(tb and any(not (v["seed_matches"] and v["selection_matches"] and v["selected_in_candidates"]) for v in tb.values()))
+    tb = result.get("target_assignment_verification")
+    tb_bad = bool(tb and not all(tb.values()))
     violations = tb_bad or bool(result["wandering_accessory_violations"]) or bool(result["part2_forced_suppression_markers"]) or bool(rec and rec["mismatches"])
     return 1 if violations else 0
 

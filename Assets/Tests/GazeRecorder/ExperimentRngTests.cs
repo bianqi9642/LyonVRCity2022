@@ -318,7 +318,7 @@ public class ExperimentRngTests
         Assert.Throws<System.Reflection.TargetInvocationException>(() => CallStatic(MgrType, "CreateNpcRng", Part("Part3"), 0L));
         Assert.Throws<System.Reflection.TargetInvocationException>(() => GetStatic<object>(MgrType, "UnassignedNpcRng"));
         Assert.Throws<System.Reflection.TargetInvocationException>(() => GetStatic<ulong>(MgrType, "EffectiveMasterSeed"));
-        Assert.Throws<System.Reflection.TargetInvocationException>(() => CallStatic(MgrType, "CreateTargetBuildingStream", "P001", 0, "GE", 0UL));
+        Assert.Throws<System.Reflection.TargetInvocationException>(() => CallStatic(MgrType, "CreateTargetSelectionStream", RngStreamValue("Target1Building"), "P001", 0, "GE", 0UL));
     }
     static void CallStatic0(string name) { try { MgrType.GetMethod(name).Invoke(null, null); } catch (System.Reflection.TargetInvocationException e) { throw e.InnerException; } }
 
@@ -395,10 +395,16 @@ public class ExperimentRngTests
         Assert.Throws<System.Reflection.TargetInvocationException>(() => CallStatic(MgrType, "GetPartStream", Enum.ToObject(PartType, 9), Stream("PartSetup")));
         Assert.Throws<System.Reflection.TargetInvocationException>(() => CallStatic(MgrType, "GetPartStream", Part("Part1"), Enum.ToObject(StreamType, 0)));
         Assert.Throws<System.Reflection.TargetInvocationException>(() => CallStatic(MgrType, "GetPartStream", Part("Part1"), Enum.ToObject(StreamType, 99)));
-        Assert.Throws<System.Reflection.TargetInvocationException>(() => CallStatic(MgrType, "GetPartStream", Part("Part3"), Stream("TargetBuilding")), "TargetBuilding is a participant-level stream");
-        Assert.Throws<System.Reflection.TargetInvocationException>(() => CallStatic(MgrType, "CreateTargetBuildingStream", "", 3, "GE", 0UL), "participant ID is required");
-        Assert.Throws<System.Reflection.TargetInvocationException>(() => CallStatic(MgrType, "CreateTargetBuildingStream", "P001", -1, "GE", 0UL));
-        Assert.Throws<System.Reflection.TargetInvocationException>(() => CallStatic(MgrType, "CreateTargetBuildingStream", "P001", 3, " ", 0UL));
+        foreach (string sel in new[] { "Target1Building", "Target2Building" })
+        {
+            Assert.Throws<System.Reflection.TargetInvocationException>(() => CallStatic(MgrType, "GetPartStream", Part("Part3"), Stream(sel)), sel + " is a participant-level selection stream");
+            Assert.Throws<System.Reflection.TargetInvocationException>(() => CallStatic(MgrType, "CreateTargetSelectionStream", Stream(sel), "", 3, "GE", 0UL), "participant ID is required");
+            Assert.Throws<System.Reflection.TargetInvocationException>(() => CallStatic(MgrType, "CreateTargetSelectionStream", Stream(sel), "P001", -1, "GE", 0UL));
+            Assert.Throws<System.Reflection.TargetInvocationException>(() => CallStatic(MgrType, "CreateTargetSelectionStream", Stream(sel), "P001", 3, " ", 0UL));
+        }
+        Assert.Throws<System.Reflection.TargetInvocationException>(() => CallStatic(MgrType, "CreateTargetSelectionStream", Stream("Appearance"), "P001", 3, "GE", 0UL), "only the two selection streams may be requested");
+        object npcSet = CallStatic(MgrType, "CreateNpcRng", Part("Part3"), 0L);
+        Assert.Throws<System.Reflection.TargetInvocationException>(() => Call(npcSet, "Get", Stream("Target2Building")), "a selection stream is not an NPC stream");
         object set = CallStatic(MgrType, "CreateNpcRng", Part("Part3"), 0L);
         Assert.Throws<System.Reflection.TargetInvocationException>(() => Call(set, "Get", Enum.ToObject(StreamType, 42)));
     }
@@ -408,7 +414,7 @@ public class ExperimentRngTests
     {
         var values = Enum.GetValues(StreamType).Cast<object>().Select(v => (int)v).ToList();
         CollectionAssert.AllItemsAreUnique(values, "no duplicate stream identifier");
-        Assert.AreEqual(Enumerable.Range(1, 11).ToList(), values.OrderBy(v => v).ToList(), "the numeric values 1..11 are part of the derivation and must not change (append only)");
+        Assert.AreEqual(Enumerable.Range(1, 12).ToList(), values.OrderBy(v => v).ToList(), "the numeric values 1..12 are part of the derivation and must not change (append only)");
         Fix(1);
         var inventory = (string[])CallStatic(MgrType, "StreamInventory");
         CollectionAssert.AreEquivalent(Enum.GetNames(StreamType), inventory);
@@ -430,32 +436,117 @@ public class ExperimentRngTests
     // ------------------------------------------------------------------------------------------------------------------------------ participant-specific Part 3 target building
 
     static readonly Type SelType = T("Part3TargetSelection");
-    static object Select(string pid, int group, string region, params string[] ids)
+    // dest: 1 = Destination 1 (stream Target1Building), 2 = Destination 2 (stream Target2Building)
+    static object SelectDest(int dest, string pid, int group, string zone, params string[] ids)
     {
-        var args = new object[] { pid, group, region, ids, null, null };
+        var args = new object[] { dest, pid, group, zone, ids, null, null };
         bool ok = (bool)SelType.GetMethod("TrySelect").Invoke(null, args);
-        return ok ? args[4] : args[5];   // Result or error text
+        return ok ? args[5] : args[6];   // Result or error text
     }
+    static object Select(string pid, int group, string zone, params string[] ids) => SelectDest(1, pid, group, zone, ids);
     static bool Selected(object r) => !(r is string);
     static string SelId(object r) => Get<string>(r, "SelectedId");
 
+    static ulong TSeed(ulong master, string stream, string pid, int group, string zone) => (ulong)CallStatic(SeedType, "TargetSelectionSeed", master, Part("Part3"), Stream(stream), pid, group, zone);
+
+    // PURE selection tests (no scene, no XR): the derivation, the draw and its properties. docs/tools/test_experiment_rng.py asserts the same frozen values for the Python reference.
     [Test]
-    public void TargetBuildingSeed_MatchesTheFrozenVectors_AndPythonReference()
+    public void TargetSelectionSeed_MatchesTheFrozenVectors_AndPythonReference()
     {
         Assert.AreEqual(0x5ffc4b9c13046ddeUL, (ulong)CallStatic(SeedType, "HashUtf8", "P001"));
-        Assert.AreEqual(0xff0834e9791e17a2UL, (ulong)CallStatic(SeedType, "TargetBuildingSeed", 31415UL, "P001", 4, "OE"));
-        Assert.AreEqual(0x8fe8f3c3df18db24UL, (ulong)CallStatic(SeedType, "TargetBuildingSeed", 31415UL, "P002", 4, "OE"));
-        Assert.AreEqual(0xc145d5fd02db767eUL, (ulong)CallStatic(SeedType, "TargetBuildingSeed", 0xFFFFFFFBUL, "P001", 11, "GU"));
-        // the chosen building for the frozen cases (docs/tools/experiment_rng.py computes the same)
+        Assert.AreEqual(0x35d409ef71e2213fUL, TSeed(31415UL, "Target1Building", "P001", 4, "OE"));
+        Assert.AreEqual(0x59a822d807652adcUL, TSeed(31415UL, "Target2Building", "P001", 4, "GU"));
+        Assert.AreEqual(0x5d7492f2f69f46ecUL, TSeed(31415UL, "Target1Building", "P002", 4, "OE"));
+        Assert.AreEqual(0xce47a73862d480c2UL, TSeed(31415UL, "Target2Building", "P002", 4, "GU"));
+        Assert.AreEqual(0xfd3479745b31e27dUL, TSeed(0xFEDCBA9876543210UL, "Target1Building", "P001", 4, "OE"));
+        Assert.AreEqual(0x86781eb11b77f237UL, TSeed(0xFEDCBA9876543210UL, "Target2Building", "P001", 4, "GU"));
+        // the chosen landmarks of the frozen cases (the Python reference computes the same); each destination has its own stream
         Fix(31415);
-        Assert.AreEqual("OE_B", SelId(Select("P001", 4, "OE", "OE_B", "OE_A")));
-        Assert.AreEqual("OE_B", SelId(Select("P003", 4, "OE", "OE_A", "OE_B")));
-        Assert.AreEqual("OE_A", SelId(Select("P004", 4, "OE", "OE_A", "OE_B")));
-        Assert.AreEqual("ff0834e9791e17a2", Get<string>(Select("P001", 4, "OE", "OE_A", "OE_B"), "DerivedSeedHex"));
+        Assert.AreEqual("OE_B", SelId(SelectDest(1, "P001", 4, "OE", "OE_B", "OE_A")));
+        Assert.AreEqual("GU_B", SelId(SelectDest(2, "P001", 4, "GU", "GU_B", "GU_A")));
+        Assert.AreEqual("OE_B", SelId(SelectDest(1, "P002", 4, "OE", "OE_A", "OE_B")));
+        Assert.AreEqual("GU_A", SelId(SelectDest(2, "P002", 4, "GU", "GU_A", "GU_B")));
+        Assert.AreEqual("35d409ef71e2213f", Get<string>(SelectDest(1, "P001", 4, "OE", "OE_A", "OE_B"), "DerivedSeedHex"));
+        Assert.AreEqual("59a822d807652adc", Get<string>(SelectDest(2, "P001", 4, "GU", "GU_A", "GU_B"), "DerivedSeedHex"));
+        Fix(0xFEDCBA9876543210UL);
+        Assert.AreEqual("OU_A", SelId(SelectDest(1, "P001", 2, "OU", "OU_B", "OU_A")));
+        Assert.AreEqual("GE_B", SelId(SelectDest(2, "P001", 2, "GE", "GE_B", "GE_A")));
     }
 
     [Test]
-    public void TargetBuilding_SameMasterSeedParticipantAndGroup_GiveTheSameBuilding_AndReplayWithTheRecordedSeedReproducesIt()
+    public void TargetSelection_TheTwoDestinationsHaveIndependentStreams_NeverSharingASeedOrAGenerator()
+    {
+        foreach (ulong master in new[] { 1UL, 31415UL, 0x8000000000000001UL })
+            foreach (string pid in new[] { "P001", "P002", "P777" })
+                Assert.AreNotEqual(TSeed(master, "Target1Building", pid, 4, "OE"), TSeed(master, "Target2Building", pid, 4, "OE"), "same participant, group and zone: the stream id alone separates the destinations");
+        // a stream's seed depends on its OWN zone only: changing the other destination's zone cannot change it
+        Assert.AreEqual(TSeed(5UL, "Target1Building", "P001", 1, "GU"), TSeed(5UL, "Target1Building", "P001", 1, "GU"));
+        var npc = new HashSet<ulong>();
+        foreach (string st in Enum.GetNames(StreamType).Where(n => n != "Target1Building" && n != "Target2Building")) for (long i = -1; i < 50; i++) npc.Add(StreamSeed(5UL, "Part3", st, i));
+        CollectionAssert.DoesNotContain(npc, TSeed(5UL, "Target1Building", "P001", 1, "GU"));
+        CollectionAssert.DoesNotContain(npc, TSeed(5UL, "Target2Building", "P001", 1, "GU"));
+        // two draws of the same destination are the same sequence; the two destinations are different generator OBJECTS with different sequences
+        Fix(2468);
+        var a1 = new object[] { RngStreamValue("Target1Building"), "P001", 4, "OE", 0UL }; var a2 = new object[] { RngStreamValue("Target2Building"), "P001", 4, "OE", 0UL };
+        object s1 = MgrType.GetMethod("CreateTargetSelectionStream").Invoke(null, a1), s2 = MgrType.GetMethod("CreateTargetSelectionStream").Invoke(null, a2), s1b = MgrType.GetMethod("CreateTargetSelectionStream").Invoke(null, new object[] { RngStreamValue("Target1Building"), "P001", 4, "OE", 0UL });
+        Assert.AreNotSame(s1, s2); Assert.AreNotSame(s1, s1b);
+        Assert.AreNotEqual((ulong)a1[4], (ulong)a2[4]);
+        CollectionAssert.AreEqual(Draw(s1, 8), Draw(s1b, 8), "same inputs: same sequence");
+        // advancing the Destination 1 stream cannot move the Destination 2 stream
+        object t2a = MgrType.GetMethod("CreateTargetSelectionStream").Invoke(null, new object[] { RngStreamValue("Target2Building"), "P001", 4, "GU", 0UL });
+        var expected = Draw(MgrType.GetMethod("CreateTargetSelectionStream").Invoke(null, new object[] { RngStreamValue("Target2Building"), "P001", 4, "GU", 0UL }), 8);
+        object t1 = MgrType.GetMethod("CreateTargetSelectionStream").Invoke(null, new object[] { RngStreamValue("Target1Building"), "P001", 4, "OE", 0UL });
+        for (int i = 0; i < 10000; i++) U(t1);
+        CollectionAssert.AreEqual(expected, Draw(t2a, 8), "Target2Building is independent of how much Target1Building drew");
+    }
+    static object RngStreamValue(string n) => Enum.Parse(StreamType, n);
+
+    [Test]
+    public void TargetSelection_ForEveryTable5Group_EachTargetBelongsToItsOwnZone_AndTheTwoIdsDiffer()
+    {
+        var table = new (string start, string d1, string d2)[] { ("GE","GU","OE"), ("GE","OE","GU"), ("GE","OU","GE"), ("GU","GE","OU"), ("GU","OE","GU"), ("GU","OU","GE"),
+                                                                  ("OE","GE","OU"), ("OE","GU","OE"), ("OE","OU","GE"), ("OU","GE","OU"), ("OU","GU","OE"), ("OU","OE","GU") };
+        Func<string, string[]> landmarks = z => new[] { z + "_A", z + "_B" };
+        Fix(0x0123456789ABCDEFUL);
+        for (int g = 0; g < 12; g++)
+        {
+            Assert.AreNotEqual(table[g].d1, table[g].d2, "group " + g + ": Destination 1 and 2 are different zones (including groups 2, 4, 7, 9)");
+            var seenPairs = new HashSet<string>();
+            for (int p = 1; p <= 200; p++)
+            {
+                string pid = "P" + p.ToString("D3");
+                object r1 = SelectDest(1, pid, g, table[g].d1, landmarks(table[g].d1)), r2 = SelectDest(2, pid, g, table[g].d2, landmarks(table[g].d2));
+                Assert.IsTrue(Selected(r1) && Selected(r2));
+                Assert.AreEqual(2, Get<string[]>(r1, "CandidateIds").Length); Assert.AreEqual(2, Get<string[]>(r2, "CandidateIds").Length, "exactly two eligible landmarks per zone");
+                StringAssert.StartsWith(table[g].d1 + "_", SelId(r1)); StringAssert.StartsWith(table[g].d2 + "_", SelId(r2));
+                CollectionAssert.Contains(landmarks(table[g].d1), SelId(r1)); CollectionAssert.Contains(landmarks(table[g].d2), SelId(r2));
+                Assert.AreNotEqual(SelId(r1), SelId(r2), "Target 1 and Target 2 are different buildings");
+                Assert.AreEqual(1, Get<int>(r1, "Destination")); Assert.AreEqual(2, Get<int>(r2, "Destination"));
+                seenPairs.Add(SelId(r1) + "|" + SelId(r2));
+            }
+            Assert.AreEqual(4, seenPairs.Count, "group " + g + ": all four (Target 1, Target 2) pairs occur across participants (independent draws; no quota, no no-replacement)");
+        }
+    }
+
+    [Test]
+    public void TargetSelection_EachDestinationIsUniformOverItsTwoLandmarks_Independently()
+    {
+        Fix(777);
+        foreach (int dest in new[] { 1, 2 })
+        {
+            int a = 0;
+            for (int p = 0; p < 2000; p++) if (SelId(SelectDest(dest, "P" + p.ToString("D4"), 4, dest == 1 ? "OE" : "GU", "x_A", "x_B")) == "x_A") a++;
+            Assert.AreEqual(1000.0, a, 5 * Math.Sqrt(2000 * 0.25), "destination " + dest + ": both landmarks are chosen about equally often");
+        }
+        // the two destinations of one participant are independent: the joint distribution is uniform over the four pairs
+        var joint = new Dictionary<string, int>();
+        for (int p = 0; p < 4000; p++) { string k = SelId(SelectDest(1, "Q" + p, 4, "OE", "a", "b")) + SelId(SelectDest(2, "Q" + p, 4, "GU", "c", "d")); joint[k] = joint.TryGetValue(k, out int c) ? c + 1 : 1; }
+        Assert.AreEqual(4, joint.Count);
+        foreach (var kv in joint) Assert.AreEqual(1000.0, kv.Value, 5 * Math.Sqrt(4000 * 0.25 * 0.75), kv.Key);
+    }
+
+    [Test]
+    public void TargetSelection_SameMasterSeedParticipantAndGroup_GiveTheSameBuildingPair_AndReplayWithTheRecordedSeedReproducesIt()
     {
         Fix(8675309);
         string first = SelId(Select("P017", 7, "OE", "OE_A", "OE_B"));
@@ -470,7 +561,7 @@ public class ExperimentRngTests
     }
 
     [Test]
-    public void TargetBuilding_ParticipantsGroupsAndRegionsHaveSeparatelyDerivedSeeds()
+    public void TargetSelection_ParticipantsGroupsZonesAndStreamsHaveSeparatelyDerivedSeeds()
     {
         Fix(99);
         var seeds = new HashSet<string>();
@@ -490,7 +581,7 @@ public class ExperimentRngTests
     }
 
     [Test]
-    public void TargetBuilding_CandidateOrderIsStable_BuildingAlwaysBelongsToTheRegion_AndInvalidInputsFailExplicitly()
+    public void TargetSelection_CandidateOrderIsStable_BuildingAlwaysBelongsToTheZone_AndInvalidInputsFailExplicitly()
     {
         Fix(4242);
         var region = new[] { "R_zeta", "R_alpha", "R_mid", "R_Beta" };
@@ -514,7 +605,7 @@ public class ExperimentRngTests
 
     // The target-building draw is independent of the NPC streams, and the NPC streams are common across participants.
     [Test]
-    public void TargetBuilding_DoesNotShiftAnyNpcStream_AndNpcStreamsDoNotDependOnParticipantOrGroup()
+    public void TargetSelection_DoesNotShiftAnyNpcStream_AndNpcStreamsDoNotDependOnParticipantOrGroup()
     {
         Fix(2026);
         object clean = CallStatic(MgrType, "CreateNpcRng", Part("Part3"), 3L);
@@ -524,13 +615,15 @@ public class ExperimentRngTests
 
         Fix(2026);
         object a = CallStatic(MgrType, "CreateNpcRng", Part("Part3"), 3L);
-        long npcBefore = Enum.GetNames(StreamType).Where(n => n != "TargetBuilding").Sum(n => (long)CallStatic(CountersType, "Total", Stream(n)));
+        long npcBefore = Enum.GetNames(StreamType).Where(n => n != "Target1Building" && n != "Target2Building").Sum(n => (long)CallStatic(CountersType, "Total", Stream(n)));
         for (int p = 1; p <= 50; p++) Select("P" + p, p % 12, "GE", "b1", "b2");           // many participants' selections between creating and using the NPC streams
-        long npcAfter = Enum.GetNames(StreamType).Where(n => n != "TargetBuilding").Sum(n => (long)CallStatic(CountersType, "Total", Stream(n)));
+        long npcAfter = Enum.GetNames(StreamType).Where(n => n != "Target1Building" && n != "Target2Building").Sum(n => (long)CallStatic(CountersType, "Total", Stream(n)));
         Assert.AreEqual(npcBefore, npcAfter, "target-building draws are counted under their own stream only");
-        Assert.AreEqual(50L, (long)CallStatic(CountersType, "Total", Stream("TargetBuilding")));
+        Assert.AreEqual(50L, (long)CallStatic(CountersType, "Total", Stream("Target1Building")), "each draw is counted under its own selection stream");
+        Assert.AreEqual(0L, (long)CallStatic(CountersType, "Total", Stream("Target2Building")));
         foreach (var kv in cleanDraws) CollectionAssert.AreEqual(kv.Value, Draw(Call(a, "Get", Stream(kv.Key)), 10), kv.Key + ": identical whatever target selections happened (and for any participant / group)");
-        Assert.Throws<System.Reflection.TargetInvocationException>(() => Call(a, "Get", Stream("TargetBuilding")), "TargetBuilding is not an NPC stream");
+        Assert.Throws<System.Reflection.TargetInvocationException>(() => Call(a, "Get", Stream("Target1Building")), "Target1Building is not an NPC stream");
+        Assert.Throws<System.Reflection.TargetInvocationException>(() => Call(a, "Get", Stream("Target2Building")), "Target2Building is not an NPC stream");
     }
 
     // ------------------------------------------------------------------------------------------------------------------------------ session_config.json
@@ -668,11 +761,11 @@ public class ExperimentRngTests
 
     // The derivation is unchanged by the removal of the 32-bit input: the frozen vectors of seeds whose upper half is zero (the values that used to be written as 32-bit numbers) still hold.
     [Test]
-    public void SeedsWithAZeroUpperHalf_KeepTheirFrozenStreamsAndTargetBuildings()
+    public void SeedsWithAZeroUpperHalf_KeepTheirFrozenStreamsAndTargetSelections()
     {
         Assert.AreEqual(0x3416d3f507fd82e3UL, StreamSeed(12345UL, "Part3", "MovementAssignment", 7));
         Assert.AreEqual(0xebca185bde3bc825UL, StreamSeed(0xFFF0EDFAUL, "Part2", "PartSetup", -1));
-        Assert.AreEqual(0xff0834e9791e17a2UL, (ulong)CallStatic(SeedType, "TargetBuildingSeed", 31415UL, "P001", 4, "OE"));
+        Assert.AreEqual(0x35d409ef71e2213fUL, TSeed(31415UL, "Target1Building", "P001", 4, "OE"));
         Assert.IsNull(FmtType.GetMethod("FromLegacyInt32"), "no legacy int32 conversion helper exists");
         Assert.IsNull(FmtType.GetField("FormatLegacyInt32")); Assert.IsNull(FmtType.GetField("FormatHex64")); Assert.IsNull(FmtType.GetField("FormatNone"));
         Assert.AreNotEqual(StreamSeed(0xFFFFFFFFUL, "Part1", "Destination", 0), StreamSeed(ulong.MaxValue, "Part1", "Destination", 0), "0x00000000ffffffff and 0xffffffffffffffff are different seeds");
@@ -694,7 +787,7 @@ public class ExperimentRngTests
             Assert.AreEqual(v.streamSeed, StreamSeed(v.seed, "Part3", "Appearance", 5), ToHex(v.seed));
             CollectionAssert.AreEqual(v.pcg, Draw(NewStream(v.seed, "Part3", "Appearance", 5), 4), "PCG32 outputs of " + ToHex(v.seed));
         }
-        Assert.AreEqual(0xdd16edfe30842108UL, (ulong)CallStatic(SeedType, "TargetBuildingSeed", 0xFEDCBA9876543210UL, "P001", 4, "OE"));
+        Assert.AreEqual(0xfd3479745b31e27dUL, TSeed(0xFEDCBA9876543210UL, "Target1Building", "P001", 4, "OE"));
     }
 
     [Test]
@@ -714,7 +807,7 @@ public class ExperimentRngTests
         Assert.AreEqual(his.Length, firstDraws.Count);
         // the target-building derivation uses the whole seed too
         var tb = new HashSet<ulong>();
-        foreach (ulong hi in his) tb.Add((ulong)CallStatic(SeedType, "TargetBuildingSeed", (hi << 32) | low, "P001", 4, "OE"));
+        foreach (ulong hi in his) tb.Add(TSeed((hi << 32) | low, "Target1Building", "P001", 4, "OE"));
         Assert.AreEqual(his.Length, tb.Count);
     }
 
@@ -729,11 +822,11 @@ public class ExperimentRngTests
             Assert.AreEqual(StreamSeed(seed, "Part3", "SpawnPlacement", -1), Get<ulong>(CallStatic(MgrType, "GetPartStream", Part("Part3"), Stream("SpawnPlacement")), "StreamSeed"));
             CollectionAssert.AreEqual(Draw(NewStream(seed, "Part2", "Appearance", 9), 5), Draw(Call(CallStatic(MgrType, "CreateNpcRng", Part("Part2"), 9L), "Get", Stream("Appearance")), 5), "per-NPC streams use the full seed");
             // every stream of the inventory (except the participant-level one, which is derived separately) derives from the full seed
-            foreach (string stream in Enum.GetNames(StreamType).Where(n => n != "TargetBuilding"))
+            foreach (string stream in Enum.GetNames(StreamType).Where(n => n != "Target1Building" && n != "Target2Building"))
                 Assert.AreEqual(StreamSeed(seed, "Part3", stream, 4), Get<ulong>(NewStream(seed, "Part3", stream, 4), "StreamSeed"), stream);
-            var args = new object[] { "P001", 4, "OE", 0UL };
-            var tb = MgrType.GetMethod("CreateTargetBuildingStream").Invoke(null, args);
-            Assert.AreEqual((ulong)CallStatic(SeedType, "TargetBuildingSeed", seed, "P001", 4, "OE"), (ulong)args[3]);
+            var args = new object[] { RngStreamValue("Target2Building"), "P001", 4, "OE", 0UL };
+            var tb = MgrType.GetMethod("CreateTargetSelectionStream").Invoke(null, args);
+            Assert.AreEqual(TSeed(seed, "Target2Building", "P001", 4, "OE"), (ulong)args[4]);
             Assert.IsNotNull(tb);
         }
     }
@@ -793,7 +886,7 @@ public class ExperimentRngTests
                 Assert.AreEqual(Get<ulong>(NewStream(seed, "Part3", "MovementAssignment", idx), "StreamSeed"), StreamSeed(seed, "Part3", "MovementAssignment", idx));
             }
             // every stream of the NPC, MovementAssignment included, uses the same root
-            foreach (string st in Enum.GetNames(StreamType).Where(n => n != "TargetBuilding" && n != "PartSetup"))
+            foreach (string st in Enum.GetNames(StreamType).Where(n => n != "Target1Building" && n != "Target2Building" && n != "PartSetup"))
                 Assert.AreEqual(StreamSeed(seed, "Part3", st, 3), Get<ulong>(Call(CallStatic(MgrType, "CreateNpcRng", Part("Part3"), 3L), "Get", Stream(st)), "StreamSeed"), st);
         }
     }

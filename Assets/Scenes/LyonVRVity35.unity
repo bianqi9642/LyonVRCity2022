@@ -246558,7 +246558,7 @@ MonoBehaviour:
   lockParticipantWhileDestination2Panel: 1
   lockParticipantWhilePart2ContinuePanel: 1
   enableLifecycleLogs: 1
-  npcWarmupDuration: 10
+  npcWarmupDuration: 300
   experimentRngMasterSeed: 0000000000000000
   holdNpcsUntilStart: 1
   waitForHeadsetBeforeStartPanel: 1

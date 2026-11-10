@@ -270,6 +270,9 @@ public class UIManager : MonoBehaviour
     public void PrepareDestinationImages(GameObject destination1Building, GameObject destination2Building)
     {
         DestroyDestinationImages();
+        // The panels' target references: the Destination 1 panel shows Destination1PreviewBuilding, the Destination 2 panel Destination2PreviewBuilding (two separate fields, never one shared reference).
+        Destination1PreviewBuilding = destination1Building;
+        Destination2PreviewBuilding = destination2Building;
 
         if (targetPreviewGenerator == null)
         {
@@ -285,6 +288,21 @@ public class UIManager : MonoBehaviour
 
         destination1Image = (destination1Building != null) ? targetPreviewGenerator.CapturePreview(destination1Building) : null;
         destination2Image = (destination2Building != null) ? targetPreviewGenerator.CapturePreview(destination2Building) : null;
+    }
+
+    /// <summary>The building the Destination 1 panel/preview was prepared for (null before PrepareDestinationImages).</summary>
+    public GameObject Destination1PreviewBuilding { get; private set; }
+    /// <summary>The building the Destination 2 panel/preview was prepared for (null before PrepareDestinationImages).</summary>
+    public GameObject Destination2PreviewBuilding { get; private set; }
+
+    /// <summary>Panel readiness before a Part 3 starts: both destination panel templates exist and are different objects (so the two panels cannot be one and the same).</summary>
+    public bool TryValidatePart3DestinationPanels(out string error)
+    {
+        error = null;
+        if (part3Dest1FullTemplate == null) { error = "the Destination 1 panel template (part3Dest1FullTemplate) is not assigned"; return false; }
+        if (part3Dest2FullTemplate == null) { error = "the Destination 2 panel template (part3Dest2FullTemplate) is not assigned"; return false; }
+        if (part3Dest1FullTemplate == part3Dest2FullTemplate) { error = "the Destination 1 and Destination 2 panels are the same template object"; return false; }
+        return true;
     }
 
     private void DestroyDestinationImages()

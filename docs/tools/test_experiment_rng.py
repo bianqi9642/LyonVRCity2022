@@ -23,7 +23,7 @@ class RngVectors(unittest.TestCase):
 
     def test_every_input_changes_the_stream(self):
         seeds = {x.stream_seed(r, p, s, i) for r in (1, 2, 0xFFFFFFFF) for p in x.PARTS for s in x.STREAMS for i in (-1, 0, 1, 2, 1000)}
-        self.assertEqual(len(seeds), 3 * 4 * 11 * 5)
+        self.assertEqual(len(seeds), 3 * 4 * len(x.STREAMS) * 5)
 
     def test_zero_first_value_seed_used_by_the_weighted_selection_test(self):
         self.assertEqual(x.Pcg32(7926344, 54).next_uint(), 0x89)   # next_float() == 0 exactly
@@ -39,17 +39,36 @@ class RngVectors(unittest.TestCase):
             self.assertEqual(x.predict_movement_mode(99, "Part3", i, 0.0), "Part2WanderingItinerary")
 
 
-class TargetBuildingVectors(unittest.TestCase):
-    def test_hash_and_seed_vectors_match_the_csharp_tests(self):
+class TargetSelectionVectors(unittest.TestCase):
+    """Frozen vectors of the per-destination target selection (C# ExperimentRngTests.TargetSelection_* asserts the same values)."""
+    def test_hash_and_selection_seed_vectors(self):
         self.assertEqual(x.hash_utf8("P001"), 0x5ffc4b9c13046dde)
-        self.assertEqual(x.target_building_seed(31415, "P001", 4, "OE"), 0xff0834e9791e17a2)
-        self.assertEqual(x.target_building_seed(31415, "P002", 4, "OE"), 0x8fe8f3c3df18db24)
-        self.assertEqual(x.target_building_seed(0xFFFFFFFB, "P001", 11, "GU"), 0xc145d5fd02db767e)
+        P3, T1, T2 = "Part3", "Target1Building", "Target2Building"
+        self.assertEqual(x.target_selection_seed(31415, P3, T1, "P001", 4, "OE"), 0x35d409ef71e2213f)
+        self.assertEqual(x.target_selection_seed(31415, P3, T2, "P001", 4, "GU"), 0x59a822d807652adc)
+        self.assertEqual(x.target_selection_seed(31415, P3, T1, "P002", 4, "OE"), 0x5d7492f2f69f46ec)
+        self.assertEqual(x.target_selection_seed(31415, P3, T2, "P002", 4, "GU"), 0xce47a73862d480c2)
+        self.assertEqual(x.target_selection_seed(0xFEDCBA9876543210, P3, T1, "P001", 4, "OE"), 0xfd3479745b31e27d)
+        self.assertEqual(x.target_selection_seed(0xFEDCBA9876543210, P3, T2, "P001", 4, "GU"), 0x86781eb11b77f237)
 
     def test_selection_vectors_and_order_independence(self):
-        self.assertEqual(x.choose_target_building(31415, "P001", 4, "OE", ["OE_B", "OE_A"])[0], "OE_B")
-        self.assertEqual(x.choose_target_building(31415, "P004", 4, "OE", ["OE_A", "OE_B"])[0], "OE_A")
-        self.assertEqual(x.choose_target_building(31415, "P004", 4, "OE", ["OE_B", "OE_A"])[0], "OE_A")
+        self.assertEqual(x.choose_target(31415, 1, "P001", 4, "OE", ["OE_B", "OE_A"])[0], "OE_B")
+        self.assertEqual(x.choose_target(31415, 2, "P001", 4, "GU", ["GU_B", "GU_A"])[0], "GU_B")
+        self.assertEqual(x.choose_target(31415, 2, "P002", 4, "GU", ["GU_A", "GU_B"])[0], "GU_A")
+        self.assertEqual(x.choose_target(31415, 2, "P002", 4, "GU", ["GU_B", "GU_A"])[0], "GU_A")
+        self.assertEqual(x.choose_target(0xFEDCBA9876543210, 2, "P001", 2, "GE", ["GE_B", "GE_A"])[0], "GE_B")
+
+    def test_the_two_destinations_use_independent_streams(self):
+        for seed in (1, 31415, 0x8000000000000001):
+            for pid in ("P001", "P002", "P777"):
+                a = x.target_selection_seed(seed, "Part3", "Target1Building", pid, 4, "OE")
+                b = x.target_selection_seed(seed, "Part3", "Target2Building", pid, 4, "OE")
+                self.assertNotEqual(a, b, "same participant, group and zone, different destination stream: different seeds")
+        # the stream id is part of the derivation: swapping the zones between destinations does not swap the seeds
+        self.assertNotEqual(x.target_selection_seed(5, "Part3", "Target1Building", "P001", 1, "GU"), x.target_selection_seed(5, "Part3", "Target2Building", "P001", 1, "GU"))
+        # no NPC stream can collide with a selection stream
+        npc = {x.stream_seed(5, "Part3", st, i) for st in x.STREAMS for i in range(50)}
+        self.assertNotIn(x.target_selection_seed(5, "Part3", "Target1Building", "P001", 1, "GU"), npc)
 
     def test_64_bit_seeds_survive_the_hex_representation_exactly(self):
         for v in (0xff0834e9791e17a2, 0xffffffffffffffff, 0x8000000000000001, 1):
@@ -57,9 +76,74 @@ class TargetBuildingVectors(unittest.TestCase):
             self.assertEqual(len(x.seed_hex(v)), 16)
         self.assertNotEqual(int(float(0xff0834e9791e17a2)), 0xff0834e9791e17a2)   # a float would have lost low bits: seeds are never stored as numbers
 
-    def test_participants_groups_regions_and_seeds_are_separately_derived(self):
-        seeds = {x.target_building_seed(m, p, g, r) for m in (1, 2) for p in ("P001", "P002", "p001") for g in (0, 5) for r in ("GE", "OU")}
-        self.assertEqual(len(seeds), 2 * 3 * 2 * 2)
+    def test_participants_groups_zones_streams_and_seeds_are_separately_derived(self):
+        seeds = {x.target_selection_seed(m, "Part3", st, p, g, z) for m in (1, 2) for st in ("Target1Building", "Target2Building") for p in ("P001", "P002", "p001") for g in (0, 5) for z in ("GE", "OU")}
+        self.assertEqual(len(seeds), 2 * 2 * 3 * 2 * 2)
+
+    def test_each_selection_is_uniform_over_the_two_landmarks(self):
+        for dest, stream_zone in ((1, "OE"), (2, "GU")):
+            n = sum(1 for p in range(2000) if x.choose_target(777, dest, "P%04d" % p, 4, stream_zone, ["A", "B"])[0] == "A")
+            self.assertAlmostEqual(n, 1000, delta=5 * (2000 * 0.25) ** 0.5)
+
+    def test_the_old_shared_domain_derivation_no_longer_exists(self):
+        self.assertFalse(hasattr(x, "target_building_seed"))
+        self.assertFalse(hasattr(x, "choose_target_building"))
+        self.assertNotIn("TargetBuilding", x.STREAMS)
+
+
+class Table5(unittest.TestCase):
+    EXPECTED = [("GE", "GU", "OE"), ("GE", "OE", "GU"), ("GE", "OU", "GE"), ("GU", "GE", "OU"), ("GU", "OE", "GU"), ("GU", "OU", "GE"),
+                ("OE", "GE", "OU"), ("OE", "GU", "OE"), ("OE", "OU", "GE"), ("OU", "GE", "OU"), ("OU", "GU", "OE"), ("OU", "OE", "GU")]
+
+    def test_the_group_table_is_exactly_table_5(self):
+        self.assertEqual(x.GROUP_TABLE, self.EXPECTED)
+
+    def test_destination_zones_differ_for_all_twelve_groups(self):
+        for g, (start, d1, d2) in enumerate(x.GROUP_TABLE):
+            self.assertNotEqual(d1, d2, "group %d" % g)
+        self.assertEqual({(d1, d2) for _, d1, d2 in x.GROUP_TABLE} & {(z, z) for z in ("GE", "GU", "OE", "OU")}, set())
+        for g in (2, 4, 7, 9):       # the groups whose START zone equals a destination zone are NOT same-destination groups
+            self.assertNotEqual(x.GROUP_TABLE[g][1], x.GROUP_TABLE[g][2])
+        self.assertEqual([x.GROUP_TABLE[g][1:] for g in (2, 4, 7, 9)], [("OU", "GE"), ("OE", "GU"), ("GU", "OE"), ("GE", "OU")])
+
+
+class VerifyTargetAssignment(unittest.TestCase):
+    @staticmethod
+    def block(master, pid, group, ids=None):
+        start, z1, z2 = x.GROUP_TABLE[group]
+        c1, c2 = ids or ([z1 + "_A", z1 + "_B"], [z2 + "_A", z2 + "_B"])
+        t1, _, s1 = x.choose_target(master, 1, pid, group, z1, c1)
+        t2, _, s2 = x.choose_target(master, 2, pid, group, z2, c2)
+        return {"target_selection_version": 2, "part3_group_index": group, "part3_start_zone": start, "destination1_zone_id": z1, "destination2_zone_id": z2,
+                "destination1_candidate_ids": sorted(c1), "destination2_candidate_ids": sorted(c2), "target1_building_id": t1, "target2_building_id": t2,
+                "target1_selection_seed": s1, "target2_selection_seed": s2}
+
+    def test_every_group_audits_clean(self):
+        for master in (31415, 0xFEDCBA9876543210):
+            for g in range(12):
+                for pid in ("P001", "P002", "P003"):
+                    r = x.verify_target_assignment(master, pid, self.block(master, pid, g))
+                    self.assertTrue(all(r.values()), (master, g, pid, r))
+
+    def test_every_violation_is_detected(self):
+        b = self.block(31415, "P001", 4)
+        for key, bad in (("target1_building_id", b["target2_building_id"]), ("target2_building_id", b["target1_building_id"]), ("destination2_zone_id", b["destination1_zone_id"]),
+                         ("part3_start_zone", "OU"), ("target1_selection_seed", "0" * 16)):
+            r = x.verify_target_assignment(31415, "P001", dict(b, **{key: bad}))
+            self.assertFalse(all(r.values()), key)
+        # the same pair of ids / zones: both targets 'distinct' and 'in zone' flags fail independently
+        same = dict(b, target2_building_id=b["target1_building_id"])
+        self.assertFalse(x.verify_target_assignment(31415, "P001", same)["target_ids_distinct"])
+        self.assertFalse(x.verify_target_assignment(31415, "P001", dict(b, destination2_zone_id=b["destination1_zone_id"]))["destination_zones_distinct"])
+        self.assertFalse(x.verify_target_assignment(31415, "P001", dict(b, destination1_candidate_ids=["OE_A"]))["target1_in_destination1_zone"], "exactly two candidates are required")
+
+    def test_unsupported_or_missing_blocks_are_not_audited(self):
+        b = self.block(31415, "P001", 4)
+        self.assertIsNone(x.verify_target_assignment(31415, "P001", dict(b, target_selection_version=1)))
+        self.assertIsNone(x.verify_target_assignment(31415, "P001", {k: v for k, v in b.items() if k != "target_selection_version"}))
+        self.assertIsNone(x.verify_target_assignment(31415, "", b))
+        self.assertIsNone(x.verify_target_assignment(31415, "P001", None))
+        self.assertIsNone(x.verify_target_assignment(31415, "P001", dict(b, part3_group_index=12)))
 
 
 class Full64BitSeeds(unittest.TestCase):
@@ -79,11 +163,11 @@ class Full64BitSeeds(unittest.TestCase):
         low = 0x00000000DEADBEEF
         seeds = {x.stream_seed(low | (hi << 32), "Part2", "Wandering", 3) for hi in (0, 1, 2, 0x80000000, 0xFFFFFFFF)}
         self.assertEqual(len(seeds), 5)
-        self.assertEqual(len({x.target_building_seed(low | (hi << 32), "P001", 4, "OE") for hi in (0, 1, 0xFFFFFFFF)}), 3)
+        self.assertEqual(len({x.target_selection_seed(low | (hi << 32), "Part3", "Target1Building", "P001", 4, "OE") for hi in (0, 1, 0xFFFFFFFF)}), 3)
 
-    def test_target_building_vector_with_upper_bits(self):
-        self.assertEqual(x.target_building_seed(0xFEDCBA9876543210, "P001", 4, "OE"), 0xdd16edfe30842108)
-        self.assertEqual(x.choose_target_building(0xFEDCBA9876543210, "P001", 4, "OE", ["OE_B", "OE_A"])[0], "OE_A")
+    def test_target_selection_vector_with_upper_bits(self):
+        self.assertEqual(x.target_selection_seed(0xFEDCBA9876543210, "Part3", "Target1Building", "P001", 4, "OE"), 0xfd3479745b31e27d)
+        self.assertEqual(x.choose_target(0xFEDCBA9876543210, 1, "P001", 4, "OE", ["OE_B", "OE_A"])[0], "OE_B")
 
     def test_no_legacy_32bit_helpers_remain(self):
         self.assertFalse(hasattr(x, "legacy_int32_to_u64"))

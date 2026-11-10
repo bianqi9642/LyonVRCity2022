@@ -34,7 +34,8 @@ public enum RngStream
     AttractorDwell = 8,      // standing point inside an Attractor plane
     Uncertainty = 9,         // hesitation / pause / slow / detour / look-around decisions
     NavigationNudge = 10,    // small navigation corrections (target nudge)
-    TargetBuilding = 11,     // participant-specific Part 3 target-building choice inside the group-assigned region (seed from Master Seed + participant + group + region, see SeedDerivation.TargetBuildingSeed)
+    Target1Building = 11,    // participant-specific choice of the Destination 1 target building inside the group-assigned Destination 1 zone (SeedDerivation.TargetSelectionSeed); not an NPC stream
+    Target2Building = 12,    // participant-specific choice of the Destination 2 target building inside the group-assigned Destination 2 zone (independent of Target1Building); not an NPC stream
 }
 
 /// <summary>The Part a stream belongs to. None = outside a running Part (pool preparation, test rigs). Values are part of the seed derivation.</summary>
@@ -56,11 +57,15 @@ public static class RngConstants
     /// <summary>Part-level streams use this index in the derivation (NPC streams use their spawn index, which starts at 0).</summary>
     public const long PartLevelIndex = -1;
     /// <summary>Number of Part slots (None + Part1..3) and of stream slots (index 0 unused) for the draw counters.</summary>
-    public const int PartSlots = 4, StreamSlots = 12;
+    public const int PartSlots = 4, StreamSlots = 13;
     /// <summary>Version of every stream's definition (what the stream is used for and how it is keyed). Recorded per stream in the manifest; bump an individual entry only if that stream's meaning changes.</summary>
     public const int StreamVersion = 1;
-    /// <summary>Domain label of the participant-specific target-building derivation (hashed, never GetHashCode).</summary>
-    public const string TargetBuildingDomain = "Part3TargetBuilding";
+    /// <summary>
+    /// Version of the participant-specific target-selection derivation (SeedDerivation.TargetSelectionSeed): 2 = one independent stream per destination (Target1Building / Target2Building), keyed by
+    /// Master Seed + Part + stream id + participant ID + group index + zone ID. (Version 1, a single shared domain keyed by the zone only, is superseded and not read by the tools.) Recorded in the manifest.
+    /// </summary>
+    public const int TargetSelectionVersion = 2;
+    public const string TargetSelectionAlgorithm = "SplitMix64-chain(master,part,stream,participant,group,zone)+PCG32.Range(sorted candidates)";
     public static readonly RngStream[] AllStreams = (RngStream[])Enum.GetValues(typeof(RngStream));
 }
 
@@ -148,18 +153,19 @@ public static class SeedDerivation
     }
 
     /// <summary>
-    /// Stream seed of the participant-specific target-building draw: Master Seed + domain "Part3TargetBuilding" + participant ID + Part 3 group index + target region ID.
-    /// The region is part of the key, so the two destinations of a group (different regions) and different groups have separately derived streams. NPC streams never use it.
+    /// Stream seed of the participant-specific target selection of ONE destination: Effective Master Seed + Part + selection stream (Target1Building / Target2Building) + participant ID +
+    /// group index + that destination's zone ID. Each destination has its own stream id, so the two selections never share a stream, a seed or a mutable generator; NPC streams never use this.
     /// </summary>
-    public static ulong TargetBuildingSeed(ulong masterSeed, string participantId, int part3GroupIndex, string regionId)
+    public static ulong TargetSelectionSeed(ulong masterSeed, RngPart part, RngStream stream, string participantId, int groupIndex, string zoneId)
     {
         unchecked
         {
             ulong h = Mix(masterSeed ^ 0x4C594F4E52455832UL);   // domain separator "LYONREX2" (the NPC streams use "LYONREX1")
-            h = Mix(h + HashUtf8(RngConstants.TargetBuildingDomain));
+            h = Mix(h + (ulong)(long)(int)part);
+            h = Mix(h + (ulong)(long)(int)stream * 0x100000001B3UL);
             h = Mix(h + HashUtf8(participantId));
-            h = Mix(h + (ulong)(long)(part3GroupIndex + 1));
-            h = Mix(h + HashUtf8(regionId));
+            h = Mix(h + (ulong)(long)(groupIndex + 1));
+            h = Mix(h + HashUtf8(zoneId));
             return h;
         }
     }
@@ -352,7 +358,7 @@ public sealed class NpcRngSet
     {
         int slot = (int)id;
         if (slot < 1 || slot >= RngConstants.StreamSlots) throw new ArgumentOutOfRangeException(nameof(id), "unknown RNG stream " + slot);
-        if (id == RngStream.TargetBuilding) throw new ArgumentException("TargetBuilding is a participant-level stream (ExperimentRngManager.CreateTargetBuildingStream), not an NPC stream", nameof(id));
+        if (id == RngStream.Target1Building || id == RngStream.Target2Building) throw new ArgumentException(id + " is a participant-level selection stream (ExperimentRngManager.CreateTargetSelectionStream), not an NPC stream", nameof(id));
         Pcg32 s = streams[slot];
         if (s == null)
         {

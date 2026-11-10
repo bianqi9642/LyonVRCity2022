@@ -24,7 +24,7 @@
 // STREAMS
 //   Part level : GetPartStream(part, stream)           keyed by (Master Seed, Part, stream)
 //   NPC level  : CreateNpcRng(part, spawnIndex)        keyed by (Master Seed, Part, stream, spawnIndex); NOT by participant or group (common NPC randomness across participants)
-//   Participant: CreateTargetBuildingStream(...)       keyed by (Master Seed, "Part3TargetBuilding", participant ID, Part 3 group index, region ID); independent of every NPC stream
+//   Participant: CreateTargetSelectionStream(...)      one stream PER DESTINATION (Target1Building / Target2Building), keyed by (Master Seed, Part 3, stream id, participant ID, group index, zone ID); independent of every NPC stream and of each other
 //   Every stream, including the Part 3 MovementAssignment stream, derives from the Master Seed alone; there is no per-stream seed override.
 //
 // This class holds static state because the experiment has exactly one RNG configuration per application run; it is reset on domain/scene (re)load
@@ -183,7 +183,7 @@ public static class ExperimentRngManager
     {
         if ((int)part < 0 || (int)part >= RngConstants.PartSlots) throw new ArgumentOutOfRangeException(nameof(part), "invalid RNG Part " + (int)part);
         if ((int)stream < 1 || (int)stream >= RngConstants.StreamSlots) throw new ArgumentOutOfRangeException(nameof(stream), "invalid RNG stream " + (int)stream);
-        if (stream == RngStream.TargetBuilding) throw new ArgumentException("TargetBuilding is a participant-level stream: use CreateTargetBuildingStream", nameof(stream));
+        if (stream == RngStream.Target1Building || stream == RngStream.Target2Building) throw new ArgumentException(stream + " is a participant-level selection stream: use CreateTargetSelectionStream", nameof(stream));
     }
 
     /// <summary>The Part-level stream (shared by every consumer of that process in that Part). Created on first use; the same stream object is returned afterwards.</summary>
@@ -211,17 +211,19 @@ public static class ExperimentRngManager
     }
 
     /// <summary>
-    /// The participant-specific stream that picks the Part 3 target building inside the region assigned by the group index. Seed = SeedDerivation.TargetBuildingSeed(Effective Master
-    /// Seed, participant ID, group index, region ID). A fresh stream object per call: asking twice with the same arguments yields the same sequence, and nothing here touches an NPC stream.
+    /// The participant-specific stream that picks the target building of ONE destination inside the zone the group index assigned to it. stream must be Target1Building (Destination 1) or
+    /// Target2Building (Destination 2): each has its own derived seed = SeedDerivation.TargetSelectionSeed(Effective Master Seed, Part 3, stream, participant ID, group index, zone ID).
+    /// A fresh Pcg32 object per call: asking twice with the same arguments yields the same sequence, the two destinations never share a generator, and nothing here touches an NPC stream.
     /// </summary>
-    public static Pcg32 CreateTargetBuildingStream(string participantId, int part3GroupIndex, string regionId, out ulong derivedSeed)
+    public static Pcg32 CreateTargetSelectionStream(RngStream stream, string participantId, int groupIndex, string zoneId, out ulong derivedSeed)
     {
-        if (string.IsNullOrWhiteSpace(participantId)) throw new ArgumentException("a participant ID is required for the participant-specific target-building selection", nameof(participantId));
-        if (string.IsNullOrWhiteSpace(regionId)) throw new ArgumentException("a target region ID is required", nameof(regionId));
-        if (part3GroupIndex < 0) throw new ArgumentOutOfRangeException(nameof(part3GroupIndex), "invalid Part 3 group index " + part3GroupIndex);
+        if (stream != RngStream.Target1Building && stream != RngStream.Target2Building) throw new ArgumentException("the target-selection stream must be Target1Building or Target2Building, got " + stream, nameof(stream));
+        if (string.IsNullOrWhiteSpace(participantId)) throw new ArgumentException("a participant ID is required for the participant-specific target selection", nameof(participantId));
+        if (string.IsNullOrWhiteSpace(zoneId)) throw new ArgumentException("a destination zone ID is required", nameof(zoneId));
+        if (groupIndex < 0) throw new ArgumentOutOfRangeException(nameof(groupIndex), "invalid group index " + groupIndex);
         EnsureInitialized();
-        derivedSeed = SeedDerivation.TargetBuildingSeed(effectiveSeed, participantId, part3GroupIndex, regionId);
-        return new Pcg32(derivedSeed, RngPart.Part3, RngStream.TargetBuilding);
+        derivedSeed = SeedDerivation.TargetSelectionSeed(effectiveSeed, RngPart.Part3, stream, participantId, groupIndex, zoneId);
+        return new Pcg32(derivedSeed, RngPart.Part3, stream);
     }
 
     /// <summary>

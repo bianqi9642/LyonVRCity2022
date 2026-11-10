@@ -395,9 +395,12 @@ public class ExperimentManager : MonoBehaviour
         public string StartPointId, TeleportPointId;
     }
 
-    /// <summary>One Part 3 destination: its group-assigned region and the participant-specific selection inside it.</summary>
+    /// <summary>One Part 3 destination: its group-assigned zone and the participant-specific selection inside it.</summary>
     public sealed class Part3DestinationInfo
     {
+        /// <summary>1 or 2.</summary>
+        public int Destination;
+        /// <summary>The zone (GE / GU / OE / OU) assigned to this destination by the group index.</summary>
         public string RegionId;
         public string[] CandidateIds;
         public string CandidateFingerprint;
@@ -422,6 +425,16 @@ public class ExperimentManager : MonoBehaviour
     public Part2AssignmentInfo Part2Assignment { get; private set; }
     /// <summary>The Part 3 assignment of this run (null until Part 3 has been resolved). Read by the manifest.</summary>
     public Part3AssignmentInfo Part3Assignment { get; private set; }
+
+    // ---- the two target identities and the ACTIVE target (separate state; Destination 2 never reads the Destination 1 reference) ----
+    /// <summary>Id of the Destination 1 target building (empty until a Part 3 assignment exists). Fixed for the whole session.</summary>
+    public string Target1BuildingId => Part3Assignment != null ? Part3Assignment.Destination1.SelectedId : "";
+    /// <summary>Id of the Destination 2 target building (empty until a Part 3 assignment exists). Fixed for the whole session; never the Destination 1 id.</summary>
+    public string Target2BuildingId => Part3Assignment != null ? Part3Assignment.Destination2.SelectedId : "";
+    /// <summary>"D1" while the Destination 1 search is open, "D2" while the Destination 2 search is open, "" otherwise.</summary>
+    public string ActivePart3Destination { get; private set; } = "";
+    /// <summary>The id a click must have to complete the open search ("" when no search is open). Set explicitly at each transition, never carried over.</summary>
+    public string ActivePart3TargetId { get; private set; } = "";
 
     private static bool TrySingle(Transform[] array, string what, int groupIndex, out Transform t, out string error)
     {
@@ -451,33 +464,74 @@ public class ExperimentManager : MonoBehaviour
         return true;
     }
 
-    private bool TryResolvePart3Destination(int groupIndex, string participantId, Part3Zone zone, string label, out Part3DestinationInfo dest, out string error)
+    /// <summary>
+    /// The eligible landmarks of one zone, validated: EXACTLY two assigned buildings, each with a TargetSelectable (the click target: its id is the building's identity) that sits on a
+    /// GameObject with an enabled, non-trigger Collider (the ray / pointer must be able to hit it). Ids are unique within the zone. Never repairs or skips: any gap is an error.
+    /// </summary>
+    private bool TryGetZoneCandidates(Part3Zone zone, string label, out Dictionary<string, GameObject> byId, out List<string> ids, out string error)
     {
-        dest = null; error = null;
+        byId = new Dictionary<string, GameObject>(StringComparer.Ordinal); ids = new List<string>(2); error = null;
         Part3ZoneTargets targets = ResolvePart3ZoneTargets(zone);
-        if (targets == null) { error = label + " region " + zone + " is not configured"; return false; }
-        var byId = new Dictionary<string, GameObject>(StringComparer.Ordinal);
-        var ids = new List<string>(2);
+        if (targets == null) { error = label + " zone " + zone + " is not configured"; return false; }
+        int assigned = (targets.buildingA != null ? 1 : 0) + (targets.buildingB != null ? 1 : 0);
+        if (assigned != 2) { error = label + " zone " + zone + " must have exactly two eligible landmarks, found " + assigned + " (buildingA / buildingB)"; return false; }
+        if (targets.buildingA == targets.buildingB) { error = label + " zone " + zone + ": buildingA and buildingB are the same object '" + targets.buildingA.name + "'"; return false; }
         foreach (GameObject candidate in new[] { targets.buildingA, targets.buildingB })
         {
-            if (candidate == null) continue;               // an unassigned slot is simply not a candidate
-            string id = GetAssignedTargetId(candidate);
-            if (string.IsNullOrWhiteSpace(id)) { error = label + " region " + zone + ": candidate '" + candidate.name + "' has no TargetSelectable id"; return false; }
-            if (byId.ContainsKey(id)) { error = label + " region " + zone + ": two candidates share the id '" + id + "'"; return false; }
+            TargetSelectable ts = candidate.GetComponent<TargetSelectable>();
+            if (ts == null) { error = label + " zone " + zone + ": landmark '" + candidate.name + "' has no TargetSelectable on the building object itself, so a controller ray / click cannot select it"; return false; }
+            Collider hit = null;
+            foreach (Collider c in candidate.GetComponents<Collider>()) if (c != null && c.enabled && !c.isTrigger) { hit = c; break; }
+            if (hit == null) { error = label + " zone " + zone + ": landmark '" + candidate.name + "' has no enabled non-trigger Collider on the object that carries its TargetSelectable"; return false; }
+            string id = ts.ResolvedTargetId;
+            if (string.IsNullOrWhiteSpace(id)) { error = label + " zone " + zone + ": landmark '" + candidate.name + "' has no usable TargetSelectable id"; return false; }
+            if (byId.ContainsKey(id)) { error = label + " zone " + zone + ": two landmarks share the id '" + id + "'"; return false; }
             byId[id] = candidate; ids.Add(id);
         }
+        return true;
+    }
+
+    /// <summary>
+    /// Scene validation before a Part 3 starts: all four zones exist, each with exactly two valid landmarks, and no landmark object or id is used in two zones. Independent of the group.
+    /// </summary>
+    private bool TryValidatePart3Zones(out string error)
+    {
+        error = null;
+        var objects = new Dictionary<GameObject, Part3Zone>();
+        var idsSeen = new Dictionary<string, Part3Zone>(StringComparer.Ordinal);
+        foreach (Part3Zone zone in new[] { Part3Zone.GE, Part3Zone.GU, Part3Zone.OE, Part3Zone.OU })
+        {
+            Dictionary<string, GameObject> byId; List<string> ids;
+            if (!TryGetZoneCandidates(zone, "Part 3", out byId, out ids, out error)) return false;
+            foreach (KeyValuePair<string, GameObject> kv in byId)
+            {
+                if (objects.TryGetValue(kv.Value, out Part3Zone other)) { error = "Part 3 landmark '" + kv.Value.name + "' is assigned to both zone " + other + " and zone " + zone; return false; }
+                if (idsSeen.TryGetValue(kv.Key, out Part3Zone otherId)) { error = "Part 3 landmark id '" + kv.Key + "' is used in both zone " + otherId + " and zone " + zone; return false; }
+                objects[kv.Value] = zone; idsSeen[kv.Key] = zone;
+            }
+        }
+        return true;
+    }
+
+    private bool TryResolvePart3Destination(int destination, int groupIndex, string participantId, Part3Zone zone, out Part3DestinationInfo dest, out string error)
+    {
+        dest = null;
+        string label = "Destination " + destination;
+        Dictionary<string, GameObject> byId; List<string> ids;
+        if (!TryGetZoneCandidates(zone, label, out byId, out ids, out error)) return false;
         Part3TargetSelection.Result sel;
-        if (!Part3TargetSelection.TrySelect(participantId, groupIndex, zone.ToString(), ids, out sel, out error)) { error = label + ": " + error; return false; }
+        if (!Part3TargetSelection.TrySelect(destination, participantId, groupIndex, zone.ToString(), ids, out sel, out error)) { error = label + ": " + error; return false; }
         dest = new Part3DestinationInfo
         {
-            RegionId = sel.RegionId, CandidateIds = sel.CandidateIds, CandidateFingerprint = sel.CandidateFingerprint, SelectedId = sel.SelectedId, Building = byId[sel.SelectedId], DerivedSeed = sel.DerivedSeed,
+            Destination = destination, RegionId = sel.RegionId, CandidateIds = sel.CandidateIds, CandidateFingerprint = sel.CandidateFingerprint, SelectedId = sel.SelectedId, Building = byId[sel.SelectedId], DerivedSeed = sel.DerivedSeed,
         };
         return true;
     }
 
     /// <summary>
-    /// Part 3: the group index (a fixed table row) designates the start zone / point and the two destination regions. Inside each region ONE eligible building is drawn from the
-    /// participant-specific stream (Part3TargetSelection). No region, start point or building is ever chosen at random or taken from another region; any gap is an error.
+    /// Part 3: the group index (a fixed table row, Table 5) designates the start zone / point and the two destination zones, which always differ. Inside each zone ONE eligible building is
+    /// drawn by that destination's own participant-specific stream (Part3TargetSelection; Target1Building / Target2Building). No zone, start point or building is ever chosen at random or
+    /// taken from another zone; any gap (not exactly two valid landmarks in a zone, missing collider / TargetSelectable, equal zones, equal target ids ...) is an error.
     /// </summary>
     private bool TryResolvePart3Assignment(int groupIndex, string participantId, out Part3AssignmentInfo info, out string error)
     {
@@ -488,10 +542,15 @@ public class ExperimentManager : MonoBehaviour
         if (def.Destination1Zone == def.Destination2Zone) { error = "group " + groupIndex + " assigns the same region to both destinations"; return false; }
         Transform start = ResolvePart3Start(def.StartZone);
         if (start == null) { error = "the Part 3 start point of zone " + def.StartZone + " (group " + groupIndex + ") is not assigned in the scene"; return false; }
+        if (!TryValidatePart3Zones(out error)) return false;
+        // Two SEPARATE selections, one per destination zone (the zones always differ): independent streams, two separate result objects, nothing shared or reused between them.
         Part3DestinationInfo d1, d2;
-        if (!TryResolvePart3Destination(groupIndex, participantId, def.Destination1Zone, "Destination 1", out d1, out error)) return false;
-        if (!TryResolvePart3Destination(groupIndex, participantId, def.Destination2Zone, "Destination 2", out d2, out error)) return false;
-        if (d1.SelectedId == d2.SelectedId) { error = "Destinations 1 and 2 resolve to the same building id '" + d1.SelectedId + "'"; return false; }
+        if (!TryResolvePart3Destination(1, groupIndex, participantId, def.Destination1Zone, out d1, out error)) return false;
+        if (!TryResolvePart3Destination(2, groupIndex, participantId, def.Destination2Zone, out d2, out error)) return false;
+        if (d1.RegionId != def.Destination1Zone.ToString() || d2.RegionId != def.Destination2Zone.ToString()) { error = "internal error: a destination resolved to a zone other than the one assigned by group " + groupIndex; return false; }
+        if (d1.SelectedId == d2.SelectedId || d1.Building == d2.Building) { error = "Destinations 1 and 2 resolve to the same building id '" + d1.SelectedId + "'"; return false; }
+        if (Array.IndexOf(d1.CandidateIds, d1.SelectedId) < 0) { error = "Target 1 '" + d1.SelectedId + "' is not one of the zone " + d1.RegionId + " landmarks"; return false; }
+        if (Array.IndexOf(d2.CandidateIds, d2.SelectedId) < 0) { error = "Target 2 '" + d2.SelectedId + "' is not one of the zone " + d2.RegionId + " landmarks"; return false; }
         info = new Part3AssignmentInfo
         {
             GroupIndex = groupIndex, ParticipantId = participantId, StartZone = def.StartZone.ToString(), StartPoint = start, StartPointId = start.name, Destination1 = d1, Destination2 = d2,
@@ -1693,7 +1752,12 @@ public class ExperimentManager : MonoBehaviour
             Debug.LogError("[ExperimentManager] RunPart3 refused: " + p3Error + ". Fix the session configuration / scene.");
             yield break;
         }
+        // Both destination panels must exist and be separate (each is later prepared for its own target building); refuse before part_start otherwise, keeping no assignment.
+        string panelError;
+        if (uiManager == null) { Debug.LogError("[ExperimentManager] RunPart3 refused: no UIManager, so the Target 1 / Target 2 panels cannot be shown."); yield break; }
+        if (!uiManager.TryValidatePart3DestinationPanels(out panelError)) { Debug.LogError("[ExperimentManager] RunPart3 refused: " + panelError + "."); yield break; }
         Part3Assignment = p3;
+        ActivePart3Destination = ""; ActivePart3TargetId = "";
 
         currentRunningPart = RunningPart.Part3;
         CurrentPartConfig = _frozenPartConfigs[2];
@@ -1811,6 +1875,7 @@ public class ExperimentManager : MonoBehaviour
 
         // Destination 1 assigned: make ONLY destination1Building interactable (TargetSelectable + hover).
         SetAllPart3CandidatesInteractable(false);
+        ActivePart3Destination = "D1"; ActivePart3TargetId = d1AssignedId ?? "";
         SetCandidateInteractable(destination1Building, true);
         RaiseEvt("candidate_interactable_on", "Part3", label: "D1", building: destination1Building);
         GameObject d1Alternate = _effective.AllowWrongCandidateSelection ? GetAlternateCandidate(d1ZoneTargets, destination1Building) : null;
@@ -1883,7 +1948,8 @@ public class ExperimentManager : MonoBehaviour
 
         if (dest1ShrunkInstance != null) { Destroy(dest1ShrunkInstance); dest1ShrunkInstance = null; }
 
-        // Destination 1 finished: the D1 target is a plain non-interactable building again.
+        // Destination 1 finished: the D1 target is a plain non-interactable building again, and no target is active until Destination 2 assigns its own.
+        ActivePart3Destination = ""; ActivePart3TargetId = "";
         SetCandidateInteractable(destination1Building, false);
         RaiseEvt("candidate_interactable_off", "Part3", label: "D1", building: destination1Building);
         if (d1Alternate != null)
@@ -1941,8 +2007,9 @@ public class ExperimentManager : MonoBehaviour
             ReleaseParticipantCheckpointLock("D2", "d2_continue_confirmed");   // safety net only (idempotent): the callback above already released it
             SetPhase("d2_search");
 
-            // Destination 2 assigned: make ONLY destination2Building interactable.
+            // Destination 2 assigned: make ONLY destination2Building interactable; the active target is set explicitly to the Destination 2 id (the Destination 1 reference is gone).
             SetAllPart3CandidatesInteractable(false);
+            ActivePart3Destination = "D2"; ActivePart3TargetId = d2AssignedId ?? "";
             SetCandidateInteractable(destination2Building, true);
             RaiseEvt("candidate_interactable_on", "Part3", label: "D2", building: destination2Building);
             GameObject d2Alternate = _effective.AllowWrongCandidateSelection ? GetAlternateCandidate(d2ZoneTargets, destination2Building) : null;
@@ -2009,6 +2076,7 @@ public class ExperimentManager : MonoBehaviour
             if (dest2ShrunkInstance != null) { Destroy(dest2ShrunkInstance); dest2ShrunkInstance = null; }
 
             // Destination 2 finished: the D2 target is a plain non-interactable building again.
+            ActivePart3Destination = ""; ActivePart3TargetId = "";
             SetCandidateInteractable(destination2Building, false);
             RaiseEvt("candidate_interactable_off", "Part3", label: "D2", building: destination2Building);
             if (d2Alternate != null)

@@ -1,10 +1,13 @@
 // Part3TargetSelection.cs
-// The participant-specific choice of the Part 3 target building inside the region that the Part 3 GROUP INDEX assigned (pure logic, no scene objects).
+// The participant-specific choice of the target building of ONE destination, inside the zone that the GROUP INDEX assigned to that destination (pure logic, no scene objects).
+// (The experimental phase with Destination 1 / Destination 2 and the 10-minute / 15-minute limits is "Part 3" in this code base.)
 //
-//   * The group index fixes the start point and the target regions (ExperimentManager.Part3GroupTable). It is never random and never uses a seed.
-//   * Within one assigned region the target building is drawn uniformly from the region's ELIGIBLE buildings with a dedicated stream whose seed is derived from
-//         Effective Master Seed + "Part3TargetBuilding" + participant ID + Part 3 group index + target region ID      (SeedDerivation.TargetBuildingSeed)
-//     That stream shares nothing with the NPC streams: the draw cannot shift them and they cannot shift it.
+//   * The group index fixes the start point and the two destination zones (ExperimentManager.Part3GroupTable, Table 5). It is never random and never uses a seed. Destination 1 and
+//     Destination 2 are ALWAYS different zones, so the two selections are independent draws: no same-zone case and no sampling without replacement exists.
+//   * Within one assigned zone the target building is drawn uniformly from the zone's two ELIGIBLE buildings with a dedicated stream per destination (Target1Building for Destination 1,
+//     Target2Building for Destination 2) whose seed is derived from
+//         Effective Master Seed + Part 3 + selection stream id + participant ID + group index + that destination's zone ID      (SeedDerivation.TargetSelectionSeed)
+//     The two streams never share a seed or a generator object, and share nothing with the NPC streams: the draws cannot shift them and they cannot shift the draws.
 //   * Candidates are identified by their stable unique id (TargetSelectable.ResolvedTargetId) and SORTED with an ordinal comparison before the draw, so neither the Unity
 //     hierarchy, the scene enumeration order nor the order of the Inspector slots can change the outcome. Duplicate or empty ids are an error.
 //   * No fallback exists: a missing participant ID, an invalid group index, an empty candidate list or an unusable id make the selection fail with a clear message and the
@@ -20,6 +23,9 @@ public static class Part3TargetSelection
 {
     public sealed class Result
     {
+        /// <summary>1 = Destination 1 (stream Target1Building), 2 = Destination 2 (stream Target2Building).</summary>
+        public int Destination;
+        /// <summary>The zone (GE / GU / OE / OU) the candidates belong to.</summary>
         public string RegionId;
         /// <summary>Eligible candidate ids, sorted ordinally (the order the draw indexes into).</summary>
         public string[] CandidateIds;
@@ -27,7 +33,7 @@ public static class Part3TargetSelection
         public string CandidateFingerprint;
         public int SelectedIndex;
         public string SelectedId;
-        /// <summary>The exact 64-bit derived stream seed (SeedDerivation.TargetBuildingSeed); serialised as 16 hex digits wherever it is recorded.</summary>
+        /// <summary>The exact 64-bit derived stream seed (SeedDerivation.TargetSelectionSeed); serialised as 16 hex digits wherever it is recorded.</summary>
         public ulong DerivedSeed;
         public string DerivedSeedHex => DerivedSeed.ToString("x16", CultureInfo.InvariantCulture);
     }
@@ -56,12 +62,13 @@ public static class Part3TargetSelection
     }
 
     /// <summary>
-    /// Draws the participant's target building for one region. Requires the experiment RNG to be Ready (it initialises on first use and throws when it is Failed). Returns false with
-    /// an error text instead of any fallback.
+    /// Draws the participant's target building of one destination (1 or 2) from the candidates of its zone. Requires the experiment RNG to be Ready (it initialises on first use and throws when
+    /// it is Failed). Returns false with an error text instead of any fallback.
     /// </summary>
-    public static bool TrySelect(string participantId, int part3GroupIndex, string regionId, IList<string> candidateIds, out Result result, out string error)
+    public static bool TrySelect(int destination, string participantId, int part3GroupIndex, string regionId, IList<string> candidateIds, out Result result, out string error)
     {
         result = null; error = null;
+        if (destination != 1 && destination != 2) { error = "invalid destination " + destination + " (expected 1 or 2)"; return false; }
         if (string.IsNullOrWhiteSpace(participantId)) { error = "the participant ID is missing: the participant-specific target-building selection cannot run (no shared-stream fallback)"; return false; }
         if (part3GroupIndex < 0) { error = "invalid Part 3 group index " + part3GroupIndex; return false; }
         if (string.IsNullOrWhiteSpace(regionId)) { error = "the target region of group " + part3GroupIndex + " is not defined"; return false; }
@@ -69,11 +76,11 @@ public static class Part3TargetSelection
         if (!TrySortCandidates(candidateIds, out sorted, out string sortError)) { error = "region " + regionId + ": " + sortError; return false; }
 
         ulong seed;
-        Pcg32 stream = ExperimentRngManager.CreateTargetBuildingStream(participantId, part3GroupIndex, regionId, out seed);
+        Pcg32 stream = ExperimentRngManager.CreateTargetSelectionStream(destination == 1 ? RngStream.Target1Building : RngStream.Target2Building, participantId, part3GroupIndex, regionId, out seed);
         int index = stream.Range(0, sorted.Length);
         result = new Result
         {
-            RegionId = regionId, CandidateIds = sorted, CandidateFingerprint = Fingerprint(sorted),
+            Destination = destination, RegionId = regionId, CandidateIds = sorted, CandidateFingerprint = Fingerprint(sorted),
             SelectedIndex = index, SelectedId = sorted[index], DerivedSeed = seed,
         };
         return true;

@@ -326,7 +326,8 @@ public partial class NpcLifecycleTests
 
     static readonly string[] Zones = { "GE", "GU", "OE", "OU" };
 
-    void ConfigurePart3(Component em, string omitStartOf = null, string emptyRegion = null, bool duplicateIdsIn = false, string dupRegion = null)
+    // fault: "single" (one landmark), "sameObject" (A == B), "noSelectable", "triggerCollider", "disabledCollider", "sharedIdWithOtherZone", "objectInTwoZones" (TargetSelectable requires a Collider, so "no collider" can only appear as a disabled / trigger one) - injected into faultZone's second landmark
+    void ConfigurePart3(Component em, string omitStartOf = null, string emptyRegion = null, bool duplicateIdsIn = false, string dupRegion = null, string faultZone = null, string fault = null)
     {
         foreach (string z in Zones)
         {
@@ -338,6 +339,20 @@ public partial class NpcLifecycleTests
                 GameObject a = MakeBuilding(z + "_A"), b = MakeBuilding(z + (duplicateIdsIn && z == dupRegion ? "_A" : "_B"), z + (duplicateIdsIn && z == dupRegion ? "_A" : "_B"));
                 bool swap = z == "OE";
                 Set(zone, "buildingA", swap ? b : a); Set(zone, "buildingB", swap ? a : b);
+            }
+            if (z == faultZone && fault != null)
+            {
+                GameObject a = Get<GameObject>(zone, "buildingA"), b = Get<GameObject>(zone, "buildingB");
+                switch (fault)
+                {
+                    case "single": Set(zone, "buildingB", null); break;
+                    case "sameObject": Set(zone, "buildingB", a); break;
+                    case "noSelectable": UnityEngine.Object.DestroyImmediate(b.GetComponent(T("TargetSelectable"))); break;
+                    case "triggerCollider": b.GetComponent<BoxCollider>().isTrigger = true; break;
+                    case "disabledCollider": b.GetComponent<BoxCollider>().enabled = false; break;
+                    case "sharedIdWithOtherZone": Set(b.GetComponent(T("TargetSelectable")), "targetId", "GE_A"); break;
+                    case "objectInTwoZones": Set(zone, "buildingB", Get<GameObject>(Get<object>(em, "part3ZoneGE"), "buildingA")); break;
+                }
             }
             Set(em, "part3Zone" + z, zone);
         }
@@ -411,13 +426,17 @@ public partial class NpcLifecycleTests
         var em = MakeEm(0, null); ConfigurePart3(em);
         var tryZones = EmType.GetMethod("TryGetPart3GroupZones");
         Assert.AreEqual(12, (int)EmType.GetProperty("Part3GroupCount").GetValue(null));
+        // Table 5 (authoritative): group -> (start zone, Destination 1 zone, Destination 2 zone). The two destination zones differ for ALL twelve groups (also groups 2, 4, 7 and 9).
+        var table5 = new[] { "GE,GU,OE", "GE,OE,GU", "GE,OU,GE", "GU,GE,OU", "GU,OE,GU", "GU,OU,GE", "OE,GE,OU", "OE,GU,OE", "OE,OU,GE", "OU,GE,OU", "OU,GU,OE", "OU,OE,GU" };
         for (int g = 0; g < 12; g++)
         {
             var z = new object[] { g, "", "", "" };
             Assert.IsTrue((bool)tryZones.Invoke(null, z));
             string start = (string)z[1], d1 = (string)z[2], d2 = (string)z[3];
-            Assert.AreNotEqual(d1, d2, "group " + g + ": the two destination regions differ (so the region id alone keys each draw)");
+            Assert.AreEqual(table5[g], start + "," + d1 + "," + d2, "group " + g + " must match Table 5 exactly");
+            Assert.AreNotEqual(d1, d2, "group " + g + ": Destination 1 zone != Destination 2 zone");
             string reference = null;
+            if (g == 2 || g == 4 || g == 7 || g == 9) Assert.AreNotEqual(d1, d2, "group " + g + " is NOT a same-zone group (its start zone equals a destination zone, nothing more)");
             foreach (ulong seed in new[] { 11UL, 12UL, 0xFFFFFFFF00000003UL })
                 foreach (string pid in new[] { "P001", "P002", "P003" })
                 {
@@ -480,10 +499,72 @@ public partial class NpcLifecycleTests
         Assert.IsTrue((bool)ResolveP3(em2, 3, "P001")[0], "a group that does not use the missing start is unaffected");
 
         var em3 = MakeEm(0, null); ConfigurePart3(em3, emptyRegion: "GU");                       // group 0: D1 = GU
-        var empty = ResolveP3(em3, 0, "P001"); Assert.IsFalse((bool)empty[0]); StringAssert.Contains("no eligible", (string)empty[2]);
+        var empty = ResolveP3(em3, 0, "P001"); Assert.IsFalse((bool)empty[0]); StringAssert.Contains("exactly two eligible landmarks, found 0", (string)empty[2]);
 
         var em4 = MakeEm(0, null); ConfigurePart3(em4, duplicateIdsIn: true, dupRegion: "OE");   // group 0: D2 = OE with two candidates sharing one id
         var dup = ResolveP3(em4, 0, "P001"); Assert.IsFalse((bool)dup[0]); StringAssert.Contains("share the id", (string)dup[2]);
+        yield return null;
+    }
+
+    // Scene validation before part_start: every zone must be valid even if THIS group does not use it, and every defect gets a precise diagnostic. Never a fallback.
+    [UnityTest]
+    public IEnumerator Part3Scene_EveryZoneMustHaveExactlyTwoValidLandmarks_BeforePart3Starts()
+    {
+        LogAssert.ignoreFailingMessages = true;
+        var cases = new (string zone, string fault, string expected)[]
+        {
+            ("GU", "single", "exactly two eligible landmarks, found 1"), ("OE", "sameObject", "the same object"), ("GU", "noSelectable", "no TargetSelectable"),
+            ("OE", "triggerCollider", "no enabled non-trigger Collider"), ("GU", "disabledCollider", "no enabled non-trigger Collider"),
+            ("OU", "sharedIdWithOtherZone", "is used in both zone"), ("OU", "objectInTwoZones", "assigned to both zone"),
+            // GE is the START zone of group 0 and no destination of it: the defect is still found
+            ("GE", "single", "exactly two eligible landmarks, found 1"), ("OU", "noSelectable", "no TargetSelectable"),
+        };
+        foreach (var c in cases)
+        {
+            var em = MakeEm(0, null); ConfigurePart3(em, faultZone: c.zone, fault: c.fault);
+            CallStatic(MgrT, "ResetForTests"); RngSeams.SetConfig(1);
+            var r = ResolveP3(em, 0, "P001");
+            Assert.IsFalse((bool)r[0], c.zone + "/" + c.fault + " must refuse the Part");
+            StringAssert.Contains(c.expected, (string)r[2], c.zone + "/" + c.fault);
+            Assert.IsFalse(GetStatic<bool>(MgrT, "IsInitialized"), "a rejected scene consumes no random number: " + c.zone + "/" + c.fault);
+        }
+        var good = MakeEm(0, null); ConfigurePart3(good);
+        CallStatic(MgrT, "ResetForTests"); RngSeams.SetConfig(1);
+        Assert.IsTrue((bool)ResolveP3(good, 0, "P001")[0]);
+        yield return null;
+    }
+
+    // For every Table 5 group and many participants (REAL resolver, synthetic scene objects): Target 1 in the Destination 1 zone, Target 2 in the Destination 2 zone, ids differ, two separate result objects.
+    [UnityTest]
+    public IEnumerator Part3Targets_ForEveryGroup_AreTwoIndependentSelections_InTheirOwnZones_WithDistinctIds()
+    {
+        var em = MakeEm(0, null); ConfigurePart3(em);
+        var tryZones = EmType.GetMethod("TryGetPart3GroupZones");
+        CallStatic(MgrT, "ResetForTests"); RngSeams.SetConfig(0x0123456789ABCDEFUL);
+        for (int g = 0; g < 12; g++)
+        {
+            var z = new object[] { g, "", "", "" }; tryZones.Invoke(null, z);
+            string d1 = (string)z[2], d2 = (string)z[3];
+            var pairs = new HashSet<string>();
+            for (int p = 1; p <= 120; p++)
+            {
+                var r = ResolveP3(em, g, "P" + p.ToString("D3")); Assert.IsTrue((bool)r[0], (string)r[2]);
+                object D1 = Get<object>(r[1], "Destination1"), D2 = Get<object>(r[1], "Destination2");
+                Assert.AreNotSame(D1, D2, "two separate destination objects");
+                Assert.AreEqual(1, Get<int>(D1, "Destination")); Assert.AreEqual(2, Get<int>(D2, "Destination"));
+                StringAssert.StartsWith(d1 + "_", Get<string>(D1, "SelectedId")); StringAssert.StartsWith(d2 + "_", Get<string>(D2, "SelectedId"));
+                Assert.AreNotEqual(Get<string>(D1, "SelectedId"), Get<string>(D2, "SelectedId"), "group " + g + " participant " + p);
+                Assert.AreNotSame(Get<GameObject>(D1, "Building"), Get<GameObject>(D2, "Building"));
+                Assert.AreEqual(Get<string>(D1, "SelectedId"), Get<GameObject>(D1, "Building").GetComponent(T("TargetSelectable")).GetType().GetProperty("ResolvedTargetId").GetValue(Get<GameObject>(D1, "Building").GetComponent(T("TargetSelectable"))));
+                Assert.AreNotEqual(Get<string>(D1, "DerivedSeedHex"), Get<string>(D2, "DerivedSeedHex"), "separate selection seeds");
+                pairs.Add(Get<string>(D1, "SelectedId") + "|" + Get<string>(D2, "SelectedId"));
+            }
+            Assert.AreEqual(4, pairs.Count, "group " + g + ": different participants legitimately draw different AND identical pairs (no quota, no no-replacement)");
+        }
+        // changing the participant can change the selection; the same participant is stable
+        string first = Get<string>(Get<object>(ResolveP3(em, 4, "P001")[1], "Destination1"), "SelectedId");
+        Assert.AreEqual(first, Get<string>(Get<object>(ResolveP3(em, 4, "P001")[1], "Destination1"), "SelectedId"));
+        Assert.IsTrue(Enumerable.Range(2, 40).Any(p => Get<string>(Get<object>(ResolveP3(em, 4, "P" + p.ToString("D3"))[1], "Destination1"), "SelectedId") != first));
         yield return null;
     }
 
@@ -507,24 +588,36 @@ public partial class NpcLifecycleTests
         var rng = (JObject)m["rng"]; var a = (JObject)m["assignments"];
         Assert.AreEqual("valid", (string)rng["rng_configuration_validation"]);
         Assert.AreEqual("not_used_fixed_seed", (string)rng["automatic_entropy_source"]);
-        CollectionAssert.Contains(rng["stream_versions"].Select(t => (string)t).ToArray(), "TargetBuilding=1");
+        CollectionAssert.Contains(rng["stream_versions"].Select(t => (string)t).ToArray(), "Target1Building=1");
+        CollectionAssert.Contains(rng["stream_versions"].Select(t => (string)t).ToArray(), "Target2Building=1");
+        CollectionAssert.DoesNotContain(rng["stream_versions"].Select(t => (string)t).ToArray(), "TargetBuilding=1");
         Assert.AreEqual(1L, (long)rng["abandoned_spawn_attempt_count"]); Assert.AreEqual("Part3:7:no_valid_route", (string)rng["abandoned_spawn_attempts"][0]);
         Assert.AreEqual(1, (int)a["part2_group_index"]); Assert.AreEqual("P2_S1", (string)a["part2_start_point_id"]); Assert.AreEqual("P2_T1", (string)a["part2_teleport_point_id"]);
         Assert.AreEqual(4, (int)a["part3_group_index"]);
         object info = p3[1];
         object d1 = Get<object>(info, "Destination1"), d2 = Get<object>(info, "Destination2");
         Assert.AreEqual(Get<string>(info, "StartZone"), (string)a["part3_start_zone"]); Assert.AreEqual("S_" + Get<string>(info, "StartZone"), (string)a["part3_start_point_id"]);
-        Assert.AreEqual("TargetBuilding", (string)a["target_building_stream"]);
-        Assert.AreEqual(Get<string>(d1, "RegionId"), (string)a["destination1_region_id"]);
-        Assert.AreEqual(Get<string>(d1, "SelectedId"), (string)a["destination1_selected_id"]);
-        Assert.AreEqual(Get<string>(d1, "CandidateFingerprint"), (string)a["destination1_candidate_fingerprint"]);
-        Assert.AreEqual(2, a["destination1_candidate_ids"].Count());
+        // Target selection record (version 2): one stream per destination; zones, ids, candidates, fingerprints and seeds
+        Assert.AreEqual(2, (int)a["target_selection_version"]);
+        Assert.AreEqual("Target1Building", (string)a["target1_stream"]); Assert.AreEqual("Target2Building", (string)a["target2_stream"]);
+        Assert.AreEqual(Get<string>(d1, "RegionId"), (string)a["destination1_zone_id"]); Assert.AreEqual(Get<string>(d2, "RegionId"), (string)a["destination2_zone_id"]);
+        Assert.AreNotEqual((string)a["destination1_zone_id"], (string)a["destination2_zone_id"]);
+        Assert.AreEqual(Get<string>(d1, "SelectedId"), (string)a["target1_building_id"]); Assert.AreEqual(Get<string>(d2, "SelectedId"), (string)a["target2_building_id"]);
+        Assert.AreNotEqual((string)a["target1_building_id"], (string)a["target2_building_id"]);
+        Assert.AreEqual(Get<string>(d1, "CandidateFingerprint"), (string)a["destination1_candidate_fingerprint"]); Assert.AreEqual(Get<string>(d2, "CandidateFingerprint"), (string)a["destination2_candidate_fingerprint"]);
+        Assert.AreEqual(2, a["destination1_candidate_ids"].Count()); Assert.AreEqual(2, a["destination2_candidate_ids"].Count());
+        CollectionAssert.Contains(a["destination1_candidate_ids"].Select(t => (string)t).ToArray(), (string)a["target1_building_id"]);
+        CollectionAssert.Contains(a["destination2_candidate_ids"].Select(t => (string)t).ToArray(), (string)a["target2_building_id"]);
+        Assert.IsTrue((bool)a["destination_zones_distinct"] && (bool)a["target1_in_destination1_zone"] && (bool)a["target2_in_destination2_zone"] && (bool)a["target_building_ids_distinct"]);
+        StringAssert.Contains("TargetSelectionSeed", (string)a["target_selection_derivation"]);
+        Assert.IsNull(a["target_building_stream"], "the single shared stream no longer exists"); Assert.IsNull(a["destination1_region_id"]); Assert.IsNull(a["destination1_derived_seed"]);
         // 64-bit seeds are 16 lowercase hex digits (a JSON string), exactly the derived value - never a JSON number
-        string hex1 = (string)a["destination1_derived_seed"], hex2 = (string)a["destination2_derived_seed"];
-        Assert.AreEqual(JTokenType.String, a["destination1_derived_seed"].Type);
-        StringAssert.IsMatch("^[0-9a-f]{16}$", hex1); StringAssert.IsMatch("^[0-9a-f]{16}$", hex2);
-        Assert.AreEqual((ulong)CallStatic(T("SeedDerivation"), "TargetBuildingSeed", 31415UL, "P001", 4, Get<string>(d1, "RegionId")), Convert.ToUInt64(hex1, 16));
-        Assert.AreEqual(Get<string>(d1, "DerivedSeedHex"), hex1);
+        string hex1 = (string)a["target1_selection_seed"], hex2 = (string)a["target2_selection_seed"];
+        Assert.AreEqual(JTokenType.String, a["target1_selection_seed"].Type); Assert.AreEqual(JTokenType.String, a["target2_selection_seed"].Type);
+        StringAssert.IsMatch("^[0-9a-f]{16}$", hex1); StringAssert.IsMatch("^[0-9a-f]{16}$", hex2); Assert.AreNotEqual(hex1, hex2);
+        Assert.AreEqual((ulong)CallStatic(T("SeedDerivation"), "TargetSelectionSeed", 31415UL, Enum.Parse(T("RngPart"), "Part3"), Enum.Parse(T("RngStream"), "Target1Building"), "P001", 4, Get<string>(d1, "RegionId")), Convert.ToUInt64(hex1, 16));
+        Assert.AreEqual((ulong)CallStatic(T("SeedDerivation"), "TargetSelectionSeed", 31415UL, Enum.Parse(T("RngPart"), "Part3"), Enum.Parse(T("RngStream"), "Target2Building"), "P001", 4, Get<string>(d2, "RegionId")), Convert.ToUInt64(hex2, 16));
+        Assert.AreEqual(Get<string>(d1, "DerivedSeedHex"), hex1); Assert.AreEqual(Get<string>(d2, "DerivedSeedHex"), hex2);
         foreach (string part in ((JArray)rng["part_stream_seeds"]).Select(t => (string)t)) StringAssert.IsMatch("^[A-Za-z0-9]+:[A-Za-z0-9]+=[0-9a-f]{16}$", part);
     }
 }

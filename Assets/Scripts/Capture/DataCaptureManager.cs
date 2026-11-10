@@ -1995,11 +1995,18 @@ public class DataCaptureManager : MonoBehaviour
         public string part2_start_point_id = "", part2_teleport_point_id = "";
         public int part3_group_index = -1;
         public string part3_start_zone = "", part3_start_point_id = "";
-        public string target_building_stream = "", target_building_derivation = "";
-        public string destination1_region_id = "", destination1_candidate_fingerprint = "", destination1_selected_id = "", destination1_derived_seed = "";
-        public string[] destination1_candidate_ids = new string[0];
-        public string destination2_region_id = "", destination2_candidate_fingerprint = "", destination2_selected_id = "", destination2_derived_seed = "";
-        public string[] destination2_candidate_ids = new string[0];
+        // Target selection (version 2): one independent stream per destination. Target 1 is drawn from the Destination 1 zone's two landmarks, Target 2 from the Destination 2 zone's two
+        // landmarks; the zones always differ (Table 5). Seeds are 16 lowercase hex digits. participant_id is the manifest's normal participant_id (not duplicated here).
+        public int target_selection_version;
+        public string target_selection_algorithm = "", target_selection_derivation = "";
+        public string destination1_zone_id = "", destination2_zone_id = "";
+        public string target1_building_id = "", target2_building_id = "";
+        public string target1_stream = "", target2_stream = "";
+        public string target1_selection_seed = "", target2_selection_seed = "";
+        public string[] destination1_candidate_ids = new string[0], destination2_candidate_ids = new string[0];
+        public string destination1_candidate_fingerprint = "", destination2_candidate_fingerprint = "";
+        // Recorded self-checks of the four invariants (an auditor re-checks them from the fields above; docs/tools/npc_movement_mix.py does so independently).
+        public bool destination_zones_distinct, target1_in_destination1_zone, target2_in_destination2_zone, target_building_ids_distinct;
     }
 
     /// <summary>session_config.used.json: the resolved configuration this session actually used (never a re-read of the external file).</summary>
@@ -2573,12 +2580,19 @@ public class DataCaptureManager : MonoBehaviour
         if (p3 != null)
         {
             a.part3_group_index = p3.GroupIndex; a.part3_start_zone = p3.StartZone; a.part3_start_point_id = p3.StartPointId;
-            a.target_building_stream = RngStream.TargetBuilding.ToString();
-            a.target_building_derivation = "SeedDerivation.TargetBuildingSeed(effective_master_seed, \"" + RngConstants.TargetBuildingDomain + "\", participant_id, part3_group_index, region_id); candidates sorted ordinally by id; index = Range(0, n) from the first value of the stream";
-            a.destination1_region_id = p3.Destination1.RegionId; a.destination1_candidate_ids = p3.Destination1.CandidateIds; a.destination1_candidate_fingerprint = p3.Destination1.CandidateFingerprint;
-            a.destination1_selected_id = p3.Destination1.SelectedId; a.destination1_derived_seed = p3.Destination1.DerivedSeedHex;
-            a.destination2_region_id = p3.Destination2.RegionId; a.destination2_candidate_ids = p3.Destination2.CandidateIds; a.destination2_candidate_fingerprint = p3.Destination2.CandidateFingerprint;
-            a.destination2_selected_id = p3.Destination2.SelectedId; a.destination2_derived_seed = p3.Destination2.DerivedSeedHex;
+            a.target_selection_version = RngConstants.TargetSelectionVersion;
+            a.target_selection_algorithm = RngConstants.TargetSelectionAlgorithm;
+            a.target_selection_derivation = "SeedDerivation.TargetSelectionSeed(effective_master_seed, Part3, stream, participant_id, part3_group_index, zone_id); stream = Target1Building (Destination 1) / Target2Building (Destination 2); candidates sorted ordinally by id; index = Range(0, 2) from the first value of the stream";
+            a.destination1_zone_id = p3.Destination1.RegionId; a.destination2_zone_id = p3.Destination2.RegionId;
+            a.target1_building_id = p3.Destination1.SelectedId; a.target2_building_id = p3.Destination2.SelectedId;
+            a.target1_stream = RngStream.Target1Building.ToString(); a.target2_stream = RngStream.Target2Building.ToString();
+            a.target1_selection_seed = p3.Destination1.DerivedSeedHex; a.target2_selection_seed = p3.Destination2.DerivedSeedHex;
+            a.destination1_candidate_ids = p3.Destination1.CandidateIds; a.destination1_candidate_fingerprint = p3.Destination1.CandidateFingerprint;
+            a.destination2_candidate_ids = p3.Destination2.CandidateIds; a.destination2_candidate_fingerprint = p3.Destination2.CandidateFingerprint;
+            a.destination_zones_distinct = a.destination1_zone_id != a.destination2_zone_id;
+            a.target1_in_destination1_zone = Array.IndexOf(a.destination1_candidate_ids, a.target1_building_id) >= 0;
+            a.target2_in_destination2_zone = Array.IndexOf(a.destination2_candidate_ids, a.target2_building_id) >= 0;
+            a.target_building_ids_distinct = a.target1_building_id != a.target2_building_id;
         }
     }
 

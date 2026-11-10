@@ -251,7 +251,7 @@ public partial class NpcLifecycleTests
 
     sealed class P3 { public Rig rig; public Component ui; public GameObject d1, d2, other; public List<GameObject> all = new List<GameObject>(); }
 
-    IEnumerator StartPart3(float d1Max, float total, Action<P3> done)
+    IEnumerator StartPart3(float d1Max, float total, Action<P3> done, Action<P3> beforeStart = null)
     {
         var camGo = new GameObject("Cam"); camGo.tag = "MainCamera"; camGo.AddComponent<Camera>(); _spawned.Add(camGo);
         var p = new P3();
@@ -263,9 +263,14 @@ public partial class NpcLifecycleTests
         var gu = Activator.CreateInstance(zoneType); var oe = Activator.CreateInstance(zoneType);
         Set(gu, "buildingA", B("BAT_GU_A", 0f)); Set(gu, "buildingB", B("BAT_GU_B", 10f)); Set(oe, "buildingA", B("BAT_OE_A", 20f)); Set(oe, "buildingB", B("BAT_OE_B", 30f));
         p.other = B("BAT_OTHER", 40f);
+        // Group 0 uses GU (D1) and OE (D2) and starts in GE, but ALL FOUR zones must hold exactly two valid landmarks before a Part 3 may start (scene validation), so GE and OU are configured too.
+        var ge = Activator.CreateInstance(zoneType); var ou = Activator.CreateInstance(zoneType);
+        Set(ge, "buildingA", B("BAT_GE_A", 50f)); Set(ge, "buildingB", B("BAT_GE_B", 60f)); Set(ou, "buildingA", B("BAT_OU_A", 70f)); Set(ou, "buildingB", B("BAT_OU_B", 80f));
+        Set(p.rig.em, "part3ZoneGE", ge); Set(p.rig.em, "part3ZoneOU", ou);
         Set(p.rig.em, "part3ZoneGU", gu); Set(p.rig.em, "part3ZoneOE", oe); Set(p.rig.em, "part3StartGE", Make("StartGE").transform);
         Set(p.rig.em, "uiManager", p.ui); Set(p.rig.em, "playerRig", Make("PlayerRig").transform); Set(p.rig.em, "spawner", p.rig.spawner);
         yield return null;
+        beforeStart?.Invoke(p);
         Call(p.rig.em, "StartPart3");
         done(p);
     }

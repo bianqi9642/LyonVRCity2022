@@ -17,8 +17,8 @@ M64 = (1 << 64) - 1
 
 PARTS = {"None": 0, "Part1": 1, "Part2": 2, "Part3": 3}
 STREAMS = {"PartSetup": 1, "SpawnPlacement": 2, "MovementAssignment": 3, "MovementAttributes": 4, "Appearance": 5,
-           "Destination": 6, "Wandering": 7, "AttractorDwell": 8, "Uncertainty": 9, "NavigationNudge": 10, "TargetBuilding": 11}
-TARGET_BUILDING_DOMAIN = "Part3TargetBuilding"
+           "Destination": 6, "Wandering": 7, "AttractorDwell": 8, "Uncertainty": 9, "NavigationNudge": 10, "Target1Building": 11, "Target2Building": 12}
+TARGET_SELECTION_VERSION = 2   # one independent stream per destination (Target1Building / Target2Building); the manifest records it as assignments.target_selection_version
 PART_LEVEL_INDEX = -1
 
 
@@ -76,23 +76,78 @@ def hash_utf8(text):
     return mix(h)
 
 
-def target_building_seed(master_seed, participant_id, part3_group_index, region_id):
-    """64-bit stream seed of the participant-specific Part 3 target-building draw (SeedDerivation.TargetBuildingSeed). Seeds are always handled as exact ints / 16-digit hex strings."""
+def target_selection_seed(master_seed, part, stream, participant_id, group_index, zone_id):
+    """
+    64-bit stream seed of the participant-specific target selection of ONE destination (SeedDerivation.TargetSelectionSeed):
+    Effective Master Seed + Part + selection stream (Target1Building / Target2Building) + participant ID + group index + that destination's zone ID.
+    """
+    part = PARTS.get(part, part)
+    stream = STREAMS.get(stream, stream)
     h = mix(check_u64(master_seed, "master seed") ^ 0x4C594F4E52455832)
-    h = mix((h + hash_utf8(TARGET_BUILDING_DOMAIN)) & M64)
+    h = mix((h + part) & M64)
+    h = mix((h + stream * 0x100000001B3) & M64)
     h = mix((h + hash_utf8(participant_id)) & M64)
-    h = mix((h + (part3_group_index + 1)) & M64)
-    h = mix((h + hash_utf8(region_id)) & M64)
+    h = mix((h + (group_index + 1)) & M64)
+    h = mix((h + hash_utf8(zone_id)) & M64)
     return h
 
 
-def choose_target_building(master_seed, participant_id, part3_group_index, region_id, candidate_ids):
-    """(selected id, sorted candidate ids, derived seed hex). Candidates are sorted by code point (UTF-8 byte order == ordinal order for ASCII ids), then index = Range(0, n) of the first value."""
+def choose_target(master_seed, destination, participant_id, group_index, zone_id, candidate_ids):
+    """
+    (selected id, sorted candidate ids, derived seed hex) for destination 1 (stream Target1Building) or 2 (Target2Building). Candidates are sorted by code point (UTF-8 byte order ==
+    ordinal order for ASCII ids); index = Range(0, n) of the first value of the destination's stream. Part is always Part3 (the destination phase).
+    """
+    if destination not in (1, 2):
+        raise ValueError("destination must be 1 or 2")
     ids = sorted(candidate_ids, key=lambda t: t.encode("utf-8"))
-    seed = target_building_seed(master_seed, participant_id, part3_group_index, region_id)
+    seed = target_selection_seed(master_seed, "Part3", "Target1Building" if destination == 1 else "Target2Building", participant_id, group_index, zone_id)
     g = Pcg32(mix((seed + 1) & M64), mix((seed + 2) & M64))
-    index = g.next_range(len(ids))
-    return ids[index], ids, "%016x" % seed
+    return ids[g.next_range(len(ids))], ids, "%016x" % seed
+
+
+# Table 5: group -> (start zone, destination 1 zone, destination 2 zone). Destination 1 and 2 ALWAYS differ.
+GROUP_TABLE = [
+    ("GE", "GU", "OE"), ("GE", "OE", "GU"), ("GE", "OU", "GE"),
+    ("GU", "GE", "OU"), ("GU", "OE", "GU"), ("GU", "OU", "GE"),
+    ("OE", "GE", "OU"), ("OE", "GU", "OE"), ("OE", "OU", "GE"),
+    ("OU", "GE", "OU"), ("OU", "GU", "OE"), ("OU", "OE", "GU"),
+]
+
+
+def verify_target_assignment(master_seed, participant_id, assignments):
+    """
+    Independent audit of a manifest 'assignments' block (target_selection_version 2). Returns a dict of booleans / None:
+      table_matches                 start / destination zones equal Table 5 for the recorded group
+      destination_zones_distinct    destination 1 zone != destination 2 zone
+      target1_in_destination1_zone  target 1 is one of the destination 1 candidates (exactly two recorded)
+      target2_in_destination2_zone  target 2 is one of the destination 2 candidates (exactly two recorded)
+      target_ids_distinct           target 1 id != target 2 id
+      seeds_match / selections_match  both selection seeds and both chosen ids re-derived from (master seed, participant, group, zone, candidates)
+    A missing / unsupported block returns None. Nothing is guessed.
+    """
+    a = assignments
+    if not isinstance(a, dict) or a.get("target_selection_version") != TARGET_SELECTION_VERSION or not participant_id:
+        return None
+    group = a.get("part3_group_index", -1)
+    if not isinstance(group, int) or isinstance(group, bool) or not 0 <= group < len(GROUP_TABLE):
+        return None
+    z1, z2 = a.get("destination1_zone_id"), a.get("destination2_zone_id")
+    c1, c2 = a.get("destination1_candidate_ids") or [], a.get("destination2_candidate_ids") or []
+    t1, t2 = a.get("target1_building_id"), a.get("target2_building_id")
+    out = {
+        "table_matches": (a.get("part3_start_zone"), z1, z2) == GROUP_TABLE[group],
+        "destination_zones_distinct": z1 is not None and z1 != z2,
+        "target1_in_destination1_zone": len(c1) == 2 and t1 in c1,
+        "target2_in_destination2_zone": len(c2) == 2 and t2 in c2,
+        "target_ids_distinct": t1 is not None and t1 != t2,
+        "seeds_match": False, "selections_match": False,
+    }
+    if len(c1) >= 1 and len(c2) >= 1 and z1 and z2:
+        s1, _, h1 = choose_target(master_seed, 1, participant_id, group, z1, c1)
+        s2, _, h2 = choose_target(master_seed, 2, participant_id, group, z2, c2)
+        out["seeds_match"] = (str(a.get("target1_selection_seed", "")).lower(), str(a.get("target2_selection_seed", "")).lower()) == (h1, h2)
+        out["selections_match"] = (t1, t2) == (s1, s2)
+    return out
 
 
 def seed_hex(value):
@@ -185,11 +240,6 @@ def predict_movement_mode(root_seed, part, spawn_index, probability):
 
 if __name__ == "__main__":
     print("hash_utf8('P001'): %016x" % hash_utf8("P001"))
-    print("target_building_seed(31415, 'P001', 4, 'OE'): %016x" % target_building_seed(31415, "P001", 4, "OE"))
-    print("target_building_seed(31415, 'P002', 4, 'OE'): %016x" % target_building_seed(31415, "P002", 4, "OE"))
-    print("target_building_seed(0xfffffffb, 'P001', 11, 'GU'): %016x" % target_building_seed(0xFFFFFFFB, "P001", 11, "GU"))
-    print("choose(31415,'P001',4,'OE',[b,a]):", choose_target_building(31415, "P001", 4, "OE", ["OE_B", "OE_A"]))
-    print("choose(31415,'P002',4,'OE',[b,a]):", choose_target_building(31415, "P002", 4, "OE", ["OE_B", "OE_A"]))
     ref = Pcg32(42, 54)
     print("pcg32(42,54):", " ".join("%08x" % ref.next_uint() for _ in range(6)))
     print("mix(0): %016x" % mix(0))
@@ -203,6 +253,9 @@ if __name__ == "__main__":
     for seed in (0x0123456789ABCDEF, 0x8000000000000000, 0xFFFFFFFFFFFFFFFF, 0x0000000100000000):
         g = Pcg32.for_stream(seed, "Part3", "Appearance", 5)
         print("64-bit seed %s: stream_seed(Part3, Appearance, 5) %016x  pcg %s" % (seed_hex(seed), stream_seed(seed, "Part3", "Appearance", 5), " ".join("%08x" % g.next_uint() for _ in range(4))))
-    seed = 0xFEDCBA9876543210
-    print("target_building_seed(%s, 'P001', 4, 'OE'): %016x" % (seed_hex(seed), target_building_seed(seed, "P001", 4, "OE")))
-    print("choose(%s,'P001',4,'OE',[OE_B,OE_A]):" % seed_hex(seed), choose_target_building(seed, "P001", 4, "OE", ["OE_B", "OE_A"]))
+    # Target selection vectors (one stream per destination)
+    for seed in (31415, 0xFEDCBA9876543210):
+        for pid, group, z1, z2 in (("P001", 4, "OE", "GU"), ("P002", 4, "OE", "GU"), ("P001", 2, "OU", "GE")):
+            t1 = choose_target(seed, 1, pid, group, z1, ["%s_A" % z1, "%s_B" % z1])
+            t2 = choose_target(seed, 2, pid, group, z2, ["%s_B" % z2, "%s_A" % z2])
+            print("target seeds=%s %s g%d: T1 %s (%s) T2 %s (%s)" % (seed_hex(seed), pid, group, t1[0], t1[2], t2[0], t2[2]))

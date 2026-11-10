@@ -12,8 +12,8 @@ The goal is **controlled, reproducible and recorded random inputs**. It is *not*
 |---|---|
 | Part 2 start point (and teleport point) | **Part 2 group index** (the group designates exactly one point; no random choice) |
 | Part 3 start point | **Part 3 group index** (fixed 12-row table, `ExperimentManager.Part3GroupTable`) |
-| Part 3 target regions (Destination 1 and 2) | **Part 3 group index** (same table) |
-| Part 3 target **building** inside each region | **participant-specific stream** (Master Seed + participant ID + group + region), restricted to that region |
+| Part 3 target zones (Destination 1 and 2; always different zones) | **Part 3 group index** (same table, Table 5) |
+| Target 1 / Target 2 **building** inside their zones | **two independent participant-specific streams** (`Target1Building` / `Target2Building`: Master Seed + Part 3 + stream + participant ID + group + that destination's zone), restricted to that zone |
 | NPC movement and every other NPC attribute | **Master Seed** and the independent NPC streams (common to all participants) |
 
 Group indices fix the spatial conditions; the participant ID only varies *which of a region's eligible buildings* is the target; the Master Seed fixes the common NPC
@@ -22,7 +22,7 @@ randomness. The three mechanisms use separate streams and cannot influence each 
 ## 1. Master Seed
 
 The Master Seed is an **unsigned 64-bit integer** (`ulong`, `0 <= seed <= 2^64 - 1`) and the **single root of every stream** (Part-level streams, per-NPC streams including the Part 3
-MovementAssignment stream, and the participant-specific target-building stream). `0` is the *automatic* sentinel; every other bit pattern - including values above `long.MaxValue` -
+MovementAssignment stream, and the two participant-specific target-selection streams). `0` is the *automatic* sentinel; every other bit pattern - including values above `long.MaxValue` -
 is a valid fixed seed. It is never converted through `float` / `double`, and no step narrows it to 32 bits.
 
 **The only external notation is exactly 16 hexadecimal characters** (`"0123456789abcdef"`). Upper or lower case is accepted on input; everything the system writes is 16
@@ -119,14 +119,15 @@ pcg32(initstate 42, initseq 54)               a15c02b7 7b47f409 ba1d3330 83d2f29
 SplitMix64(0)                                 e220a8397b1dcdaf
 stream_seed(12345, Part3, MovementAssignment, 7) = 3416d3f507fd82e3   -> b7e72b1d 5df2b1fb 286ca041 20cbe59b
 stream_seed(00000000fff0edfa, Part2, PartSetup, -1) = ebca185bde3bc825   -> 6f6fa57b 47e9819d db773bc4 8af435a2
-target_building_seed(0000000000007ab7, "P001", 4, "OE") = ff0834e9791e17a2
+target_selection_seed(0000000000007ab7, Part3, Target1Building, "P001", 4, "OE") = 35d409ef71e2213f   (landmark OE_B of [OE_A, OE_B])
+target_selection_seed(0000000000007ab7, Part3, Target2Building, "P001", 4, "GU") = 59a822d807652adc   (landmark GU_B of [GU_A, GU_B])
 
 full 64-bit seeds (upper 32 bits matter), stream_seed(seed, Part3, Appearance, 5) -> first four PCG32 values:
   0123456789abcdef   f2bf7e15eba8a3ae   f1e263c4 ac8a94eb 3f69c154 e2182729
   8000000000000000   d12b2071557656fd   a5d60f57 3ab404ac bdeaa517 bca9ad63
   ffffffffffffffff   b3ecaf7719f9038f   d8b86df4 0619fc42 7e08b2ee 632dc6a5
   0000000100000000   3a6aff65bc3ade19   6335d753 bf9e17bc 164906bf b5a280e1
-target_building_seed(fedcba9876543210, "P001", 4, "OE") = dd16edfe30842108   (building OE_A)
+target_selection_seed(fedcba9876543210, Part3, Target1Building, "P001", 4, "OE") = fd3479745b31e27d   (landmark OE_B)
 ```
 
 `SeedDerivationVersion` stays **1**: the derivation function is unchanged (the seed is XORed whole into the first `Mix`). The manifest layout is `rng_config_version = 3`.
@@ -145,7 +146,8 @@ target_building_seed(fedcba9876543210, "P001", 4, "OE") = dd16edfe30842108   (bu
 | 8 | `AttractorDwell` | standing point inside an Attractor plane (`AttractorDwell`, drawn from the visiting NPC's stream) | NPC |
 | 9 | `Uncertainty` | pause / hesitate / slow / detour / look-around decisions (`UncertainBehavior`) | NPC |
 | 10 | `NavigationNudge` | small navigation corrections (`MoveToTarget` target nudge) | NPC |
-| 11 | `TargetBuilding` | participant-specific choice of the Part 3 target building inside the group-assigned region (not an NPC stream; keyed by Master Seed + participant + group + region) | participant |
+| 11 | `Target1Building` | participant-specific choice of the Destination 1 target landmark inside the Destination 1 zone (not an NPC stream; keyed by Master Seed + Part 3 + stream + participant + group + zone) | participant |
+| 12 | `Target2Building` | participant-specific choice of the Destination 2 target landmark inside the Destination 2 zone (independent of `Target1Building`; same key structure) | participant |
 
 The numeric ids are part of the derivation: never renumber, only append.
 
@@ -176,28 +178,58 @@ same inputs play out, since routes depend on reachability.) This policy is uncha
 * **Part 2:** `part2Groups[Part2GroupIndex]` must designate **exactly one** start point and **exactly one** teleport point (the shipped scene does). A missing / out-of-range
   group, an empty list, a null entry or more than one point is an error and the Part is refused (`ExperimentManager.TryResolvePart2Assignment`). The earlier random pick among
   a group's points no longer exists. No Master Seed, participant ID or NPC state is consulted.
-* **Part 3:** `Part3GroupTable[Part3GroupIndex]` fixes the start zone, Destination 1 region and Destination 2 region; the start point is the zone's assigned point. An index outside
-  0..11, an unassigned start point, a region without eligible buildings or two destinations in one region is an error and the Part is refused
-  (`TryResolvePart3Assignment`). Region id = the zone name (`GE`, `GU`, `OE`, `OU`); the two destination regions of a group always differ (asserted by a test).
+* **Part 3** (the experimental phase with Destination 1 / Destination 2, the 10-minute D1 limit and the 15-minute total limit): `Part3GroupTable[Part3GroupIndex]` fixes the start zone, the Destination 1
+  zone and the Destination 2 zone (Table 5, below); the start point is the zone's assigned point. An index outside 0..11, an unassigned start point or any zone / landmark defect (section 3c)
+  is an error and the Part is refused (`TryResolvePart3Assignment`). Zone id = `GE`, `GU`, `OE`, `OU`.
 * All of this is resolved and validated **before** `part_start` is raised.
 
-### 3c. Participant-specific target building
+**Table 5 (authoritative, implemented exactly; `ExperimentManager.Part3GroupTable`, pinned by tests in C# and Python):**
 
-For each destination: eligible buildings = the region's non-null candidate slots, each identified by `TargetSelectable.ResolvedTargetId` (an empty or duplicate id is an error);
-ids are **sorted ordinally** (not by hierarchy, slot or scene order); the building is `sorted[Range(0, n)]` of the FIRST value of the participant stream
-`Pcg32(TargetBuildingSeed(Effective Master Seed, participant ID, group index, region ID))`, uniform, no quota, no no-replacement rule (two participants may draw the same building).
+| Group | Start | Destination 1 | Destination 2 | | Group | Start | Destination 1 | Destination 2 |
+|---:|---|---|---|---|---:|---|---|---|
+| 0 | GE | GU | OE | | 6 | OE | GE | OU |
+| 1 | GE | OE | GU | | 7 | OE | GU | OE |
+| 2 | GE | OU | GE | | 8 | OE | OU | GE |
+| 3 | GU | GE | OU | | 9 | OU | GE | OU |
+| 4 | GU | OE | GU | | 10 | OU | GU | OE |
+| 5 | GU | OU | GE | | 11 | OU | OE | GU |
+
+**Destination 1 and Destination 2 are different zones in all 12 groups.** Groups 2, 4, 7 and 9 start in the zone of one of their destinations, but their two destination zones differ as well
+(`OU/GE`, `OE/GU`, `GU/OE`, `GE/OU`). There is no same-zone group, therefore no same-zone sampling and no sampling without replacement anywhere.
+
+### 3c. Participant-specific target selection (two independent draws)
+
+Every participant receives **Target 1** = one of the two landmarks of the Destination 1 zone and **Target 2** = one of the two landmarks of the Destination 2 zone, as two SEPARATE selections
+(two result objects, two derived seeds, two generator objects; nothing mutable is shared or reused). Because the zones differ, the selections need no coordination and the two ids are always distinct
+(still validated). Each selection is uniform over its two landmarks; participants are not balanced or de-duplicated against each other (no quota): two participants may draw the same landmarks.
+
+* **Eligible landmarks of a zone** = exactly two assigned buildings, each with a `TargetSelectable` on the building object itself (id = `ResolvedTargetId`, the stable identity used for scoring) and an
+  enabled non-trigger `Collider` on that object. Identified by id, **sorted ordinally** (not by hierarchy, slot or scene order); the pick is `sorted[Range(0, 2)]` of the FIRST value of the destination's stream.
+* **Scene validation before `part_start`** (all four zones, whether or not the group uses them): every zone has exactly two distinct landmark objects; ids are unique within and across zones; no object is in two zones;
+  both destination panels exist and are different objects. Then: the two zones differ, Target 1 is a Destination 1 zone landmark, Target 2 a Destination 2 zone landmark, the two ids differ. Any failure refuses the
+  Part with a precise message; nothing falls back or is repaired.
+* **Stream per destination** (`Target1Building` for Destination 1, `Target2Building` for Destination 2; selection version 2):
 
 ```
-h = Mix(uint(MasterSeed) ^ 0x4C594F4E52455832)      // "LYONREX2" (the NPC streams use ...31)
-h = Mix(h + HashUtf8("Part3TargetBuilding"))        // domain separation
-h = Mix(h + HashUtf8(participantId))                // FNV-1a 64 over the UTF-8 bytes, length-terminated, then Mix; case and every character matter
+h = Mix(MasterSeed ^ 0x4C594F4E52455832)            // "LYONREX2" (the NPC streams use ...31)
+h = Mix(h + part)                                    // Part 3
+h = Mix(h + stream * 0x100000001B3)                  // 11 = Target1Building, 12 = Target2Building
+h = Mix(h + HashUtf8(participantId))                 // FNV-1a 64 over the UTF-8 bytes, length-terminated, then Mix; case and every character matter
 h = Mix(h + (groupIndex + 1))
-h = Mix(h + HashUtf8(regionId))                     // initstate = Mix(h + 1), initseq = Mix(h + 2)
+h = Mix(h + HashUtf8(zoneId))                        // that destination's own zone; initstate = Mix(h + 1), initseq = Mix(h + 2)
 ```
 
-No `string.GetHashCode()`, no clock, no instance id, no spawn order. A missing / blank participant ID is an error (no shared-stream fallback); the Part does not start.
-Replaying a session with its recorded `effective_master_seed`, the same participant ID and the same eligible set reproduces the selection; a different automatic seed
-can give a different building.
+No `string.GetHashCode()`, no clock, no instance id, no spawn order, no `UnityEngine.Random`. A missing / blank participant ID is an error (no shared-stream fallback). The streams are counted under their own
+names, never under an NPC stream, and an NPC stream can neither be shifted by nor shift them. Replaying a session with its recorded `effective_master_seed`, the same participant ID and group reproduces the pair;
+a different automatic seed can give a different pair. The previous single shared `TargetBuilding` stream (selection version 1) is superseded; the readers do not support it.
+
+### 3d. Target state during the session
+
+`ExperimentManager.Target1BuildingId` / `Target2BuildingId` (fixed for the session) are separate; `ActivePart3Destination` ("D1" / "D2" / "") and `ActivePart3TargetId` are set **explicitly** when a search
+opens and cleared when it closes, so the Destination 2 search can never read the Destination 1 target. The Destination 1 panel is prepared for Target 1's building and the Destination 2 panel for Target 2's
+(`UIManager.Destination1PreviewBuilding` / `Destination2PreviewBuilding`). Only the active target (plus, when `allowWrongCandidateSelection` is on, the other landmark of the same zone) is selectable; a click is scored
+`correct` only when its id equals the open search's target id. Finding Target 1 moves to Destination 2 exactly once; the 10-minute D1 timeout moves there with Target 2; the 15-minute total limit ends the phase
+(timing logic unchanged).
 
 ## 4. Part 3 movement assignment
 
@@ -236,7 +268,7 @@ field, its scene value, the manifest list of overrides and the corresponding set
 | `automatic_entropy_source` | `os_csprng (...)` for an automatic seed, `not_used_fixed_seed` otherwise |
 | `abandoned_spawn_attempt_count`, `abandoned_spawn_attempts` | spawn attempts that consumed a spawn index without creating an NPC, as `Part:index:reason` (`no_valid_route`, `pool_or_instantiate_failed`; first 500) - a gap in `rng_spawn_index` is explained here |
 
-`session_manifest.json` -> `assignments` (group-controlled conditions and the participant-specific draw; the participant ID is the manifest's normal `participant_id`, not duplicated): `part2_group_index`, `part2_start_point_id`, `part2_teleport_point_id`, `part3_group_index`, `part3_start_zone`, `part3_start_point_id`, `target_building_stream`, `target_building_derivation`, and per destination `destinationN_region_id`, `destinationN_candidate_ids` (sorted), `destinationN_candidate_fingerprint` (16 hex), `destinationN_selected_id`, `destinationN_derived_seed` (16 hex).
+`session_manifest.json` -> `assignments` (group-controlled conditions and the participant-specific draw; the participant ID is the manifest's normal `participant_id`, not duplicated): `part2_group_index`, `part2_start_point_id`, `part2_teleport_point_id`, `part3_group_index`, `part3_start_zone`, `part3_start_point_id`, `destination1_zone_id`, `destination2_zone_id`, `target1_building_id`, `target2_building_id`, `destination1_candidate_ids` / `destination2_candidate_ids` (the two sorted ids), `destination1_candidate_fingerprint` / `destination2_candidate_fingerprint` (16 hex), `target1_stream` / `target2_stream`, `target1_selection_seed` / `target2_selection_seed` (16 hex), `target_selection_version` (2), `target_selection_algorithm`, `target_selection_derivation`, and the recorded self-checks `destination_zones_distinct`, `target1_in_destination1_zone`, `target2_in_destination2_zone`, `target_building_ids_distinct`. An auditor verifies after a session that Target 1 is in the Destination 1 zone, Target 2 in the Destination 2 zone, the two ids differ and the zones differ (`docs/tools/npc_movement_mix.py` -> `target_assignment_verification` re-derives all of it independently from `effective_master_seed`, `participant_id` and the recorded candidates).
 
 **Seed representation:** every 64-bit seed is written as exactly **16 lowercase hexadecimal digits in a JSON/CSV string** (never a number; JSON numbers become doubles in many readers and would lose low bits). Python reads them with `int(x, 16)`; `docs/tools/experiment_rng.py` and `npc_movement_mix.py` handle them as exact ints. The spawn index and draw counts are plain integers (exact). `setting_entries` `experiment_rng_master_seed_configured` / `_effective` are the same 16-digit strings.
 

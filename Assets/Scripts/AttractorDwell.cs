@@ -20,10 +20,9 @@
 // affect route generation, itinerary contents, entrance/attractor/exit selection or ordering.
 //
 // RANDOM-NUMBER ISOLATION
-// The existing project drives entrance/attractor/exit selection, attractor count, ordering, dwell timing
-// and other NPC behaviour from the shared UnityEngine.Random sequence. This component samples with a
-// PRIVATE System.Random, so it never advances UnityEngine.Random and the existing route generation is
-// bit-for-bit unaffected.
+// The standing point is drawn from the visiting NPC's own AttractorDwell stream of the experiment RNG
+// (PedestrianAgent.Rng.AttractorDwell, see ExperimentRng.cs): reproducible with a fixed Master Seed and independent of every other
+// random process. The component keeps no random state of its own (one Attractor plane is shared by many NPCs).
 //
 // VERTICAL PROJECTION
 // The projection scans straight down the candidate's X/Z column (algorithm adapted from
@@ -93,20 +92,8 @@ public class AttractorDwell : MonoBehaviour
              "misplaced Plane. Off by default; never logs per-frame.")]
     public bool enableDebugLogs = false;
 
-    // Private RNG. Using System.Random (NOT UnityEngine.Random) keeps the project's existing
-    // UnityEngine.Random sequence - and therefore entrance/attractor/exit selection, attractor count,
-    // ordering and dwell timing - completely unchanged. Seeded per-instance so two components created in
-    // the same frame still diverge.
-    System.Random _rng;
-    System.Random Rng
-    {
-        get
-        {
-            if (_rng == null)
-                _rng = new System.Random(unchecked(System.Environment.TickCount * 397) ^ GetInstanceID());
-            return _rng;
-        }
-    }
+    // The stream of the NPC currently asking for a point (set for the duration of one TryGetRandomStandingPoint call; main thread only).
+    Pcg32 currentRng;
 
     void Reset()
     {
@@ -137,7 +124,14 @@ public class AttractorDwell : MonoBehaviour
     /// </summary>
     public bool TryGetRandomStandingPoint(out Vector3 point)
     {
+        return TryGetRandomStandingPoint(out point, ExperimentRngManager.UnassignedNpcRng.AttractorDwell);
+    }
+
+    /// <summary>As above, drawing from the given stream (the visiting NPC's AttractorDwell stream).</summary>
+    public bool TryGetRandomStandingPoint(out Vector3 point, Pcg32 rng)
+    {
         point = default;
+        currentRng = rng ?? ExperimentRngManager.UnassignedNpcRng.AttractorDwell;
 
         if (!enableRandomStop) return false;
 
@@ -247,7 +241,7 @@ public class AttractorDwell : MonoBehaviour
 
     float RandRange(float min, float max)
     {
-        return min + (float)Rng.NextDouble() * (max - min);
+        return min + currentRng.NextFloat() * (max - min);
     }
 
     // Scene-view helper: draw the sampling rectangle and a line to the Facing Target when selected.

@@ -29,15 +29,20 @@ public partial class NpcLifecycleTests
     static readonly Type AppearanceType = T("AppearanceController");
     const string AttrMode = "Part3AttractorItinerary", WandMode = "Part2WanderingItinerary";
 
-    static object NewSelector(int seed) => Activator.CreateInstance(SelectorType, seed);
-    static string Draw(object selector, float p) => Call(selector, "Choose", p).ToString();
-    static string ModeOf(Component pa) => Get<object>(pa, "MovementMode").ToString();
+    static readonly Type RngPartType = T("RngPart");
+    static object Part3EnumValue => Enum.Parse(RngPartType, "Part3");
 
-    static List<string> ExpectedModes(int seed, float p, int n)
+    // The assignment of the NPC with spawn index i is a pure function of (root seed, Part 3, i, probability): the first value of its own MovementAssignment stream.
+    static string Predict(ulong root, long index, float p) => CallStatic(SelectorType, "Predict", root, Part3EnumValue, index, p).ToString();
+    static string ModeOf(Component pa) => Get<object>(pa, "MovementMode").ToString();
+    static object NewSelector() => Activator.CreateInstance(SelectorType);
+    static object NewNpcSet(ulong root, long index) => Activator.CreateInstance(T("NpcRngSet"), root, Part3EnumValue, index);
+    static string Choose(object selector, object npc, float p) => Call(selector, "Choose", npc, p).ToString();
+
+    static List<string> ExpectedModes(ulong root, float p, int n)
     {
-        object s = NewSelector(seed);
         var l = new List<string>();
-        for (int i = 0; i < n; i++) l.Add(Draw(s, p));
+        for (int i = 0; i < n; i++) l.Add(Predict(root, i, p));
         return l;
     }
 
@@ -46,15 +51,14 @@ public partial class NpcLifecycleTests
     [Test]
     public void Mix_ZeroAndOne_AreExact_AndOutOfRangeValuesAreClamped()
     {
-        object zero = NewSelector(1), one = NewSelector(2);
         for (int i = 0; i < 5000; i++)
         {
-            Assert.AreEqual(WandMode, Draw(zero, 0f), "0.0 = every new NPC wanders");
-            Assert.AreEqual(AttrMode, Draw(one, 1f), "1.0 = every new NPC uses attractors");
+            Assert.AreEqual(WandMode, Predict(1, i, 0f), "0.0 = every new NPC wanders");
+            Assert.AreEqual(AttrMode, Predict(2, i, 1f), "1.0 = every new NPC uses attractors");
         }
-        Assert.AreEqual(AttrMode, Draw(NewSelector(3), 7.5f), "> 1 is clamped to 1");
-        Assert.AreEqual(WandMode, Draw(NewSelector(3), -2f), "< 0 is clamped to 0");
-        Assert.AreEqual(AttrMode, Draw(NewSelector(3), float.NaN), "NaN falls back to the default (all attractor)");
+        Assert.AreEqual(AttrMode, Predict(3, 0, 7.5f), "> 1 is clamped to 1");
+        Assert.AreEqual(WandMode, Predict(3, 0, -2f), "< 0 is clamped to 0");
+        Assert.AreEqual(AttrMode, Predict(3, 0, float.NaN), "NaN falls back to the default (all attractor)");
         Assert.AreEqual(1f, (float)CallStatic(SelectorType, "SanitizeProbability", float.NaN));
         Assert.AreEqual(0f, (float)CallStatic(SelectorType, "SanitizeProbability", -0.001f));
         Assert.AreEqual(1f, (float)CallStatic(SelectorType, "SanitizeProbability", 1.001f));
@@ -62,7 +66,7 @@ public partial class NpcLifecycleTests
         Assert.AreEqual(1f, (float)SelectorType.GetField("DefaultAttractorProbability").GetRawConstantValue(), "the default keeps the pre-mixture behaviour");
     }
 
-    // Independent Bernoulli(a) per spawn: the count of attractors in n draws is Binomial(n, a). No exact counts are demanded; 5 standard deviations is the bound
+    // Independent Bernoulli(a) per spawn index: the count of attractors among n indices is Binomial(n, a). No exact counts are demanded; 5 standard deviations is the bound
     // (the seeds are fixed, so the outcome is deterministic and cannot flake).
     [Test]
     public void Mix_IntermediateProbabilities_GiveBinomialCounts_NotExactCounts()
@@ -72,11 +76,10 @@ public partial class NpcLifecycleTests
         foreach (float p in new[] { 0.1f, 0.25f, 0.5f, 0.75f, 0.9f })
         {
             var counts = new List<int>();
-            foreach (int seed in new[] { 11, 22, 33, 44, 55 })
+            foreach (ulong seed in new[] { 11UL, 22UL, 33UL, 44UL, 55UL })
             {
-                object s = NewSelector(seed);
                 int k = 0;
-                for (int i = 0; i < n; i++) if (Draw(s, p) == AttrMode) k++;
+                for (int i = 0; i < n; i++) if (Predict(seed, i, p) == AttrMode) k++;
                 counts.Add(k);
                 double sigma = Math.Sqrt(n * p * (1 - p));
                 Assert.LessOrEqual(Math.Abs(k - n * p), 5 * sigma, "p=" + p + " seed=" + seed + " attractors=" + k + " of " + n);
@@ -84,20 +87,19 @@ public partial class NpcLifecycleTests
             Assert.Greater(counts.Distinct().Count(), 1, "the realised counts vary from seed to seed (random sampling, not a fixed quota) at p=" + p);
             report.Add("p=" + p.ToString("F2", CultureInfo.InvariantCulture) + " attractor shares " + string.Join("/", counts.Select(c => (c / (double)n).ToString("F3", CultureInfo.InvariantCulture))));
         }
-        TestContext.Out.WriteLine("per-spawn draws, 10000 each: " + string.Join("; ", report));
+        TestContext.Out.WriteLine("per-spawn assignments, 10000 each: " + string.Join("; ", report));
     }
 
-    // The draw does not depend on the previous outcomes: P(attractor | previous attractor) = P(attractor | previous wandering) = a.
+    // The assignment of one spawn index does not depend on its neighbours: P(attractor | previous index attractor) = P(attractor | previous index wandering) = a.
     [Test]
-    public void Mix_ConsecutiveDraws_AreIndependent()
+    public void Mix_ConsecutiveSpawnIndices_AreIndependent()
     {
         const int n = 40000; const float p = 0.5f;
-        object s = NewSelector(777);
-        string prev = Draw(s, p);
+        string prev = Predict(777, 0, p);
         int afterA = 0, a = 0, afterW = 0, w = 0;
-        for (int i = 0; i < n; i++)
+        for (int i = 1; i <= n; i++)
         {
-            string cur = Draw(s, p);
+            string cur = Predict(777, i, p);
             if (prev == AttrMode) { a++; if (cur == AttrMode) afterA++; } else { w++; if (cur == AttrMode) afterW++; }
             prev = cur;
         }
@@ -105,23 +107,24 @@ public partial class NpcLifecycleTests
         Assert.AreEqual(p, afterW / (double)w, 0.03, "P(attractor | previous wandering)");
     }
 
+    // Same root seed + same Part + same spawn index = the same movement assignment, however it is asked (static prediction, the selector with an NPC stream set, any order).
     [Test]
-    public void Mix_SameSeed_ReproducesTheSequence_DifferentSeeds_AreIndependent()
+    public void Mix_SameSeedPartAndSpawnIndex_GiveTheSameAssignment_DifferentSeedsAreIndependent()
     {
         var a = ExpectedModes(4242, 0.5f, 2000); var b = ExpectedModes(4242, 0.5f, 2000);
-        CollectionAssert.AreEqual(a, b, "same seed -> identical assignment sequence");
+        CollectionAssert.AreEqual(a, b, "same seed -> identical assignment for every spawn index");
+        var sel = NewSelector();
+        for (int i = 1999; i >= 0; i -= 7)   // reverse order, sparse: the result does not depend on what was asked before
+            Assert.AreEqual(a[i], Choose(sel, NewNpcSet(4242, i), 0.5f), "index " + i);
         var c = ExpectedModes(4243, 0.5f, 2000);
         double agree = a.Zip(c, (x, y) => x == y ? 1 : 0).Sum() / 2000.0;
         Assert.AreEqual(0.5, agree, 0.06, "two different seeds agree about half of the time (independent streams), not always");
         Assert.AreNotEqual(string.Join(",", a), string.Join(",", c));
-        Assert.AreEqual(1234, Get<int>(NewSelector(1234), "Seed"));
-        Assert.AreEqual(55, (int)CallStatic(SelectorType, "ResolveSeed", 55, 9), "an explicit seed is used as is");
     }
 
-    // One value is drawn per decision whatever the probability is, so the stream position does not depend on the setting, and a lower probability picks a
-    // subset of the attractor spawns of a higher one (the same r is compared with a smaller a).
+    // The value r of spawn i does not depend on the probability, so the attractor set of a lower probability is a subset of a higher one; and each decision takes exactly one value.
     [Test]
-    public void Mix_OneDrawPerDecision_AndAttractorSetsAreNestedAcrossProbabilities()
+    public void Mix_OneValuePerDecision_AndAttractorSetsAreNestedAcrossProbabilities()
     {
         var p25 = ExpectedModes(99, 0.25f, 3000); var p50 = ExpectedModes(99, 0.5f, 3000); var p75 = ExpectedModes(99, 0.75f, 3000);
         for (int i = 0; i < 3000; i++)
@@ -129,52 +132,49 @@ public partial class NpcLifecycleTests
             if (p25[i] == AttrMode) Assert.AreEqual(AttrMode, p50[i], "i=" + i);
             if (p50[i] == AttrMode) Assert.AreEqual(AttrMode, p75[i], "i=" + i);
         }
-        object s = NewSelector(5);
-        foreach (float p in new[] { 0f, 0.5f, 1f, 0.3f }) Draw(s, p);
-        Assert.AreEqual(4L, Get<long>(s, "Draws"), "exactly one draw per decision, even at 0 and 1");
+        var s = NewSelector();
+        foreach (float p in new[] { 0f, 0.5f, 1f, 0.3f })
+        {
+            object npc = NewNpcSet(5, 0);
+            Choose(s, npc, p);
+            Assert.AreEqual(1L, Get<long>(Call(npc, "Get", Enum.Parse(T("RngStream"), "MovementAssignment")), "Draws"), "exactly one value per decision, even at 0 and 1");
+        }
+        Assert.AreEqual(4L, Get<long>(s, "Draws"));
     }
 
-    // No active-population correction exists: whatever the assignment counters and the live population look like, the next draw is the same.
+    // No active-population correction exists: whatever the assignment counters say, the assignment of an index is unchanged; ResetCounts does not move anything.
     [Test]
-    public void Mix_ActivePopulationAndCounters_NeverInfluenceTheNextDraw()
+    public void Mix_ActivePopulationAndCounters_NeverInfluenceAnAssignment()
     {
-        object clean = NewSelector(31337), skewed = NewSelector(31337);
-        var expected = new List<string>(); var actual = new List<string>();
+        var clean = NewSelector(); var skewed = NewSelector();
         for (int i = 0; i < 500; i++)
         {
-            expected.Add(Draw(clean, 0.5f));
-            // report a wildly unbalanced history to the second selector: a quota/deficit design would now correct towards wandering
-            for (int k = 0; k < 40; k++) Call(skewed, "NoteAssigned", Enum.Parse(T("NpcMovementMode"), AttrMode));
-            actual.Add(Draw(skewed, 0.5f));
+            for (int k = 0; k < 40; k++) Call(skewed, "NoteAssigned", Enum.Parse(T("NpcMovementMode"), AttrMode));   // a wildly unbalanced history
+            Assert.AreEqual(Choose(clean, NewNpcSet(31337, i), 0.5f), Choose(skewed, NewNpcSet(31337, i), 0.5f), "index " + i);
         }
-        CollectionAssert.AreEqual(expected, actual, "the draw sequence is a function of the seed only");
-        var s = NewSelector(8);
-        for (int i = 0; i < 20; i++) Draw(s, 0.5f);
-        var next = NewSelector(8);
-        for (int i = 0; i < 20; i++) Draw(next, 0.5f);
-        Call(s, "ResetCounts");
-        Assert.AreEqual(Draw(next, 0.5f), Draw(s, 0.5f), "ResetCounts (a new Part) clears the counters but does not rewind or reseed the stream");
-        Assert.AreEqual(0L, Get<long>(s, "AssignedTotal"));
+        Call(skewed, "ResetCounts");
+        Assert.AreEqual(0L, Get<long>(skewed, "AssignedTotal"));
+        Assert.AreEqual(Choose(clean, NewNpcSet(31337, 501), 0.5f), Choose(skewed, NewNpcSet(31337, 501), 0.5f), "ResetCounts (a new Part) changes nothing about assignments");
     }
 
     [Test]
-    public void Mix_ConsumesNoUnityRandomNumbers_SoRouteDwellAndAppearanceDrawsAreUnperturbed()
+    public void Mix_ConsumesNoUnityRandomNumbers_SoNothingElseIsPerturbed()
     {
         UnityEngine.Random.InitState(20261109);
         var expected = new[] { UnityEngine.Random.value, UnityEngine.Random.value, UnityEngine.Random.value };
         UnityEngine.Random.InitState(20261109);
-        object s = NewSelector(1);
-        for (int i = 0; i < 5000; i++) Draw(s, 0.37f);
+        var s = NewSelector();
+        for (int i = 0; i < 5000; i++) Choose(s, NewNpcSet(1, i), 0.37f);
         var actual = new[] { UnityEngine.Random.value, UnityEngine.Random.value, UnityEngine.Random.value };
         CollectionAssert.AreEqual(expected, actual, "the selector never touches UnityEngine.Random");
     }
 
     [Test]
-    public void Mix_ChooseCost_IsSmall_AndAllocatesNothing()
+    public void Mix_ChooseCost_IsSmall_AndAllocatesNothingPerDecision()
     {
-        var sel = NewSelector(1); var p = Expression.Parameter(typeof(float), "p");
-        var choose = Expression.Lambda<Func<float, int>>(Expression.Convert(Expression.Call(Expression.Constant(sel), SelectorType.GetMethod("Choose"), p), typeof(int)), p).Compile();
-        choose(0.5f);   // warm-up
+        var sel = NewSelector(); var npc = NewNpcSet(1, 0); var p = Expression.Parameter(typeof(float), "p");
+        var choose = Expression.Lambda<Func<float, int>>(Expression.Convert(Expression.Call(Expression.Constant(sel), SelectorType.GetMethod("Choose"), Expression.Constant(npc), p), typeof(int)), p).Compile();
+        choose(0.5f);   // warm-up (creates the stream)
         const int calls = 400000;
         int gc0 = GC.CollectionCount(0);
         var sw = Stopwatch.StartNew(); int sink = 0;
@@ -197,7 +197,8 @@ public partial class NpcLifecycleTests
         Assert.IsNull(SpawnerType.GetField("part3AttractorMovementProportion"), "the old active-population field no longer exists (one parameter only)");
         Assert.AreEqual(1f, Get<float>(sp, "part3AttractorMovementProbability"), "default = every new NPC uses attractors = the pre-mixture Part 3 behaviour");
         Assert.AreEqual(1f, Get<float>(sp, "Part3AttractorMovementProbability"));
-        Assert.AreEqual(0, Get<int>(sp, "part3MovementAssignmentSeed"), "seed 0 = derive from the clock");
+        Assert.IsNull(SpawnerType.GetField("part3MovementAssignmentSeed"), "the legacy movement-assignment seed no longer exists: the Master Seed is the only root");
+        Assert.IsNull(SpawnerType.GetProperty("LegacyMovementAssignmentSeed"));
 
         var range = (UnityEngine.RangeAttribute)Attribute.GetCustomAttribute(field, typeof(UnityEngine.RangeAttribute));
         Assert.IsNotNull(range); Assert.AreEqual(0f, range.min); Assert.AreEqual(1f, range.max);
@@ -272,7 +273,8 @@ public partial class NpcLifecycleTests
         yield return new WaitForSecondsRealtime(0.5f);   // the first legs are issued
         var agents = ActiveAgents(rig);
         Assert.AreEqual(n, agents.Count);
-        CollectionAssert.AreEqual(ExpectedModes(20261109, p, n), agents.Select(ModeOf).ToList(), "p=" + p + ": spawn i uses the i-th draw of the seeded stream");
+        foreach (var ag in agents) Assert.AreEqual(Predict(20261109, Get<long>(ag, "RngSpawnIndex"), p), ModeOf(ag), "p=" + p + ": the NPC with spawn index i has the assignment (seed, Part 3, i, p)");
+        Assert.AreEqual(n, agents.Select(ag => Get<long>(ag, "RngSpawnIndex")).Distinct().Count(), "every NPC has its own spawn index");
         int attractor = agents.Count(a => ModeOf(a) == AttrMode);
         Assert.AreEqual((long)attractor, Get<long>(rig.spawner, "AssignedAttractorMovementTotal")); Assert.AreEqual((long)(n - attractor), Get<long>(rig.spawner, "AssignedWanderingMovementTotal"));
         Assert.AreEqual((long)n, Get<long>(rig.spawner, "Part3MovementDraws"), "one draw per spawn");
@@ -667,17 +669,17 @@ public partial class NpcLifecycleTests
         // name, running Part, npcDirectedMovement, probability, profile has a wristband, expectation about the NEW lifetimes (wears?, marker)
         var phases = new (string name, string running, bool directed, float p, bool profileBracelet, bool suppressed)[]
         {
-            ("P3 attractor (with wristband)",          "Part3", true,  1f, true,  false),
-            ("P3 attractor->wandering",                "Part3", true,  0f, true,  true),
-            ("P3 wandering->P2 wandering",             "Part2", false, 1f, true,  false),
-            ("P2 with wristband->P3 wandering",        "Part3", true,  0f, true,  true),
-            ("P3 wandering->P3 attractor, no wristband","Part3", true,  1f, false, false),
-            ("P3 attractor w/o wristband->wandering",  "Part3", true,  0f, true,  true),
-            ("P3 wandering->P3 attractor (profile)",   "Part3", true,  1f, true,  false),
-            ("P3 attractor->P2 wandering",             "Part2", false, 1f, true,  false),
+            ("Part3EnumValue attractor (with wristband)",          "Part3", true,  1f, true,  false),
+            ("Part3EnumValue attractor->wandering",                "Part3", true,  0f, true,  true),
+            ("Part3EnumValue wandering->P2 wandering",             "Part2", false, 1f, true,  false),
+            ("P2 with wristband->Part3EnumValue wandering",        "Part3", true,  0f, true,  true),
+            ("Part3EnumValue wandering->Part3EnumValue attractor, no wristband","Part3", true,  1f, false, false),
+            ("Part3EnumValue attractor w/o wristband->wandering",  "Part3", true,  0f, true,  true),
+            ("Part3EnumValue wandering->Part3EnumValue attractor (profile)",   "Part3", true,  1f, true,  false),
+            ("Part3EnumValue attractor->P2 wandering",             "Part2", false, 1f, true,  false),
             ("P2 with wristband->no active Part",      "None",  false, 0f, true,  false),
-            ("no active Part->P3 attractor",           "Part3", true,  1f, true,  false),
-            ("P3 attractor->Part 1",                   "Part1", false, 0f, true,  false),
+            ("no active Part->Part3EnumValue attractor",           "Part3", true,  1f, true,  false),
+            ("Part3EnumValue attractor->Part 1",                   "Part1", false, 0f, true,  false),
         };
         var bounds = new List<int>();
         for (int i = 0; i < phases.Length; i++)
@@ -783,14 +785,14 @@ public partial class NpcLifecycleTests
         var m = SpawnerType.GetMethod("DecideMovementMode", All);
         for (int i = 0; i < 5; i++)
         {
-            var args = new object[] { null };
+            var args = new object[] { CallStatic(T("ExperimentRngManager"), "CreateNpcRng", Enum.Parse(T("RngPart"), "None"), (long)i), null };
             Assert.AreEqual(AttrMode, m.Invoke(rig.spawner, args).ToString());
-            Assert.AreEqual(false, args[0], "no draw was applied");
+            Assert.AreEqual(false, args[1], "no draw was applied");
         }
         Assert.AreEqual(0L, Get<long>(rig.spawner, "Part3MovementDraws"));
     }
 
-    // Spawning under Part 1 / Part 2 / no Part leaves the selector's private sequence untouched: the first Part 3 spawns afterwards are exactly the first draws of the seed.
+    // Spawning under Part 1 / Part 2 / no Part takes no movement-assignment value, and the Part 3 assignments that follow are the pure function of (seed, Part 3, spawn index).
     [UnityTest]
     public IEnumerator SelectorScope_NonPart3Spawning_LeavesThePrivateSequenceUntouched()
     {
@@ -806,9 +808,11 @@ public partial class NpcLifecycleTests
         EmType.GetField("currentRunningPart", All).SetValue(rig.em, Enum.Parse(EmType.GetNestedType("RunningPart", All), "Part3"));
         Set(rig.spawner, "maxAgents", 30);
         yield return WaitUntil(() => Live(rig) == 30, 30f, "Part 3 NPCs");
-        var part3 = ActiveAgents(rig).Skip(12).Select(ModeOf).ToList();
-        CollectionAssert.AreEqual(ExpectedModes(20261109, 0.5f, part3.Count), part3, "the stream starts at draw 1 of the seed");
-        Assert.AreEqual((long)part3.Count, Get<long>(rig.spawner, "Part3MovementDraws"));
+        var part3Agents = ActiveAgents(rig).Skip(12).ToList();
+        Assert.AreEqual(18, part3Agents.Count);
+        foreach (var a in part3Agents)
+            Assert.AreEqual(Predict(20261109, Get<long>(a, "RngSpawnIndex"), 0.5f), ModeOf(a), "the mode is the pure function of (seed, Part 3, spawn index): earlier Part 1 / Part 2 spawns changed nothing");
+        Assert.AreEqual((long)part3Agents.Count, Get<long>(rig.spawner, "Part3MovementDraws"));
     }
 
     // ====================================================================================== Part 2 accessory weights: adjusted to match the overall Part 3 distribution
@@ -1024,17 +1028,17 @@ public partial class NpcLifecycleTests
         // name, running Part, Part 3 directed, npcDirectedMovement of the running Part, probability, expected option (0 wristband, 1 normal None, -3 forced)
         var phases = new (string name, string running, bool p3Directed, bool directed, float p, int option)[]
         {
-            ("P3 attractor",                         "Part3", true,  true,  1f, 0),
-            ("P3 attractor -> P2 (a = 0)",           "Part2", true,  false, 0f, 1),
-            ("P2 -> P3 attractor",                   "Part3", true,  true,  1f, 0),
-            ("P3 attractor -> P3 wandering",         "Part3", true,  true,  0f, -3),
-            ("P3 wandering -> P2 (a = 0)",           "Part2", true,  false, 0f, 1),
+            ("Part3EnumValue attractor",                         "Part3", true,  true,  1f, 0),
+            ("Part3EnumValue attractor -> P2 (a = 0)",           "Part2", true,  false, 0f, 1),
+            ("P2 -> Part3EnumValue attractor",                   "Part3", true,  true,  1f, 0),
+            ("Part3EnumValue attractor -> Part3EnumValue wandering",         "Part3", true,  true,  0f, -3),
+            ("Part3EnumValue wandering -> P2 (a = 0)",           "Part2", true,  false, 0f, 1),
             ("P2 (a = 0) -> no active Part",         "None",  true,  false, 0f, 0),
             ("no active Part -> P2 (a = 0)",         "Part2", true,  false, 0f, 1),
             ("P2 (a = 0) -> Part 1",                 "Part1", true,  false, 0f, 0),
             ("Part 1 -> P2 (a = 1, unchanged)",      "Part2", true,  false, 1f, 0),
             ("P2, Part 3 directed OFF (a_eff = 0)",  "Part2", false, false, 1f, 1),
-            ("P2 (a_eff = 0) -> P3 wandering",       "Part3", true,  false, 1f, -3),
+            ("P2 (a_eff = 0) -> Part3EnumValue wandering",       "Part3", true,  false, 1f, -3),
         };
         var bounds = new List<int>();
         for (int i = 0; i < phases.Length; i++)
@@ -1081,7 +1085,7 @@ public partial class NpcLifecycleTests
     {
         Rig rig = null;
         var o = MixRig(0.4f, 6, speed: 12f);
-        o.compact = true; o.createDcm = true; o.movementSeed = 987654;
+        o.compact = true; o.createDcm = true; o.masterSeed = 987654UL;
         yield return BuildRig(o, r => rig = r);
         yield return WaitUntil(() => Get<int>(rig.spawner, "NpcSpawnedTotal") >= 50, 60f, "50 spawns");
         Set(rig.spawner, "maxAgents", 0);
@@ -1093,7 +1097,10 @@ public partial class NpcLifecycleTests
         int total = lt.Rows.Count;
         Assert.AreEqual(Get<int>(rig.spawner, "NpcSpawnedTotal"), total, "one lifetime row per spawn");
         var recorded = lt.Rows.Select(r => lt.Get(r, "movement_mode")).ToList();
-        CollectionAssert.AreEqual(ExpectedModes(987654, 0.4f, total), recorded, "npc_lifetimes.csv movement_mode, in spawn order, is exactly the seeded draw sequence: no balancing, even with churn");
+        var spawnIdx = lt.Rows.Select(r => long.Parse(lt.Get(r, "rng_spawn_index"), CultureInfo.InvariantCulture)).ToList();
+        CollectionAssert.AreEqual(spawnIdx.Select(i => Predict(987654, i, 0.4f)).ToList(), recorded, "npc_lifetimes.csv movement_mode equals the pure function of (seed, Part 3, rng_spawn_index): no balancing, even with churn");
+        Assert.IsTrue(lt.Rows.All(r => lt.Get(r, "rng_part") == "Part3"), "rng_part is recorded");
+        CollectionAssert.AreEqual(spawnIdx.OrderBy(i => i).ToList(), spawnIdx, "spawn indices increase in spawn order");
         var rowsA = lt.Rows.Where(r => lt.Get(r, "movement_mode") == AttrMode).ToList();
         var rowsW = lt.Rows.Where(r => lt.Get(r, "movement_mode") == WandMode).ToList();
         Assert.Greater(rowsA.Count, 5); Assert.Greater(rowsW.Count, 5);
@@ -1107,10 +1114,12 @@ public partial class NpcLifecycleTests
         var prob = entries.FirstOrDefault(e => (string)e["key"] == "spawner_part3_attractor_movement_probability");
         Assert.IsNotNull(prob, "the configured per-spawn probability is in the manifest's setting_entries");
         Assert.AreEqual("0.4", (string)prob["value"]); Assert.AreEqual("INSPECTOR", (string)prob["source"]);
-        var seed = entries.FirstOrDefault(e => (string)e["key"] == "spawner_part3_movement_assignment_seed");
-        Assert.IsNotNull(seed); Assert.AreEqual("987654", (string)seed["value"]);
+        Assert.IsNull(entries.FirstOrDefault(e => (string)e["key"] == "spawner_part3_movement_assignment_seed"), "no separate movement-assignment seed exists any more");
+        Assert.AreEqual("00000000000f1206", (string)entries.First(e => (string)e["key"] == "experiment_rng_master_seed_effective")["value"], "the Master Seed is the only root");
         Assert.IsNull(entries.FirstOrDefault(e => (string)e["key"] == "spawner_part3_attractor_movement_proportion"), "the retired active-population key is never written again");
-        StringAssert.Contains("Part 3 movement-strategy draw: private System.Random seed=987654", (string)m["npc_random_sources"]);
+        StringAssert.Contains("Experiment RNG PCG32-XSH-RR v1, Master Seed", (string)m["npc_random_sources"]);
+        StringAssert.Contains("derived from the Master Seed alone", (string)m["npc_random_sources"]);
+        StringAssert.DoesNotContain("override", (string)m["npc_random_sources"]);
         Assert.AreEqual(17, (int)m["schema_version"], "no schema bump: new setting_entries keys and no new column");
     }
 }

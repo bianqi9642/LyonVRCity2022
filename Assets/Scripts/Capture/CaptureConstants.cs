@@ -74,7 +74,9 @@ public static class CaptureConstants
         "appearance_hash,appearance_applied_t_abs," +
         "app_body_option,app_body_mesh,app_body_materials,app_hair_option,app_hair_mesh,app_hair_materials," +
         "app_top_option,app_top_mesh,app_top_materials,app_bottom_option,app_bottom_mesh,app_bottom_materials," +
-        "app_shoes_option,app_shoes_mesh,app_shoes_materials,app_accessories_option,app_accessories_mesh,app_accessories_materials";
+        "app_shoes_option,app_shoes_mesh,app_shoes_materials,app_accessories_option,app_accessories_mesh,app_accessories_materials," +
+        // Appended (experiment RNG v1): the Part and the stable spawn index that, with the manifest Master Seed, reconstruct this lifetime's random streams.
+        "rng_part,rng_spawn_index";
 
     // Diagnostic channel (NOT a participant or NPC event stream): one row per recording failure / recovery transition of any stream or of the manifest.
     public const string CaptureErrorsHeader =

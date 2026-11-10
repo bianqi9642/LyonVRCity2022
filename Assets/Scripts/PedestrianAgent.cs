@@ -221,6 +221,18 @@ public class PedestrianAgent : MonoBehaviour
     public float ConfiguredSpeed { get; private set; }
     public bool UncertainBehaviorEnabled { get; private set; }
 
+    // ---- experiment RNG (see ExperimentRng.cs): the independent random streams of THIS NPC lifetime, assigned by SpawnerManager.SpawnAgent before any other random draw ----
+    NpcRngSet rngSet;
+
+    /// <summary>The NPC's own random streams (spawn placement, attributes, appearance, destination, dwell standing point, uncertainty, nudges). Never null: an NPC that was not
+    /// spawned by SpawnerManager (a hand-placed prefab, a test rig) uses the shared "unassigned" set, which is deterministic and counted like any other stream.</summary>
+    public NpcRngSet Rng { get { return rngSet ?? ExperimentRngManager.UnassignedNpcRng; } }
+    /// <summary>The Part and the stable spawn index of this lifetime's streams (index -1 / Part None when unassigned). Recorded in npc_lifetimes.csv (rng_part, rng_spawn_index).</summary>
+    public RngPart RngPart { get { return Rng.Part; } }
+    public long RngSpawnIndex { get { return Rng.SpawnIndex; } }
+    /// <summary>Called once per spawn by SpawnerManager, before the first draw of the NPC.</summary>
+    public void AssignRng(NpcRngSet set) { rngSet = set; }
+
     public void SetProfileAttributes(string profileName, float baseSpeed, float multiplier, float configuredSpeed, bool uncertainEnabled)
     {
         ProfileName = profileName ?? "";
@@ -735,7 +747,7 @@ public class PedestrianAgent : MonoBehaviour
     bool PlaceNearEntrance(Transform entrance)
     {
         Vector3 position;
-        if (!manager.TryFindEntranceSpawnPosition(entrance, gameObject, out position))
+        if (!manager.TryFindEntranceSpawnPosition(entrance, gameObject, out position, Rng.SpawnPlacement))
             return false;
 
         Vector3 before = transform.position;
@@ -1260,7 +1272,7 @@ public class PedestrianAgent : MonoBehaviour
         AttractorDwell dwell = waypoint.GetComponent<AttractorDwell>();
         if (dwell == null) return false;
 
-        return dwell.TryGetRandomStandingPoint(out stop);
+        return dwell.TryGetRandomStandingPoint(out stop, Rng.AttractorDwell);
     }
 
     /// <summary>

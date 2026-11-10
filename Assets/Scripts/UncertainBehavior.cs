@@ -17,6 +17,19 @@ using UnityEngine.AI;
 
 public class UncertainBehavior : MonoBehaviour
 {
+    // ---- experiment RNG (see ExperimentRng.cs): every decision draws from THIS NPC's own Uncertainty stream, so one NPC's per-frame draws never move another NPC's sequence.
+    // The stream follows the lifetime (PedestrianAgent.AssignRng at each spawn). The number of draws per frame still depends on the frame rate (Poisson sampling per Update).
+    PedestrianAgent rngOwner;
+    bool rngOwnerLooked;
+    Pcg32 R
+    {
+        get
+        {
+            if (!rngOwnerLooked) { rngOwner = GetComponent<PedestrianAgent>(); rngOwnerLooked = true; }
+            return (rngOwner != null ? rngOwner.Rng : ExperimentRngManager.UnassignedNpcRng).Uncertainty;
+        }
+    }
+
     [Header("References")]
     [Tooltip("Required: the MoveToTarget component on this GameObject. All movement (pause/resume/detour/" +
              "temporary speed) is expressed through this reference; there is no NavMeshAgent-direct fallback.")]
@@ -348,22 +361,22 @@ public class UncertainBehavior : MonoBehaviour
         else
         {
             // In walking state: sample random events (Poisson approximation)
-            if (UnityEngine.Random.value < pauseProbPerSec * dt)
+            if (R.NextFloat() < pauseProbPerSec * dt)
             {
                 EnterPause();
                 return;
             }
-            if (UnityEngine.Random.value < hesitateProbPerSec * dt)
+            if (R.NextFloat() < hesitateProbPerSec * dt)
             {
                 EnterHesitate();
                 return;
             }
-            if (UnityEngine.Random.value < slowProbPerSec * dt)
+            if (R.NextFloat() < slowProbPerSec * dt)
             {
                 EnterSlow();
                 return;
             }
-            if (UnityEngine.Random.value < detourProbPerSec * dt)
+            if (R.NextFloat() < detourProbPerSec * dt)
             {
                 EnterDetour();
                 return;
@@ -390,7 +403,7 @@ public class UncertainBehavior : MonoBehaviour
     {
         EndLookAround(); // safety: external Trigger*Now() can enter a state without leaving Hesitate first
         state = State.Pause;
-        stateTimer = UnityEngine.Random.Range(pauseMin, pauseMax);
+        stateTimer = R.Range(pauseMin, pauseMax);
         stateStartTime = Time.time;
 
         // Use PauseExternal so MoveToTarget won't treat this as 'arrived'
@@ -412,7 +425,7 @@ public class UncertainBehavior : MonoBehaviour
     void EnterHesitate()
     {
         state = State.Hesitate;
-        stateTimer = UnityEngine.Random.Range(hesitateMin, hesitateMax);
+        stateTimer = R.Range(hesitateMin, hesitateMax);
         stateStartTime = Time.time;
 
         // Start the smooth look-around. Only when it can actually run (a head bone exists) is the soft-pause
@@ -439,7 +452,7 @@ public class UncertainBehavior : MonoBehaviour
     {
         EndLookAround();
         state = State.Slow;
-        stateTimer = UnityEngine.Random.Range(slowMin, slowMax);
+        stateTimer = R.Range(slowMin, slowMax);
         stateStartTime = Time.time;
 
         if (moveController != null)
@@ -473,7 +486,8 @@ public class UncertainBehavior : MonoBehaviour
         for (int attempt = 0; attempt < detourSampleMaxAttempts; attempt++)
         {
             // sample a random candidate within detourRadius
-            Vector2 rnd = UnityEngine.Random.insideUnitCircle * detourRadius;
+            float rcx, rcy; R.InsideUnitCircle(out rcx, out rcy);
+            Vector2 rnd = new Vector2(rcx, rcy) * detourRadius;
             Vector3 candidate = transform.position + new Vector3(rnd.x, 0f, rnd.y);
 
             // snap candidate to NavMesh within detourNavMeshSampleDistance
@@ -516,7 +530,7 @@ public class UncertainBehavior : MonoBehaviour
         {
             // fallback: short pause instead of detour
             state = State.Pause;
-            stateTimer = UnityEngine.Random.Range(pauseMin, pauseMax);
+            stateTimer = R.Range(pauseMin, pauseMax);
             stateStartTime = Time.time;
             if (moveController != null)
                 moveController.PauseExternal(true, true);
@@ -623,7 +637,7 @@ public class UncertainBehavior : MonoBehaviour
 
                 pendingDetourEndReason = "retries_exhausted";
                 state = State.Pause;
-                stateTimer = UnityEngine.Random.Range(pauseMin, pauseMax);
+                stateTimer = R.Range(pauseMin, pauseMax);
                 stateStartTime = Time.time;
 
                 if (moveController != null)
@@ -768,7 +782,7 @@ public class UncertainBehavior : MonoBehaviour
         if (!lookAroundEnabled) return false;
         if (!ResolveLookBone()) return false;
 
-        StartLookTurn(UnityEngine.Random.value < 0.5f ? -1f : 1f);
+        StartLookTurn(R.NextFloat() < 0.5f ? -1f : 1f);
         return true;
     }
 
@@ -860,9 +874,9 @@ public class UncertainBehavior : MonoBehaviour
         lookBone.rotation = Quaternion.AngleAxis(lookYaw, transform.up) * lookBone.rotation;
     }
 
-    static float RandomRange(float a, float b)
+    float RandomRange(float a, float b)
     {
-        return UnityEngine.Random.Range(Mathf.Min(a, b), Mathf.Max(a, b));
+        return R.Range(Mathf.Min(a, b), Mathf.Max(a, b));
     }
 
     // ---- External triggers ----

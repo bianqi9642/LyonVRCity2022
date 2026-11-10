@@ -44,6 +44,7 @@ public partial class NpcLifecycleTests
     public void SetUp()
     {
         CallStatic(BusType, "ResetForTests");
+        CallStatic(T("ExperimentRngManager"), "ResetForTests");   // the Master Seed and every stream are process-wide static state: each test starts from a clean RNG
         T("CaptureIO").GetField("FaultInjector").SetValue(null, null);
         T("CaptureClock").GetField("TestSource").SetValue(null, null);
         CallStatic(AoiType, "ResetDiagnostics");
@@ -66,6 +67,7 @@ public partial class NpcLifecycleTests
         yield return null;
         yield return null;
         if (_navInstance.valid) NavMesh.RemoveNavMeshData(_navInstance);
+        CallStatic(T("ExperimentRngManager"), "ResetForTests");
         CallStatic(BusType, "ResetForTests");
         T("CaptureIO").GetField("FaultInjector").SetValue(null, null);
         T("CaptureClock").GetField("TestSource").SetValue(null, null);
@@ -100,8 +102,8 @@ public partial class NpcLifecycleTests
         public float npcSpeed = 12f;
         public float entranceRadius = 0f;           // SpawnerManager.entranceSpawnRadius (scene value: 5 -> distributed entrance placement)
         public float attractorProbability = 1f;     // SpawnerManager.part3AttractorMovementProbability (Part 3 per-spawn probability of attractor movement; 1 = the default)
-        public int movementSeed = 20261109;         // SpawnerManager.part3MovementAssignmentSeed (private stream of the Part 3 strategy draws; fixed so the sequence is reproducible)
         public bool withAccessories = false;        // AppearanceController.accessoriesRenderer on the template (a placeholder mesh like the prefab); needs withAppearance + a profile
+        public ulong masterSeed = 20261109UL;       // ExperimentManager.experimentRngMasterSeed as an unsigned 64-bit value, set as 16 hex digits (0 = automatic; the fixed default makes every derived stream, incl. the Part 3 movement assignment, reproducible)
         public string runningPart = null;           // ExperimentManager.currentRunningPart set before the spawner starts: "Part1" | "Part2" | "Part3"; null = None (no Part running, as before)
         public bool attractor = false;              // one attractor between entrance and exit, with a short dwell
         public bool compact = false;                // entrance and exit 6 m apart so an itinerary finishes naturally within seconds
@@ -204,6 +206,7 @@ public partial class NpcLifecycleTests
 
         var emGo = Make("TestExperimentManager");
         rig.em = emGo.AddComponent(EmType);
+        Set(rig.em, "experimentRngMasterSeed", o.masterSeed.ToString("x16"));
         Set(rig.em, "part3AudioRecording", o.audio);   // Part 3 audio needs a microphone (or a simulated one): off in every rig that does not test it
         if (o.runningPart != null) EmType.GetField("currentRunningPart", All).SetValue(rig.em, Enum.Parse(EmType.GetNestedType("RunningPart", All), o.runningPart));
         o.emSetup?.Invoke(rig.em);
@@ -257,7 +260,6 @@ public partial class NpcLifecycleTests
         Set(rig.spawner, "usePooling", true);
         Set(rig.spawner, "entranceSpawnRadius", o.entranceRadius);
         Set(rig.spawner, "part3AttractorMovementProbability", o.attractorProbability);
-        Set(rig.spawner, "part3MovementAssignmentSeed", o.movementSeed);
         if (o.prewarmBudgetMs >= 0f) Set(rig.spawner, "prewarmFrameBudgetMs", o.prewarmBudgetMs);
         if (o.attractor)
         {

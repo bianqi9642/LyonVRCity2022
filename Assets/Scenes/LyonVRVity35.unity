@@ -246559,6 +246559,7 @@ MonoBehaviour:
   lockParticipantWhilePart2ContinuePanel: 1
   enableLifecycleLogs: 1
   npcWarmupDuration: 10
+  experimentRngMasterSeed: 0000000000000000
   holdNpcsUntilStart: 1
   waitForHeadsetBeforeStartPanel: 1
   part1StartPosition: {fileID: 1571442372}
@@ -290081,7 +290082,6 @@ MonoBehaviour:
   maxAttractorsPerAgent: 8
   dwellTimeSec: {x: 30, y: 60}
   part3AttractorMovementProbability: 0.6
-  part3MovementAssignmentSeed: 0
   wanderingPoints:
   - {fileID: 204195053}
   - {fileID: 1017432391}
@@ -320819,7 +320819,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   participantId: 1
-  selectedPart: 2
+  selectedPart: 3
   part2GroupIndex: 0
   part3GroupIndex: 2
   autoStart: 1

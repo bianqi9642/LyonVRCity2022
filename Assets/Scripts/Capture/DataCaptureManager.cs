@@ -1741,6 +1741,8 @@ public class DataCaptureManager : MonoBehaviour
         AddPart(f, ap != null ? ap.bottom : null);
         AddPart(f, ap != null ? ap.shoes : null);
         AddPart(f, ap != null ? ap.accessories : null);
+        // ---- appended (experiment RNG): which streams this lifetime used (Part + stable spawn index; -1 / None = spawned outside SpawnerManager) ----
+        f.Add(pa.RngPart.ToString()); f.Add(pa.RngSpawnIndex.ToString(CultureInfo.InvariantCulture));
         _npcLifetimes.WriteLine(_npcLifetimes.Join(f));
         WriteProfileRegistryRow(lp);
     }
@@ -1954,6 +1956,52 @@ public class DataCaptureManager : MonoBehaviour
     [Serializable]
     public class SettingEntryRecord { public string key, value, source; }
 
+    /// <summary>
+    /// The experiment RNG configuration of the session (ExperimentRngManager). Everything needed to audit and re-derive the random inputs: algorithm + versions, configured vs
+    /// effective Master Seed, seed source and policy, the stream inventory, the Part-level stream seeds created so far, and (refreshed at every manifest update)
+    /// the per-(Part, stream) draw counts. Per-NPC stream seeds are NOT listed: they follow from the documented rule using npc_lifetimes.csv rng_part / rng_spawn_index.
+    /// </summary>
+    [Serializable]
+    public class RngManifest
+    {
+        public int rng_config_version;
+        public string rng_algorithm = "", rng_seed_derivation = "";
+        public int rng_algorithm_version, rng_seed_derivation_version;
+        // Version 3 (RngConstants.RngConfigVersion): the Master Seeds are unsigned 64-bit values written as 16 lowercase hex STRINGS (never JSON numbers). Earlier versions are not
+        // supported by the readers (they report them as not reconstructable).
+        public string master_seed_representation = "";
+        public string configured_master_seed = "", effective_master_seed = "";
+        public string seed_source = "", seed_policy = "", configured_seed_origin = "", initialization_note = "";
+        public string[] stream_inventory = new string[0], stream_versions = new string[0], part_stream_seeds = new string[0], stream_draw_counts = new string[0];
+        public string npc_stream_seed_rule = "";
+        // "valid" when the Master Seed was resolved and frozen; otherwise "failed: <reason>" / "not_initialized" (the experiment cannot start).
+        public string rng_configuration_validation = "";
+        // "os_csprng (...)" for an automatic seed, "not_used_fixed_seed" for a fixed one.
+        public string automatic_entropy_source = "";
+        // Spawn attempts that consumed a spawn index without creating an NPC: total, and the first ones as "Part:index:reason" (so a gap in rng_spawn_index is explained).
+        public long abandoned_spawn_attempt_count;
+        public string[] abandoned_spawn_attempts = new string[0];
+    }
+
+    /// <summary>
+    /// The experimental assignments of this run, as designated by the group indices and the participant-specific target-building draw (ExperimentManager.Part2Assignment / Part3Assignment).
+    /// Empty / -1 for a Part that has not been resolved. All 64-bit seeds are 16 lowercase hex digits (never a JSON number). The participant ID is NOT duplicated here: it is the normal
+    /// participant_id of this manifest, the key of the derivation.
+    /// </summary>
+    [Serializable]
+    public class AssignmentsManifest
+    {
+        public int part2_group_index = -1;
+        public string part2_start_point_id = "", part2_teleport_point_id = "";
+        public int part3_group_index = -1;
+        public string part3_start_zone = "", part3_start_point_id = "";
+        public string target_building_stream = "", target_building_derivation = "";
+        public string destination1_region_id = "", destination1_candidate_fingerprint = "", destination1_selected_id = "", destination1_derived_seed = "";
+        public string[] destination1_candidate_ids = new string[0];
+        public string destination2_region_id = "", destination2_candidate_fingerprint = "", destination2_selected_id = "", destination2_derived_seed = "";
+        public string[] destination2_candidate_ids = new string[0];
+    }
+
     /// <summary>session_config.used.json: the resolved configuration this session actually used (never a re-read of the external file).</summary>
     [Serializable]
     class UsedConfigRecord
@@ -2043,7 +2091,7 @@ public class DataCaptureManager : MonoBehaviour
         public PartConfigSnapshot part1_config, part2_config, part3_config;
         public bool npc_capture, trajectory_ok = true, gaze_ok = true, events_ok = true;
         public string randomization_note =
-            "UnityEngine.Random not seeded; AttractorDwell uses TickCount-seeded System.Random; NPC trajectories are not replayable from initial conditions.";
+            "Project-owned experiment/NPC randomness uses the experiment RNG (see the rng block: Master Seed, PCG32 streams); UnityEngine.Random is not used by project code. NPC trajectories still depend on frame rate, NavMesh avoidance and update order and are not guaranteed identical.";
         public string[] file_list = new string[0];
 
         // ---- schema v2: identity scheme and NPC capture mode (new; older sessions do not have these keys) ----
@@ -2095,6 +2143,9 @@ public class DataCaptureManager : MonoBehaviour
         public string capture_finalization_error = "";
         public long late_events_rejected, late_npc_records_rejected, late_gaze_rows_rejected, npc_event_buffer_high_water;
         public string npc_random_sources = "";
+        // Experiment RNG block: see RngManifest.
+        public RngManifest rng = new RngManifest();
+        public AssignmentsManifest assignments = new AssignmentsManifest();
         public FrameTimingSummary frame_timing = new FrameTimingSummary();
         public int trials_started, trials_ended, app_pause_count, app_resume_count, manifest_updates;
         public string last_manifest_update_reason = "";
@@ -2476,6 +2527,61 @@ public class DataCaptureManager : MonoBehaviour
         return h.rows_written > 0 ? "ok" : "configured_no_rows";
     }
 
+    // Experiment RNG block: static configuration + the live draw counts (refreshed with every manifest update). Reading the manager initialises it if nothing drew yet (it is always
+    // initialised long before this point in a real session).
+    void FillRngManifest()
+    {
+        var r = _manifest.rng ?? (_manifest.rng = new RngManifest());
+        r.rng_config_version = RngConstants.RngConfigVersion;
+        r.master_seed_representation = RngConstants.SeedRepresentation;
+        r.rng_algorithm = RngConstants.AlgorithmName; r.rng_algorithm_version = RngConstants.AlgorithmVersion;
+        r.rng_seed_derivation = RngConstants.SeedDerivationName; r.rng_seed_derivation_version = RngConstants.SeedDerivationVersion;
+        r.stream_inventory = ExperimentRngManager.StreamInventory();
+        r.stream_versions = ExperimentRngManager.StreamVersions();
+        try
+        {
+            r.configured_master_seed = MasterSeedFormat.ToHex(ExperimentRngManager.ConfiguredMasterSeed);
+            r.effective_master_seed = MasterSeedFormat.ToHex(ExperimentRngManager.EffectiveMasterSeed);
+            r.seed_source = ExperimentRngManager.SeedSource;
+            r.seed_policy = ExperimentRngManager.SeedPolicy;
+            r.configured_seed_origin = ExperimentRngManager.ConfigSource;
+            r.automatic_entropy_source = ExperimentRngManager.EntropySource;
+            r.initialization_note = ExperimentRngManager.InitializationNote;
+            r.part_stream_seeds = ExperimentRngManager.PartStreamSeeds();
+            r.stream_draw_counts = ExperimentRngManager.DrawCountSummary();
+        }
+        catch (InvalidOperationException)
+        {
+            // Failed RNG: no seed exists. Say so in the record instead of a misleading 0.
+            r.seed_source = ""; r.seed_policy = ""; r.effective_master_seed = ""; r.configured_master_seed = "";
+        }
+        r.rng_configuration_validation = ExperimentRngManager.ConfigurationValidation;
+        r.npc_stream_seed_rule = "per-NPC stream seed = SeedDerivation.StreamSeed(MasterSeed, rng_part, stream, rng_spawn_index) (MovementAssignment included: the Master Seed is the only root); " +
+                                 "NPC streams do not depend on participant or group; PCG32 initstate = Mix(seed + 1), initseq = Mix(seed + 2); see docs/rng_system.md";
+        if (_spawner != null)
+        {
+            r.abandoned_spawn_attempt_count = _spawner.AbandonedSpawnAttemptCount;
+            var l = _spawner.AbandonedSpawnAttempts; var arr = new string[l.Count]; for (int i = 0; i < arr.Length; i++) arr[i] = l[i];
+            r.abandoned_spawn_attempts = arr;
+        }
+
+        // group-controlled spatial conditions + the participant-specific target building
+        var a = _manifest.assignments ?? (_manifest.assignments = new AssignmentsManifest());
+        ExperimentManager.Part2AssignmentInfo p2 = _experimentManager != null ? _experimentManager.Part2Assignment : null;
+        if (p2 != null) { a.part2_group_index = p2.GroupIndex; a.part2_start_point_id = p2.StartPointId; a.part2_teleport_point_id = p2.TeleportPointId; }
+        ExperimentManager.Part3AssignmentInfo p3 = _experimentManager != null ? _experimentManager.Part3Assignment : null;
+        if (p3 != null)
+        {
+            a.part3_group_index = p3.GroupIndex; a.part3_start_zone = p3.StartZone; a.part3_start_point_id = p3.StartPointId;
+            a.target_building_stream = RngStream.TargetBuilding.ToString();
+            a.target_building_derivation = "SeedDerivation.TargetBuildingSeed(effective_master_seed, \"" + RngConstants.TargetBuildingDomain + "\", participant_id, part3_group_index, region_id); candidates sorted ordinally by id; index = Range(0, n) from the first value of the stream";
+            a.destination1_region_id = p3.Destination1.RegionId; a.destination1_candidate_ids = p3.Destination1.CandidateIds; a.destination1_candidate_fingerprint = p3.Destination1.CandidateFingerprint;
+            a.destination1_selected_id = p3.Destination1.SelectedId; a.destination1_derived_seed = p3.Destination1.DerivedSeedHex;
+            a.destination2_region_id = p3.Destination2.RegionId; a.destination2_candidate_ids = p3.Destination2.CandidateIds; a.destination2_candidate_fingerprint = p3.Destination2.CandidateFingerprint;
+            a.destination2_selected_id = p3.Destination2.SelectedId; a.destination2_derived_seed = p3.Destination2.DerivedSeedHex;
+        }
+    }
+
     // NPC preparation block: the frozen settings + timestamps live in ExperimentManager.NpcPreparation; the live pool counters are refreshed here (a partial count while the pool is still being prepared).
     void FillNpcPreparation()
     {
@@ -2490,12 +2596,13 @@ public class DataCaptureManager : MonoBehaviour
             }
             _manifest.npc_preparation = prep;
         }
-        string entrance = (_spawner != null && _spawner.EntranceRngSeeded) ? ("seed=" + _spawner.EntranceRngSeed.ToString(System.Globalization.CultureInfo.InvariantCulture) + " (TickCount-based)") : "not_yet_created";
         _manifest.npc_random_sources =
-            "UnityEngine.Random: not seeded (Unity's own startup seed, not readable); entrance placement: private System.Random " + entrance +
-            "; Part 3 movement-strategy draw: private System.Random " + (_spawner != null ? "seed=" + _spawner.Part3MovementAssignmentSeedEffective.ToString(System.Globalization.CultureInfo.InvariantCulture) + " (draws=" + _spawner.Part3MovementDraws.ToString(System.Globalization.CultureInfo.InvariantCulture) + ")" : "not_available") +
-            "; AttractorDwell: one TickCount-seeded System.Random per instance. A fixed warm-up duration standardises the preparation period only; NPC trajectories are NOT identical across sessions " +
-            "and are not replayable.";
+            "Experiment RNG " + RngConstants.AlgorithmName + " v" + RngConstants.AlgorithmVersion + ", Master Seed " + MasterSeedFormat.ToHex(ExperimentRngManager.EffectiveMasterSeed) +
+            " (" + ExperimentRngManager.SeedSource + "): independent streams per random process and per NPC spawn (spawn placement, movement assignment, movement attributes, appearance, destination, wandering, " +
+            "attractor dwell, uncertainty, navigation nudge); UnityEngine.Random is not used by project code (third-party package code is outside this control). Part 3 movement assignment: first value of the " +
+            "NPC's own MovementAssignment stream (derived from the Master Seed alone)" +
+            ". A fixed warm-up duration standardises the preparation period only; NPC trajectories are NOT guaranteed identical across sessions (frame rate, NavMesh avoidance, update order).";
+        FillRngManifest();
     }
 
     // Acquisition block + the explicit writer-vs-acquisition split. Reads only; the lifecycle itself is driven by EyeTrackingLifecycleController.

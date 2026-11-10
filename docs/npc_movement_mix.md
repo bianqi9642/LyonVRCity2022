@@ -52,9 +52,17 @@ In every "no" row the selector's private stream is untouched: the first Part 3 s
 
 ### Randomness and reproducibility
 
-* The draw comes from a **private `System.Random`** owned by the selector. It never touches `UnityEngine.Random`, so route generation, wandering-point and attractor choice, dwell sampling and the Agent Profile rolls keep their sequences; Part 2 never calls it.
-* **Seed:** `part3MovementAssignmentSeed` (Inspector). `0` (default) derives a seed from the clock and the component id, as the existing entrance-placement stream does; any other value is used as is. The *effective* seed is written to the manifest (`spawner_part3_movement_assignment_seed`, and in `npc_random_sources`).
-* **Reproducibility:** the *i*-th draw of a stream is a function of the seed only, so the same seed gives the same sequence of draws (verified: the recorded `movement_mode` of real spawns equals the offline sequence exactly). Which NPC receives which draw still depends on spawn timing; a spawn attempt abandoned after the draw (no valid route that tick) consumes its draw. The rest of the simulation is not replayable (`UnityEngine.Random` is unseeded), as before.
+The assignment of the NPC with spawn index *i* is the **first value of its own `MovementAssignment` stream** of the experiment RNG (`docs/rng_system.md`): a pure
+function of (Master Seed, Part 3, *i*, probability). It never touches `UnityEngine.Random`, does not depend on spawn timing, on other NPCs or on other draws
+(route, appearance, hesitation), and the attractor sets are nested across probabilities. Part 1, Part 2, no running Part and `npcDirectedMovement = false`
+take no value at all.
+
+* **Seed:** `ExperimentManager.experimentRngMasterSeed` / `session_config.json` `experimentRngMasterSeed` (a 64-bit value written as exactly 16 hex digits: `0000000000000000` = a recorded
+  automatic seed per session, non-zero = fixed and shared; no numeric notation is accepted). The Master Seed is the **only** root of the Part 3 movement assignment: there is no separate
+  movement-assignment seed. The configuration and the effective seed are recorded (`rng` block, `setting_entries`).
+* **Reproducibility:** with a fixed seed the *i*-th spawn always has the same assignment. Which NPC is spawned when is not guaranteed identical (frame-quantised
+  spawn timing, caps), and abandoned attempts keep their index, so reconstruct from `npc_lifetimes.csv` `rng_part` / `rng_spawn_index`
+  (`docs/tools/npc_movement_mix.py` does this and reports mismatches).
 
 ## 2. Accessory rule
 
@@ -68,7 +76,7 @@ In this project the accessory is the **wristband** (`AppearanceController.access
 | Part 3 | attractor | the profile's `accessoriesOptions`, exactly as before (0 % none, 50 % half, 100 % all, several options keep their weights and colour alternatives) |
 | none / unknown / no ExperimentManager | any | normal Agent Profile selection (never assumes Part 3) |
 
-How it is enforced: after the strategy is chosen, `SpawnAgent()` passes `suppressAccessory = (RunningPartName == "Part3" && mode == Part2WanderingItinerary)` (`SpawnerManager.ShouldSuppressAccessory`; wandering alone is not evidence of Part 3, and an unknown / empty Part never gets the rule) through `AgentFactory.ApplyProfileToInstance` to `AppearanceController.ApplyProfile(profile, suppressAccessory: true)`. That call **does not draw** an accessory option (no `UnityEngine.Random` value is used for it) and empties the accessory renderer exactly as the normal path does before a draw (no mesh, null materials), so a pooled object cannot keep the previous lifetime's wristband. The profile is the one already selected for the spawn; it is not re-selected. Every other profile roll (gender, clothes, speed, uncertainty) is untouched. **Random-stream side effect (accepted):** skipping the accessory draw means a suppressed NPC consumes fewer values from the global `UnityEngine.Random` than an unsuppressed one, so later global draws (routes, dwell, other appearance parts) land on different values than they would have. Nothing in the project seeds `UnityEngine.Random` (`Random.InitState` is not called), so no reproducible sequence existed to disturb, and every draw keeps its distribution. A dedicated accessory stream would have changed how Part 2 consumes randomness, so it was not introduced; the movement-strategy stream remains the private `System.Random`. Part 2 calls the unchanged path, so its accessory assignment is identical to before; a Part 3 → Part 2 reuse re-draws from the profile (and, for a profile without accessory options, restores the prefab's own accessory that a suppressed lifetime had cleared).
+How it is enforced: after the strategy is chosen, `SpawnAgent()` passes `suppressAccessory = (RunningPartName == "Part3" && mode == Part2WanderingItinerary)` (`SpawnerManager.ShouldSuppressAccessory`; wandering alone is not evidence of Part 3, and an unknown / empty Part never gets the rule) through `AgentFactory.ApplyProfileToInstance` to `AppearanceController.ApplyProfile(profile, suppressAccessory: true)`. That call **does not draw** an accessory option (no value is drawn from the NPC's Appearance stream for it) and empties the accessory renderer exactly as the normal path does before a draw (no mesh, null materials), so a pooled object cannot keep the previous lifetime's wristband. The profile is the one already selected for the spawn; it is not re-selected. Every other profile roll (gender, clothes, speed, uncertainty) is untouched. **Random streams:** a suppressed NPC simply skips its accessory values; they belong to that NPC's own `Appearance` stream (`docs/rng_system.md`), so no other NPC, stream or later draw is shifted. Part 2 calls the unchanged path, so its accessory assignment is identical to before; a Part 3 → Part 2 reuse re-draws from the profile (and, for a profile without accessory options, restores the prefab's own accessory that a suppressed lifetime had cleared).
 
 | Pool transition (previous lifetime → new lifetime) | Result |
 |---|---|
@@ -114,14 +122,15 @@ Production profile (`Assets/VRExp/Agent Profile.asset`, the only profile asset):
 
 Part 2 and Part 3 may still differ in their overall accessory counts if their Agent Profile mixtures differ; the rule matches them per profile and does not change profile allocation.
 
-**Side effect on `UnityEngine.Random`:** none beyond what already existed - the adjustment draws nothing; Part 3 wandering suppression still skips the accessory draw (see section 2).
+**Random-stream effect:** the adjustment draws nothing. A suppressed (Part 3 wandering) NPC skips its accessory draws, but those come from the NPC's own Appearance stream, so no other NPC or process shifts.
 
 ## 3. Recorded data
 
 | What | Where | Notes |
 |---|---|---|
 | Configured probability | `session_manifest.json` → `setting_entries[spawner_part3_attractor_movement_probability]` (source `INSPECTOR`) | the only key describing this setting; it also feeds the Part 2 accessory weights (via `a_eff`, section 2b) |
-| Effective seed | `setting_entries[spawner_part3_movement_assignment_seed]`, `npc_random_sources` | |
+| Master Seed / RNG record | `session_manifest.json` `rng` block, `setting_entries[experiment_rng_master_seed_configured / _effective]`, `npc_random_sources` | see `docs/rng_system.md` |
+| Stream key of each NPC | `npc_lifetimes.csv` `rng_part`, `rng_spawn_index` | with the effective Master Seed these reconstruct all of the NPC's streams |
 | Strategy of each spawn | `npc_lifetimes.csv` `movement_mode` | already existed (column 21) |
 | Accessory of each spawn | `npc_lifetimes.csv` `app_accessories_option` / `app_accessories_mesh` / `app_accessories_materials` | already existed; mesh non-blank = wears it; option `-3` = suppressed by the Part 3 wandering rule |
 | Agent Profile | `npc_lifetimes.csv` `profile_name`, `profile_content_hash` (full profile in `npc_profiles.csv`) | the profile's accessory weights are in its snapshot |

@@ -92,7 +92,7 @@ public class AppearanceController : MonoBehaviour
     /// <summary>Full form: forced gender and the Part 3 accessory switch (see <see cref="ApplyProfile(AgentProfile, bool)"/>).</summary>
     public void ApplyProfile(AgentProfile profile, AgentGender gender, bool suppressAccessory)
     {
-        ApplyProfileCore(profile, gender, suppressAccessory, 1f);
+        ApplyProfileCore(profile, gender, suppressAccessory, 1f, ExperimentRngManager.UnassignedNpcRng.Appearance);
     }
 
     /// <summary>
@@ -103,13 +103,24 @@ public class AppearanceController : MonoBehaviour
     public void ApplyProfile(AgentProfile profile, bool suppressAccessory, float accessoryWeightScale)
     {
         if (profile == null) return;
-        ApplyProfileCore(profile, profile.ChooseGender(), suppressAccessory, accessoryWeightScale);
+        ApplyProfile(profile, suppressAccessory, accessoryWeightScale, null);
+    }
+
+    /// <summary>
+    /// As above, drawing EVERY appearance random value (gender, option choices, material choices, accessory) from appearanceRng, the NPC's own Appearance stream of the
+    /// experiment RNG. null = the shared "unassigned" Appearance stream (deterministic, never UnityEngine.Random).
+    /// </summary>
+    public void ApplyProfile(AgentProfile profile, bool suppressAccessory, float accessoryWeightScale, Pcg32 appearanceRng)
+    {
+        if (profile == null) return;
+        Pcg32 rng = appearanceRng ?? ExperimentRngManager.UnassignedNpcRng.Appearance;
+        ApplyProfileCore(profile, profile.ChooseGender(rng), suppressAccessory, accessoryWeightScale, rng);
     }
 
     /// <summary>Observation only: the accessory weight scale used by the most recent ApplyProfile call (1 = the profile's own weights).</summary>
     public float LastAccessoryWeightScale { get; private set; } = 1f;
 
-    private void ApplyProfileCore(AgentProfile profile, AgentGender gender, bool suppressAccessory, float accessoryWeightScale)
+    private void ApplyProfileCore(AgentProfile profile, AgentGender gender, bool suppressAccessory, float accessoryWeightScale, Pcg32 rng)
     {
         if (profile == null) return;
 
@@ -119,14 +130,14 @@ public class AppearanceController : MonoBehaviour
         LastAccessoryWeightScale = suppressAccessory ? 1f : scale;
 
         var applied = new AppliedAppearance { appliedTAbs = CaptureClock.TAbs, gender = gender };
-        applied.body        = ApplyPart(profile, profile.bodyOptions,        bodyRenderer,        CurrentGender);
-        applied.hair        = ApplyPart(profile, profile.hairOptions,        hairRenderer,        CurrentGender);
-        applied.top         = ApplyPart(profile, profile.topOptions,         topRenderer,         CurrentGender);
-        applied.bottom      = ApplyPart(profile, profile.bottomOptions,      bottomRenderer,      CurrentGender);
-        applied.shoes       = ApplyPart(profile, profile.shoesOptions,       shoesRenderer,       CurrentGender);
+        applied.body        = ApplyPart(profile, profile.bodyOptions,        bodyRenderer,        CurrentGender, rng);
+        applied.hair        = ApplyPart(profile, profile.hairOptions,        hairRenderer,        CurrentGender, rng);
+        applied.top         = ApplyPart(profile, profile.topOptions,         topRenderer,         CurrentGender, rng);
+        applied.bottom      = ApplyPart(profile, profile.bottomOptions,      bottomRenderer,      CurrentGender, rng);
+        applied.shoes       = ApplyPart(profile, profile.shoesOptions,       shoesRenderer,       CurrentGender, rng);
         applied.accessories = suppressAccessory
             ? SuppressAccessory()
-            : ApplyPart(profile, scale < 1f ? AccessoryWeightAdjuster.GetOptions(profile, scale) : profile.accessoriesOptions, accessoriesRenderer, CurrentGender, isAccessory: true);
+            : ApplyPart(profile, scale < 1f ? AccessoryWeightAdjuster.GetOptions(profile, scale) : profile.accessoriesOptions, accessoriesRenderer, CurrentGender, rng, isAccessory: true);
         LastApplied = applied;
 
         if (enableDebugLogs && accessoriesRenderer != null)
@@ -170,7 +181,7 @@ public class AppearanceController : MonoBehaviour
     /// colour ALTERNATIVES) and assigned to every slot as a shared asset, so the bracelet is a single colour and no per-NPC material instance is made.
     /// </summary>
     private AppliedPartRecord ApplyPart(AgentProfile profile, AgentProfile.PartOption[] options,
-                           SkinnedMeshRenderer renderer, AgentGender gender, bool isAccessory = false)
+                           SkinnedMeshRenderer renderer, AgentGender gender, Pcg32 rng, bool isAccessory = false)
     {
         var record = new AppliedPartRecord();   // observation only: nothing below depends on it
         if (renderer == null) return record;
@@ -201,7 +212,7 @@ public class AppearanceController : MonoBehaviour
             record.materials = renderer.sharedMaterials;
         }
 
-        var chosen = profile.ChooseWeightedOption(options, gender);
+        var chosen = profile.ChooseWeightedOption(options, gender, rng);
         record.optionIndex = chosen == null ? -1 : System.Array.IndexOf(options, chosen);
 
         if (chosen == null)
@@ -238,10 +249,10 @@ public class AppearanceController : MonoBehaviour
 
             Material[] newMats = new Material[slotCount];
             record.materialIndices = new int[slotCount];
-            int accessoryDraw = isAccessory ? Random.Range(0, chosen.materials.Length) : -1;   // ONE draw for the whole bracelet
+            int accessoryDraw = isAccessory ? rng.Range(0, chosen.materials.Length) : -1;   // ONE draw for the whole bracelet
             for (int s = 0; s < slotCount; s++)
             {
-                int matIndex = isAccessory ? accessoryDraw : Random.Range(0, chosen.materials.Length);
+                int matIndex = isAccessory ? accessoryDraw : rng.Range(0, chosen.materials.Length);
                 record.materialIndices[s] = matIndex;
                 Material baseMat = chosen.materials[matIndex];
 

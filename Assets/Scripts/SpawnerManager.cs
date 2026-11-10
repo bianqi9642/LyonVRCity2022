@@ -27,10 +27,14 @@
 // PART 3 MOVEMENT MIX  (part3AttractorMovementProbability, default 1 = all attractor = the behaviour before the mix existed)
 //   In Part 3 each NPC gets ONE of the two modes above for its whole lifetime. The choice is an independent Bernoulli trial per spawn
 //   (Part3MovementStrategySelector): attractor with the configured probability a, wandering otherwise. Nothing about the live population or the history is
-//   consulted, nothing is balanced and no NPC is ever reassigned, so the realised share fluctuates around a. The draw uses a PRIVATE System.Random (seed =
-//   part3MovementAssignmentSeed, or clock-derived and recorded in the manifest), so UnityEngine.Random (routes, dwell, appearance) keeps its sequence, and
-//   Part 1, Part 2, no running Part and an unknown Part never draw (the selector runs only while RunningPartName is exactly "Part3" with npcDirectedMovement on). DecideMovementMode() is the only place the mode is chosen; the choice is recorded per lifetime by DataCaptureManager
-//   (npc_lifetimes.csv 'movement_mode') and the configured probability + effective seed in the manifest (setting_entries).
+//   consulted, nothing is balanced and no NPC is ever reassigned, so the realised share fluctuates around a. The value is the FIRST value of the NPC's own MovementAssignment
+//   stream of the experiment RNG (ExperimentRngManager, docs/rng_system.md): a pure function of (Master Seed, Part 3, spawn index, probability); the Master Seed is the
+//   only root (no separate movement-assignment seed exists). Part 1, Part 2, no running Part and an unknown Part never take a value (the selector
+//   runs only while RunningPartName is exactly "Part3" with npcDirectedMovement on). DecideMovementMode() is the only place the mode is chosen; the choice is recorded per lifetime by DataCaptureManager
+//   (npc_lifetimes.csv 'movement_mode', 'rng_part', 'rng_spawn_index') and the configured probability + the RNG record in the manifest (setting_entries, 'rng').
+//
+// RANDOMNESS: every random decision of this class draws from the experiment RNG - per-NPC streams (SpawnPlacement, MovementAttributes, Destination, Wandering; the NPC's index is taken
+//   in SpawnAgent BEFORE the first draw and abandoned attempts keep theirs) or, for pool preparation, the Part-None SpawnPlacement stream. UnityEngine.Random and System.Random are not used.
 //   ACCESSORY RULE (explicit Part 3 only): when ExperimentManager.RunningPartName is exactly "Part3" AND the NPC's mode is the wandering itinerary, it never wears
 //   the accessory (wristband): AppearanceController.ApplyProfile(..., suppressAccessory: true) clears it on every spawn. No running Part / Part 1 / Part 2 use the
 //   normal profile selection. The suppression clears it on every spawn, so a pooled object cannot keep the previous lifetime's. An attractor NPC uses the Agent Profile's existing accessoriesOptions unchanged.
@@ -135,10 +139,6 @@ public class SpawnerManager : MonoBehaviour
              "affects only NPCs spawned afterwards. Wandering NPCs in Part 3 never wear the accessory. Part 2 MOVEMENT ignores this setting, but Part 2 ACCESSORY weights are scaled by it (wristband weights x the effective value, remainder to None; 0 when Part 3 directed movement is off) so Part 2 matches the overall Part 3 accessory distribution. Out-of-range values are clamped to 0..1.")]
     [Range(0f, 1f)]
     public float part3AttractorMovementProbability = Part3MovementStrategySelector.DefaultAttractorProbability;
-
-    [Tooltip("Seed of the private random stream that draws the Part 3 movement strategies. 0 = derive a seed from the clock (different every session; the " +
-             "effective seed is written to the session manifest). Any other value makes the sequence of draws reproducible.")]
-    public int part3MovementAssignmentSeed = 0;
 
     [Header("Part 2 Itinerary Stops (Wandering Points)")]
     [Tooltip("Predefined, experimenter-placed Transforms used ONLY as the intermediate stops of Part 2 " +
@@ -277,9 +277,24 @@ public class SpawnerManager : MonoBehaviour
 
     // Part 3 movement mix: the private random stream and the cumulative assignment counts (see Part3MovementStrategySelector). Created on first use.
     private Part3MovementStrategySelector movementSelector;
-    private Part3MovementStrategySelector MovementSelector =>
-        movementSelector ?? (movementSelector = new Part3MovementStrategySelector(
-            Part3MovementStrategySelector.ResolveSeed(part3MovementAssignmentSeed, GetInstanceID())));
+    private Part3MovementStrategySelector MovementSelector => movementSelector ?? (movementSelector = new Part3MovementStrategySelector());
+
+    // Stable spawn index of the NEXT spawn attempt within the running Part (see SpawnAgent: assigned before the first random draw of the attempt; reset by ResetForNewPart).
+    private long spawnAttemptIndex = 0;
+
+    // Spawn attempts that consumed an index but produced no NPC, with the reason ("Part3:12:no_valid_route"), so a gap in rng_spawn_index is explained. Capped (the counter keeps counting); no per-draw logging.
+    private readonly List<string> abandonedSpawnAttempts = new List<string>();
+    private long abandonedSpawnAttemptCount = 0;
+    private const int k_MaxRecordedAbandonedAttempts = 500;
+    /// <summary>Total spawn attempts that consumed a spawn index without creating an NPC (all Parts of this run).</summary>
+    public long AbandonedSpawnAttemptCount => abandonedSpawnAttemptCount;
+    /// <summary>The first recorded abandoned attempts as "Part:index:reason" (capped at 500).</summary>
+    public IReadOnlyList<string> AbandonedSpawnAttempts => abandonedSpawnAttempts;
+    private void NoteAbandonedAttempt(RngPart part, long index, string reason)
+    {
+        abandonedSpawnAttemptCount++;
+        if (abandonedSpawnAttempts.Count < k_MaxRecordedAbandonedAttempts) abandonedSpawnAttempts.Add(part + ":" + index.ToString(System.Globalization.CultureInfo.InvariantCulture) + ":" + reason);
+    }
 
     // Population accounting: 'liveAgents' counts spawned-and-not-yet-finished NPCs (the maxAgents cap);
     // 'activeAgents' is the same set as GameObjects, so trial-state pause/resume/despawn can act on them as a group.
@@ -307,17 +322,11 @@ public class SpawnerManager : MonoBehaviour
     private bool npcBehaviourPaused = false;
     private int npcPauseHeldCount = 0;
 
-    /// <summary>The seed of the private entrance-placement RNG (TickCount-based; recorded for provenance, not for replay - UnityEngine.Random is not seeded).</summary>
-    public int EntranceRngSeed { get; private set; }
-    public bool EntranceRngSeeded { get; private set; }
-
     // Reused buffer for BuildWanderingItinerary()'s leg reachability checks (created lazily on first use).
     private NavMeshPath routeCheckPath;
     private float nextRouteWarnTime = 0f;
 
-    // Entrance spawn distribution (see TryFindEntranceSpawnPosition). A private System.Random is used so the
-    // UnityEngine.Random sequence that drives route generation is never perturbed (same approach as AttractorDwell).
-    private System.Random entranceRng;
+    // Entrance spawn distribution (see TryFindEntranceSpawnPosition): drawn from the spawning NPC's own SpawnPlacement stream (experiment RNG).
     private readonly List<Vector3> entranceNeighbourBuffer = new List<Vector3>(64);
     private Vector3[] entranceCornerBuffer;
     private const float k_EntranceClearanceMargin = 0.1f;     // added to 2 x runtime agent radius
@@ -346,12 +355,12 @@ public class SpawnerManager : MonoBehaviour
 
     /// <summary>The configured Part 3 attractor probability as the selector uses it (clamped to 0..1; NaN -> 1).</summary>
     public float Part3AttractorMovementProbability => Part3MovementStrategySelector.SanitizeProbability(part3AttractorMovementProbability);
-    /// <summary>The effective seed of the Part 3 movement-strategy stream (explicit, or clock-derived on first use); recorded in the manifest.</summary>
-    public int Part3MovementAssignmentSeedEffective => MovementSelector.Seed;
+    /// <summary>The spawn index the next spawn attempt of the running Part will receive (0 right after a Part's NPC lifecycle began).</summary>
+    public long NextSpawnIndex => spawnAttemptIndex;
     /// <summary>Cumulative strategy assignments made by the Part 3 draw since the Part's NPC lifecycle began (spawns of an NPC-enabled Part 3 only).</summary>
     public long AssignedAttractorMovementTotal => movementSelector != null ? movementSelector.AssignedAttractor : 0;
     public long AssignedWanderingMovementTotal => movementSelector != null ? movementSelector.AssignedWandering : 0;
-    /// <summary>Random values drawn from the Part 3 movement stream so far (one per decision; Part 2 never draws).</summary>
+    /// <summary>Movement-assignment values taken so far (one per Part 3 decision; Part 1, Part 2, no Part and directed-movement-off never take one).</summary>
     public long Part3MovementDraws => movementSelector != null ? movementSelector.Draws : 0;
 
     /// <summary>True once the NavMesh wait and the pool prewarm finished and the spawn loop has been started (or immediately when pooling is off).</summary>
@@ -529,7 +538,7 @@ public class SpawnerManager : MonoBehaviour
     // (IsExplicitPart3Running) and step 1 selected attractor movement: ONE independent draw from the private Part 3 stream decides attractor (probability a) or
     // wandering (1 - a) for this NPC. Part 1, Part 2, no running Part, an unknown Part or no ExperimentManager NEVER call the selector (no draw, stream untouched)
     // and Part 3 with npcDirectedMovement = false is all wandering without a draw. 'mixApplied' tells the caller a draw was made (so the assignment is counted).
-    private NpcMovementMode DecideMovementMode(out bool mixApplied)
+    private NpcMovementMode DecideMovementMode(NpcRngSet rng, out bool mixApplied)
     {
         mixApplied = false;
         NpcMovementMode partMode = ActiveMovementMode();
@@ -537,7 +546,7 @@ public class SpawnerManager : MonoBehaviour
             return partMode;
 
         mixApplied = true;
-        return MovementSelector.Choose(part3AttractorMovementProbability);
+        return MovementSelector.Choose(rng, part3AttractorMovementProbability);
     }
 
     // True only while ExperimentManager explicitly reports Part 3 as the running Part (RunningPartName == "Part3"). No ExperimentManager, no running Part
@@ -732,7 +741,8 @@ public class SpawnerManager : MonoBehaviour
         ReleaseNpcBehaviourPause("new_part");   // frozen NPCs never stay frozen into the next Part / Session
         endPanelActive = false;
         simulationActive = false;   // re-opened by BeginNpcSimulation() if the new Part has NPCs enabled
-        if (movementSelector != null) movementSelector.ResetCounts();   // the cumulative assignment counts are per Part; the random stream continues
+        spawnAttemptIndex = 0;   // spawn indices count from 0 in every Part (the streams are keyed by Part as well)
+        if (movementSelector != null) movementSelector.ResetCounts();   // the cumulative assignment counts are per Part
         if (enableDebugLogs) Debug.Log("[SpawnerManager] New Part starting -> End-Panel hard stop cleared.");
     }
 
@@ -954,6 +964,9 @@ public class SpawnerManager : MonoBehaviour
         }
     }
 
+    // Pool preparation (before any Part): its placement jitter and NavMesh probing draw from the Part-None SpawnPlacement stream, which no NPC stream shares.
+    private static Pcg32 PoolRng() { return ExperimentRngManager.GetPartStream(RngPart.None, RngStream.SpawnPlacement); }
+
     // Sampling origin for pool initialisation: prefer the user-provided startTransform, then the first entrance,
     // otherwise world origin.
     private Vector3 PoolSampleOrigin()
@@ -975,7 +988,7 @@ public class SpawnerManager : MonoBehaviour
 
         while (Time.time - start < navmeshWaitTimeout)
         {
-            Vector3 s = SampleNavMeshNear(sampleOrigin, spawnSampleRadius, spawnSampleMaxAttempts);
+            Vector3 s = SampleNavMeshNear(sampleOrigin, spawnSampleRadius, spawnSampleMaxAttempts, PoolRng());
             if (s != Vector3.zero)
             {
                 navAvailable = true;
@@ -987,7 +1000,7 @@ public class SpawnerManager : MonoBehaviour
                 foreach (var e in entrances)
                 {
                     if (e == null) continue;
-                    Vector3 ss = SampleNavMeshNear(e.position, spawnSampleRadius, 2);
+                    Vector3 ss = SampleNavMeshNear(e.position, spawnSampleRadius, 2, PoolRng());
                     if (ss != Vector3.zero)
                     {
                         navAvailable = true;
@@ -1023,12 +1036,13 @@ public class SpawnerManager : MonoBehaviour
         for (int i = 0; i < poolPrewarm; i++)
         {
             // instantiate the prefab (Awake will run here)
-            GameObject go = Instantiate(agentPrefab, sampleOrigin + Random.insideUnitSphere * 0.5f, Quaternion.identity);
+            float jx, jy, jz; PoolRng().InsideUnitSphere(out jx, out jy, out jz);
+            GameObject go = Instantiate(agentPrefab, sampleOrigin + new Vector3(jx, jy, jz) * 0.5f, Quaternion.identity);
             double createdTAbs = CaptureClock.TAbs;
             long createdTUnix = CaptureClock.TUnixMs;
 
             // attempt to place on NavMesh near sampleOrigin using improved sampling
-            Vector3 navPos = SampleNavMeshNear(sampleOrigin, sampleRadius, spawnSampleMaxAttempts);
+            Vector3 navPos = SampleNavMeshNear(sampleOrigin, sampleRadius, spawnSampleMaxAttempts, PoolRng());
             NavMeshAgent nav = go.GetComponent<NavMeshAgent>();
 
             bool placedOnNav = false;
@@ -1130,12 +1144,20 @@ public class SpawnerManager : MonoBehaviour
         if (!HasSpawnPrerequisites())
             return;
 
+        // 0. STABLE SPAWN INDEX + the NPC's own random streams ------------------------------------------------
+        // The index is taken BEFORE the first random draw of this attempt. An attempt that is abandoned later (no valid route this tick, no pooled object) keeps its index,
+        // so the next attempt gets a different one (a retry must not repeat a failing route); the index counts attempts of the running Part only, from 0 after ResetForNewPart.
+        // Every random decision of this NPC then draws from ITS streams: another NPC's draws can never shift them.
+        RngPart rngPart = ExperimentRngManager.PartFromName(experimentManager != null ? experimentManager.RunningPartName : "");
+        long spawnIndex = spawnAttemptIndex++;
+        NpcRngSet rng = ExperimentRngManager.CreateNpcRng(rngPart, spawnIndex);
+
         // 1. DECIDE -------------------------------------------------------------------------------------------
         int entranceIndex;
-        Transform chosenEntrance = ChooseEntrance(out entranceIndex);
-        Vector3 spawnPos = ResolveSpawnPosition(chosenEntrance);
+        Transform chosenEntrance = ChooseEntrance(out entranceIndex, rng.SpawnPlacement);
+        Vector3 spawnPos = ResolveSpawnPosition(chosenEntrance, rng.SpawnPlacement);
         bool mixApplied;
-        NpcMovementMode mode = DecideMovementMode(out mixApplied);
+        NpcMovementMode mode = DecideMovementMode(rng, out mixApplied);
         // Part 3 accessory rule: explicit Part 3 running AND wandering strategy => no accessory (decided here and applied with the profile below).
         bool suppressAccessory = ShouldSuppressAccessory(mode);
         float accessoryWeightScale = AccessoryWeightScaleForSpawn();   // < 1 only in Part 2 (accessory distribution matching)
@@ -1143,24 +1165,31 @@ public class SpawnerManager : MonoBehaviour
         // Part 3 only: attractor dwell time, drawn once per NPC (before the route) and reused for each of its
         // attractor visits. Entrances and exits never dwell.
         float dwell = (mode == NpcMovementMode.Part3AttractorItinerary)
-            ? Random.Range(dwellTimeSec.x, dwellTimeSec.y)
+            ? rng.MovementAttributes.Range(dwellTimeSec.x, dwellTimeSec.y)
             : 0f;
 
-        List<Transform> itinerary = BuildItinerary(mode, chosenEntrance);
+        List<Transform> itinerary = BuildItinerary(mode, chosenEntrance, rng);
         if (itinerary == null)
+        {
+            NoteAbandonedAttempt(rngPart, spawnIndex, "no_valid_route");
             return; // no valid route this tick (already reported)
+        }
 
         // 2. ACQUIRE ------------------------------------------------------------------------------------------
         bool reused = usePooling && pool.Count > 0;
         double acquireTAbs = CaptureClock.TAbs;
         GameObject go = reused ? TakeFromPool(spawnPos) : InstantiateNewAgent(spawnPos);
         if (go == null)
+        {
+            NoteAbandonedAttempt(rngPart, spawnIndex, "pool_or_instantiate_failed");
             return;
+        }
 
         PedestrianAgent agentScript = go.GetComponent<PedestrianAgent>();
         RecordPoolAcquired(agentScript, reused, acquireTAbs);
+        agentScript.AssignRng(rng);   // before the profile roll and before anything of this lifetime can draw
 
-        ApplyAgentProfile(go, suppressAccessory, accessoryWeightScale);
+        ApplyAgentProfile(go, suppressAccessory, accessoryWeightScale, rng);
         BindMoverToAgent(go);
 
         if (reused)
@@ -1194,19 +1223,19 @@ public class SpawnerManager : MonoBehaviour
 
     // Chooses a random entrance. The SAME draw serves both modes: it becomes itinerary[0] of the route (in Part 3 the
     // first waypoint, in Part 2 the placement point). Returns null (index -1) if no entrances are configured.
-    private Transform ChooseEntrance(out int entranceIndex)
+    private Transform ChooseEntrance(out int entranceIndex, Pcg32 rng)
     {
         entranceIndex = -1;
         if (entrances == null || entrances.Length == 0)
             return null;
 
-        entranceIndex = Random.Range(0, entrances.Length);
+        entranceIndex = rng.Range(0, entrances.Length);
         return entrances[entranceIndex];
     }
 
     // The physical spawn position: NavMesh-sampled around startTransform (priority) or, failing that, around the
     // chosen entrance (legacy behaviour). Identical for both movement modes.
-    private Vector3 ResolveSpawnPosition(Transform chosenEntrance)
+    private Vector3 ResolveSpawnPosition(Transform chosenEntrance, Pcg32 rng)
     {
         Vector3 samplingOrigin = Vector3.zero;
         if (startTransform != null)
@@ -1215,7 +1244,7 @@ public class SpawnerManager : MonoBehaviour
             samplingOrigin = chosenEntrance.position;
 
         // sample NavMesh near sampling origin using improved sampling
-        Vector3 spawnPos = SampleNavMeshNear(samplingOrigin, spawnSampleRadius, spawnSampleMaxAttempts);
+        Vector3 spawnPos = SampleNavMeshNear(samplingOrigin, spawnSampleRadius, spawnSampleMaxAttempts, rng);
         if (spawnPos == Vector3.zero)
         {
             // defensive fallback: place at samplingOrigin rather than return and leave a stray prefab instanced later
@@ -1259,6 +1288,13 @@ public class SpawnerManager : MonoBehaviour
     /// </summary>
     public bool TryFindEntranceSpawnPosition(Transform entrance, GameObject self, out Vector3 position)
     {
+        PedestrianAgent owner = self != null ? self.GetComponent<PedestrianAgent>() : null;
+        return TryFindEntranceSpawnPosition(entrance, self, out position, (owner != null ? owner.Rng : ExperimentRngManager.UnassignedNpcRng).SpawnPlacement);
+    }
+
+    /// <summary>As above, drawing the candidate points from the given stream (the placed NPC's SpawnPlacement stream).</summary>
+    public bool TryFindEntranceSpawnPosition(Transform entrance, GameObject self, out Vector3 position, Pcg32 entranceRng)
+    {
         position = entrance != null ? entrance.position : Vector3.zero;
         if (entrance == null || entranceSpawnRadius <= 0f)
             return false;
@@ -1293,13 +1329,6 @@ public class SpawnerManager : MonoBehaviour
         bool hasBase = NavMesh.SamplePosition(origin, out baseHit, k_EntranceBaseSampleDistance, NavMesh.AllAreas);
         float sampleY = hasBase ? baseHit.position.y : origin.y;
 
-        if (entranceRng == null)
-        {
-            EntranceRngSeed = unchecked(System.Environment.TickCount * 397) ^ GetInstanceID();
-            EntranceRngSeeded = true;
-            entranceRng = new System.Random(EntranceRngSeed);
-        }
-
         int attempts = Mathf.Max(1, entranceSpawnMaxAttempts);
         bool found = false, clear = false;
         Vector3 best = origin;
@@ -1311,8 +1340,8 @@ public class SpawnerManager : MonoBehaviour
             used++;
 
             // 2. Area-uniform random point in the horizontal disc, snapped to the NavMesh.
-            float angle = (float)(entranceRng.NextDouble() * 6.283185307179586);
-            float r = radius * Mathf.Sqrt((float)entranceRng.NextDouble());
+            float angle = entranceRng.NextFloat() * 6.28318530717959f;
+            float r = radius * Mathf.Sqrt(entranceRng.NextFloat());
             Vector3 probe = new Vector3(origin.x + Mathf.Cos(angle) * r, sampleY, origin.z + Mathf.Sin(angle) * r);
 
             NavMeshHit hit;
@@ -1414,7 +1443,7 @@ public class SpawnerManager : MonoBehaviour
     /// Improved NavMesh sampling routine: random horizontal offsets around 'origin', projected onto the ground, then
     /// sampled onto the NavMesh at several vertical offsets. Returns Vector3.zero if nothing was found.
     /// </summary>
-    Vector3 SampleNavMeshNear(Vector3 origin, float radius, int attempts)
+    Vector3 SampleNavMeshNear(Vector3 origin, float radius, int attempts, Pcg32 rng)
     {
         NavMeshHit navHit;
 
@@ -1425,7 +1454,8 @@ public class SpawnerManager : MonoBehaviour
         for (int i = 0; i < attempts; i++)
         {
             // Sample a random point on the horizontal plane around the origin.
-            Vector2 r2 = Random.insideUnitCircle * radius;
+            float cx, cy; rng.InsideUnitCircle(out cx, out cy);
+            Vector2 r2 = new Vector2(cx, cy) * radius;
             Vector3 candidate = new Vector3(origin.x + r2.x, origin.y, origin.z + r2.y);
 
             // 1) Try to project the candidate down onto geometry (if colliders exist).
@@ -1526,11 +1556,11 @@ public class SpawnerManager : MonoBehaviour
     // Builds the route for the given mode, or returns null when no valid route could be produced this tick.
     // In both modes list[0] is the placement point (the entrance), the LAST entry is the exit, and the list is
     // handed to PedestrianAgent unchanged for the NPC's whole life.
-    private List<Transform> BuildItinerary(NpcMovementMode mode, Transform entrance)
+    private List<Transform> BuildItinerary(NpcMovementMode mode, Transform entrance, NpcRngSet rng)
     {
         return mode == NpcMovementMode.Part2WanderingItinerary
-            ? BuildWanderingItinerary(entrance)
-            : BuildAttractorItinerary(entrance);
+            ? BuildWanderingItinerary(entrance, rng.Wandering)
+            : BuildAttractorItinerary(entrance, rng.Destination);
     }
 
     /// <summary>
@@ -1538,11 +1568,11 @@ public class SpawnerManager : MonoBehaviour
     /// The chosen 'entrance' is inserted as the first element so itinerary[0] is an entrance. Never reads
     /// wanderingPoints.
     /// </summary>
-    List<Transform> BuildAttractorItinerary(Transform entrance)
+    List<Transform> BuildAttractorItinerary(Transform entrance, Pcg32 rng)
     {
         List<Transform> list = new List<Transform>();
 
-        int num = Random.Range(minAttractorsPerAgent, maxAttractorsPerAgent + 1);
+        int num = rng.Range(minAttractorsPerAgent, maxAttractorsPerAgent + 1);
 
         if (attractors != null && attractors.Length > 0)
         {
@@ -1550,7 +1580,7 @@ public class SpawnerManager : MonoBehaviour
             for (int i = 0; i < attractors.Length; i++) indices.Add(i);
             for (int k = 0; k < num && indices.Count > 0; k++)
             {
-                int iSel = Random.Range(0, indices.Count);
+                int iSel = rng.Range(0, indices.Count);
                 int idx = indices[iSel];
                 indices.RemoveAt(iSel); // avoid visiting same attractor twice
                 if (attractors[idx] != null && attractors[idx].transform != null)
@@ -1561,7 +1591,7 @@ public class SpawnerManager : MonoBehaviour
         // finally pick an exit
         if (exits != null && exits.Length > 0)
         {
-            Transform exit = exits[Random.Range(0, exits.Length)];
+            Transform exit = exits[rng.Range(0, exits.Length)];
             list.Add(exit);
         }
 
@@ -1591,7 +1621,7 @@ public class SpawnerManager : MonoBehaviour
     /// Index 0 is the entrance (or startTransform if there are no entrances): the NPC is placed there instantly by
     /// PedestrianAgent, so no leg to it is validated.
     /// </summary>
-    List<Transform> BuildWanderingItinerary(Transform entrance)
+    List<Transform> BuildWanderingItinerary(Transform entrance, Pcg32 rng)
     {
         Transform origin = entrance != null ? entrance : startTransform;
         if (origin == null)
@@ -1607,14 +1637,14 @@ public class SpawnerManager : MonoBehaviour
 
         int lo = Mathf.Max(0, minWanderingPointsPerAgent);
         int hi = Mathf.Max(lo, maxWanderingPointsPerAgent);
-        int wanted = Mathf.Min(Random.Range(lo, hi + 1), candidates.Count);
+        int wanted = Mathf.Min(rng.Range(lo, hi + 1), candidates.Count);
 
         // 2. Ordered, distinct, leg-validated stops
         List<Transform> stops = new List<Transform>(wanted);
         Vector3 cursor = origin.position;
         while (stops.Count < wanted && candidates.Count > 0)
         {
-            int pick = Random.Range(0, candidates.Count);
+            int pick = rng.Range(0, candidates.Count);
             Transform candidate = candidates[pick];
             candidates.RemoveAt(pick); // each candidate is considered at most once -> bounded
 
@@ -1636,12 +1666,12 @@ public class SpawnerManager : MonoBehaviour
 
         if (hasExits)
         {
-            exit = PickReachableExit(cursor);
+            exit = PickReachableExit(cursor, rng);
             while (exit == null && stops.Count > 0)
             {
                 stops.RemoveAt(stops.Count - 1);
                 cursor = stops.Count > 0 ? stops[stops.Count - 1].position : origin.position;
-                exit = PickReachableExit(cursor);
+                exit = PickReachableExit(cursor, rng);
             }
 
             if (exit == null)
@@ -1672,7 +1702,7 @@ public class SpawnerManager : MonoBehaviour
     }
 
     // A random non-null exit reachable from 'from' (each exit tried at most once), or null.
-    private Transform PickReachableExit(Vector3 from)
+    private Transform PickReachableExit(Vector3 from, Pcg32 rng)
     {
         List<Transform> remaining = new List<Transform>(exits.Length);
         for (int i = 0; i < exits.Length; i++)
@@ -1680,7 +1710,7 @@ public class SpawnerManager : MonoBehaviour
 
         while (remaining.Count > 0)
         {
-            int pick = Random.Range(0, remaining.Count);
+            int pick = rng.Range(0, remaining.Count);
             Transform candidate = remaining[pick];
             remaining.RemoveAt(pick);
             if (IsLegReachable(from, candidate.position))
@@ -1833,12 +1863,12 @@ public class SpawnerManager : MonoBehaviour
 
     // Applies the default AgentProfile (appearance, speed, NavMeshAgent shape, UncertainBehavior roll) via the
     // factory; without a factory only the NavMeshAgent values are applied (best effort).
-    private void ApplyAgentProfile(GameObject go, bool suppressAccessory = false, float accessoryWeightScale = 1f)
+    private void ApplyAgentProfile(GameObject go, bool suppressAccessory = false, float accessoryWeightScale = 1f, NpcRngSet rng = null)
     {
         if (agentFactory != null && defaultProfile != null)
         {
             // We already instantiated/reused the GameObject, so use ApplyProfileToInstance (not a create method).
-            agentFactory.ApplyProfileToInstance(go, defaultProfile, suppressAccessory, accessoryWeightScale);
+            agentFactory.ApplyProfileToInstance(go, defaultProfile, suppressAccessory, accessoryWeightScale, rng);
         }
         else if (defaultProfile != null)
         {

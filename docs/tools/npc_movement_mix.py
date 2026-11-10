@@ -5,10 +5,14 @@ npc_movement_mix.py - offline summary of the Part 3 NPC movement strategy and of
 WHAT IT READS
   * session_manifest.json   setting_entries:
         spawner_part3_attractor_movement_probability   the CONFIGURED per-spawn probability that a new Part 3 NPC uses attractor movement
-        spawner_part3_movement_assignment_seed         the effective seed of the private random stream that drew the strategies
+        rng { rng_config_version, master_seed_representation, effective_master_seed, seed_source, seed_policy, rng_algorithm(_version), ... }   the experiment RNG record (docs/rng_system.md).
+                                                       Only rng_config_version 3 (unsigned 64-bit Master Seed as 16 lowercase hex digits) is supported; any other layout (earlier numeric
+                                                       32-bit seeds, versions 1 / 2, no version) is reported as an unsupported RNG manifest format and NOT reconstructed. Nothing is converted.
+                                                       The Master Seed is the only root of the Part 3 MovementAssignment stream: there is no separate movement-assignment seed.
         part3_npc_directed_movement                    true/false: Part 3's master switch. false = every Part 3 NPC wanders, so attractor NPCs cannot occur
         Manifests of sessions recorded with an earlier allocation design may carry an obsolete key; it is not read, never interpreted as a probability.
-  * npc_lifetimes.csv       one row per NPC lifetime: part, profile_name, profile_content_hash, movement_mode, app_accessories_option, app_accessories_mesh.
+  * npc_lifetimes.csv       one row per NPC lifetime: part, profile_name, profile_content_hash, movement_mode, app_accessories_option, app_accessories_mesh,
+                            rng_part, rng_spawn_index (experiment RNG sessions only).
         app_accessories_option: 0..n-1 = element chosen from the profile's accessory list (the last element of the production profile, 8, is the 'None' option);
         -3 = FORCED no accessory (Part 3 wandering NPC only); blank / -1 / -2 = not applicable.
   * npc_profiles.csv        profile_content_hash -> profile_json (the ORIGINAL accessory weights; the runtime Part 2 adjustment never modifies the profile).
@@ -22,7 +26,12 @@ THE RULE BEING CHECKED
   Observed rates are finite random samples and are NOT expected to equal the expectation exactly.
 
 WHAT IT REPORTS (descriptive; nothing is asserted against the configured value)
-  configured_semantics / configured_attractor_probability / effective_attractor_probability / part3_directed_movement / movement_assignment_seed
+  rng_recorded / rng_effective_master_seed (16 hex digits, always) / rng_seed_representation / rng_reconstructable / rng_reconstruction_note / rng_config_version / rng_seed_source / rng_seed_policy / rng_algorithm(_version)
+  movement_mode_reconstruction           {checked, mismatches, mismatch_ids}: every Part 3 row's movement_mode re-derived from (root seed, Part 3, rng_spawn_index, probability) with
+                                         docs/tools/experiment_rng.py; None when the data needed (RNG block, spawn indices, probability, directed movement on) is not recorded
+  target_building_reconstruction         per destination {region, seed_matches, selection_matches, selected_in_candidates}: the participant-specific target building re-derived from
+                                         (effective Master Seed, participant_id, Part 3 group index, region) and the recorded candidate ids; None when not recorded
+  configured_semantics / configured_attractor_probability / effective_attractor_probability / part3_directed_movement
   part3_attractor_spawns, part3_wandering_spawns, realised percentages, z_score_vs_configured (informational)
   profile_distribution (Part 3), attractor_accessory_rate, part3_attractor_accessory_distribution {element: count, pct}
   part3_wandering_forced_none_count (option -3), wandering_accessory_count / wandering_accessory_violations (Part 3 wandering NPCs that DO wear one: must be 0)
@@ -37,10 +46,13 @@ import csv
 import json
 import math
 import os
+import struct
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # python3 -I does not add the script directory
+import experiment_rng as xrng
+
 PROBABILITY_KEY = "spawner_part3_attractor_movement_probability"
-SEED_KEY = "spawner_part3_movement_assignment_seed"
 DIRECTED_KEY = "part3_npc_directed_movement"
 ATTRACTOR = "Part3AttractorItinerary"
 WANDERING = "Part2WanderingItinerary"
@@ -77,22 +89,90 @@ def _bool(text):
 
 
 def read_configuration(session_dir):
-    """(semantics, probability, seed, part3_directed) from the manifest. A session without the setting reports not_recorded and None."""
+    """(semantics, probability, part3_directed) from the manifest. A session without the setting reports not_recorded and None."""
     path = os.path.join(session_dir, "session_manifest.json")
     if not os.path.isfile(path):
-        return "not_recorded", None, None, None
+        return "not_recorded", None, None
     with open(path, encoding="utf-8") as f:
         manifest = json.load(f)
     probability = _float(_setting(manifest, PROBABILITY_KEY))
-    seed_text = _setting(manifest, SEED_KEY)
-    try:
-        seed = int(seed_text) if seed_text is not None else None
-    except ValueError:
-        seed = None
     directed = _bool(_setting(manifest, DIRECTED_KEY))
     if probability is not None:
-        return "per_spawn_probability", probability, seed, directed
-    return "not_recorded", None, seed, directed
+        return "per_spawn_probability", probability, directed
+    return "not_recorded", None, directed
+
+
+def read_rng(session_dir):
+    """The manifest 'rng' block as a dict, or None for a session recorded before the experiment RNG existed (nothing is invented)."""
+    path = os.path.join(session_dir, "session_manifest.json")
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        block = json.load(f).get("rng")
+    return block if isinstance(block, dict) and "effective_master_seed" in block else None
+
+
+def read_assignments(session_dir):
+    """(participant_id, assignments block) from the manifest; (None, None) when absent (sessions before the group-controlled assignment record)."""
+    path = os.path.join(session_dir, "session_manifest.json")
+    if not os.path.isfile(path):
+        return None, None
+    with open(path, encoding="utf-8") as f:
+        m = json.load(f)
+    a = m.get("assignments")
+    return m.get("participant_id"), (a if isinstance(a, dict) else None)
+
+
+def reconstruct_target_buildings(participant_id, assignments, rng_block):
+    """
+    Re-derive the participant-specific Part 3 target building of each destination from the recorded effective Master Seed, participant_id, group index and region (docs/tools/experiment_rng.py).
+    Seeds are compared as exact 16-digit hex strings / Python ints (never floats). Returns None when the data is not recorded.
+    """
+    info = xrng.manifest_master_seed(rng_block)
+    if not assignments or not info["reconstructable"] or not participant_id or assignments.get("part3_group_index", -1) < 0:
+        return None
+    out = {}
+    for d in ("destination1", "destination2"):
+        region = assignments.get(d + "_region_id") or ""
+        ids = assignments.get(d + "_candidate_ids") or []
+        if not region or not ids:
+            continue
+        selected, sorted_ids, seed_hex = xrng.choose_target_building(info["seed"], participant_id, assignments["part3_group_index"], region, ids)
+        recorded_seed = assignments.get(d + "_derived_seed") or ""
+        out[d] = {
+            "region": region,
+            "seed_matches": recorded_seed.lower() == seed_hex,
+            "selection_matches": assignments.get(d + "_selected_id") == selected,
+            "selected_in_candidates": assignments.get(d + "_selected_id") in ids,
+        }
+    return out or None
+
+
+def _f32(x):
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+def reconstruct_movement_modes(part3_rows, rng_block, probability, directed):
+    """Re-derive each Part 3 row's movement_mode. Returns None when not reconstructable (no RNG block, no probability, directed movement off, or no spawn indices)."""
+    info = xrng.manifest_master_seed(rng_block)
+    if not info["reconstructable"] or probability is None or directed is False:
+        return None
+    root = info["seed"]   # the Master Seed is the only root of the MovementAssignment stream
+    checked, mismatches = 0, []
+    for r in part3_rows:
+        if (r.get("rng_part") or "") != PART3:
+            continue
+        try:
+            idx = int(r.get("rng_spawn_index"))
+        except (TypeError, ValueError):
+            continue
+        if idx < 0:
+            continue
+        checked += 1
+        expected = xrng.predict_movement_mode(root, PART3, idx, _f32(probability))
+        if expected != r.get("movement_mode"):
+            mismatches.append(r.get("npc_spawn_instance_id", ""))
+    return {"checked": checked, "mismatches": len(mismatches), "mismatch_ids": mismatches} if checked else None
 
 
 def effective_probability(probability, directed):
@@ -211,8 +291,11 @@ def _pct_table(counts, n):
 # ---------------------------------------------------------------------------------------------------------------------------------- summary
 
 def summarize(session_dir):
-    semantics, probability, seed, directed = read_configuration(session_dir)
+    semantics, probability, directed = read_configuration(session_dir)
     a_eff = effective_probability(probability, directed)
+    rng_block = read_rng(session_dir)
+    seed_info = xrng.manifest_master_seed(rng_block)
+    participant_id, assignments = read_assignments(session_dir)
     all_rows, has_accessory_columns = read_lifetimes(session_dir)
     part3 = [r for r in all_rows if r.get("part") == PART3 and r.get("movement_mode") in (ATTRACTOR, WANDERING)]
     part2 = [r for r in all_rows if r.get("part") == PART2]
@@ -224,7 +307,18 @@ def summarize(session_dir):
         "configured_attractor_probability": probability,
         "part3_directed_movement": directed,
         "effective_attractor_probability": a_eff,
-        "movement_assignment_seed": seed,
+        "rng_recorded": rng_block is not None,
+        "rng_effective_master_seed": (xrng.seed_hex(seed_info["seed"]) if seed_info["seed"] is not None else None) if rng_block else None,
+        "rng_seed_representation": seed_info["representation"] if rng_block else None,
+        "rng_reconstructable": seed_info["reconstructable"],
+        "rng_reconstruction_note": seed_info["reason"],
+        "rng_config_version": seed_info["rng_config_version"],
+        "rng_seed_source": rng_block.get("seed_source") if rng_block else None,
+        "rng_seed_policy": rng_block.get("seed_policy") if rng_block else None,
+        "rng_algorithm": rng_block.get("rng_algorithm") if rng_block else None,
+        "rng_algorithm_version": rng_block.get("rng_algorithm_version") if rng_block else None,
+        "movement_mode_reconstruction": reconstruct_movement_modes(part3, rng_block, probability, directed),
+        "target_building_reconstruction": reconstruct_target_buildings(participant_id, assignments, rng_block),
         "part3_attractor_spawns": len(attractors),
         "part3_wandering_spawns": len(wanderers),
         "realised_attractor_pct": (100.0 * len(attractors) / n) if n else None,
@@ -317,7 +411,10 @@ def main(argv):
         for t in table:
             print("%-24s %7d %5s %8s %10s %10s %10s %10s" % (t["profile"][:24], t["element"], "yes" if t["is_none"] else "", _fmt(t["original_weight"]),
                                                               _fmt(t["expected_part2"]), _fmt(t["expected_part3_overall"]), _fmt(t["observed_part2"]), _fmt(t["observed_part3"])))
-    violations = bool(result["wandering_accessory_violations"]) or bool(result["part2_forced_suppression_markers"])
+    rec = result.get("movement_mode_reconstruction")
+    tb = result.get("target_building_reconstruction")
+    tb_bad = bool(tb and any(not (v["seed_matches"] and v["selection_matches"] and v["selected_in_candidates"]) for v in tb.values()))
+    violations = tb_bad or bool(result["wandering_accessory_violations"]) or bool(result["part2_forced_suppression_markers"]) or bool(rec and rec["mismatches"])
     return 1 if violations else 0
 
 

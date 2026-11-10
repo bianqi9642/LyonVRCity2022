@@ -49,11 +49,12 @@ class MixReaderTests(unittest.TestCase):
     def test_probability_counts_percentages_and_profiles(self):
         with tempfile.TemporaryDirectory() as d:
             life = [("Part3", A, "ProfA", "Bracelet", "0"), ("Part3", A, "ProfA", "", "1"), ("Part3", W, "ProfB", "", "-3"), ("Part3", W, "ProfB", "", "-3")]
-            write_session(d, life, [entry(mix.PROBABILITY_KEY, 0.4), entry(mix.SEED_KEY, 987654)])
+            write_session(d, life, [entry(mix.PROBABILITY_KEY, 0.4)])
             r = mix.summarize(d)
             self.assertEqual(r["configured_semantics"], "per_spawn_probability")
             self.assertEqual(r["configured_attractor_probability"], 0.4)
-            self.assertEqual(r["movement_assignment_seed"], 987654)
+            self.assertNotIn("movement_assignment_seed", r)
+            self.assertNotIn("movement_assignment_legacy_override", r)
             self.assertEqual((r["part3_attractor_spawns"], r["part3_wandering_spawns"]), (2, 2))
             self.assertEqual((r["realised_attractor_pct"], r["realised_wandering_pct"]), (50.0, 50.0))
             self.assertEqual(r["profile_distribution"], {"ProfA": 2, "ProfB": 2})
@@ -145,6 +146,162 @@ class MixReaderTests(unittest.TestCase):
 
 
 PROD = [0.05] * 8 + [0.6]   # the production profile: 8 wristbands + None last
+
+
+def rng_block(master, version=3):
+    """The manifest rng block. Version 3 (current): the unsigned 64-bit seed as 16 lowercase hex digits + master_seed_representation. Versions 1 / 2 reproduce the UNSUPPORTED historical layouts
+    (version 1: a signed 32-bit JSON number; version 2: hex without the version-3 contract) so the tests can check they are refused."""
+    block = {"seed_source": "fixed", "seed_policy": "shared_fixed_seed", "rng_algorithm": "PCG32-XSH-RR", "rng_algorithm_version": 1, "rng_config_version": version}
+    block["effective_master_seed"] = master if version == 1 else "%016x" % master
+    if version >= 2:
+        block["master_seed_representation"] = "uint64_hex16"
+    return block
+
+
+class TargetBuildingReaderTests(unittest.TestCase):
+    @staticmethod
+    def manifest(d, pid, master, group, region, ids, selected=None, seed_hex=None, version=3):
+        import experiment_rng as xr
+        sel, srt, seed = xr.choose_target_building(master, pid, group, region, ids)
+        a = {"part3_group_index": group, "destination1_region_id": region, "destination1_candidate_ids": ids,
+             "destination1_selected_id": selected or sel, "destination1_derived_seed": seed_hex or seed}
+        with open(os.path.join(d, "session_manifest.json"), "w") as f:
+            json.dump({"schema_version": 17, "participant_id": pid, "setting_entries": [], "assignments": a,
+                       "rng": rng_block(master, version)}, f)
+
+    def test_recorded_selection_and_exact_64_bit_seed_are_reproduced(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.manifest(d, "P004", 31415, 4, "OE", ["OE_A", "OE_B"])
+            r = mix.summarize(d)["target_building_reconstruction"]
+            self.assertEqual(r["destination1"], {"region": "OE", "seed_matches": True, "selection_matches": True, "selected_in_candidates": True})
+
+    def test_a_current_manifest_with_an_upper_bits_seed_is_reproduced_exactly(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.manifest(d, "P001", 0xFEDCBA9876543210, 4, "OE", ["OE_B", "OE_A"])
+            r = mix.summarize(d)["target_building_reconstruction"]["destination1"]
+            self.assertEqual(r, {"region": "OE", "seed_matches": True, "selection_matches": True, "selected_in_candidates": True})
+            with open(os.path.join(d, "session_manifest.json")) as f:
+                m = json.load(f)
+            self.assertEqual(m["assignments"]["destination1_derived_seed"], "dd16edfe30842108")
+            self.assertEqual(m["assignments"]["destination1_selected_id"], "OE_A")
+
+    def test_a_wrong_seed_or_building_is_flagged(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.manifest(d, "P004", 31415, 4, "OE", ["OE_A", "OE_B"], selected="OE_B")
+            r = mix.summarize(d)["target_building_reconstruction"]["destination1"]
+            self.assertFalse(r["selection_matches"]); self.assertTrue(r["seed_matches"])
+            self.manifest(d, "P004", 31415, 4, "OE", ["OE_A", "OE_B"], seed_hex="ff0834e9791e17a3")
+            self.assertFalse(mix.summarize(d)["target_building_reconstruction"]["destination1"]["seed_matches"])
+
+    def test_sessions_without_assignments_have_nothing_to_reconstruct(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_session(d, [("Part3", A, "P", "", "1")], [entry(mix.PROBABILITY_KEY, 0.5)])
+            self.assertIsNone(mix.summarize(d)["target_building_reconstruction"])
+
+
+class RngRecordTests(unittest.TestCase):
+    """The experiment RNG block and the reconstruction of recorded movement modes."""
+
+    @staticmethod
+    def session(d, root, p, indices, directed=None, corrupt=(), version=3):
+        import experiment_rng as xr
+        header = ["session_id", "npc_spawn_instance_id", "part", "profile_name", "movement_mode", "rng_part", "rng_spawn_index"]
+        with open(os.path.join(d, "npc_lifetimes.csv"), "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            for n, i in enumerate(indices):
+                mode = xr.predict_movement_mode(root, "Part3", i, mix._f32(p))
+                if n in corrupt:
+                    mode = A if mode == W else W
+                w.writerow(["S", "L%d" % n, "Part3", "P", mode, "Part3", i])
+        entries = [entry(mix.PROBABILITY_KEY, p)]
+        if directed is not None:
+            entries.append(entry(mix.DIRECTED_KEY, "true" if directed else "false"))
+        manifest = {"schema_version": 17, "setting_entries": entries,
+                    "rng": rng_block(root, version)}
+        with open(os.path.join(d, "session_manifest.json"), "w") as f:
+            json.dump(manifest, f)
+
+    def test_recorded_modes_are_reconstructed_from_the_effective_master_seed(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.session(d, 31415, 0.6, range(200))
+            r = mix.summarize(d)
+            self.assertTrue(r["rng_recorded"])
+            self.assertEqual((r["rng_effective_master_seed"], r["rng_seed_source"], r["rng_algorithm_version"]), ("0000000000007ab7", "fixed", 1))
+            self.assertEqual((r["rng_seed_representation"], r["rng_reconstructable"], r["rng_config_version"]), ("uint64_hex16", True, 3))
+            self.assertEqual(r["movement_mode_reconstruction"], {"checked": 200, "mismatches": 0, "mismatch_ids": []})
+            self.assertNotIn("movement_assignment_legacy_override", r)
+
+    def test_a_64_bit_manifest_is_reconstructed_and_reported_as_hex(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.session(d, 0x8000000000000001, 0.6, range(200))
+            r = mix.summarize(d)
+            self.assertEqual((r["rng_effective_master_seed"], r["rng_seed_representation"], r["rng_reconstructable"]), ("8000000000000001", "uint64_hex16", True))
+            self.assertEqual(r["movement_mode_reconstruction"], {"checked": 200, "mismatches": 0, "mismatch_ids": []})
+
+    def test_the_master_seed_is_the_only_root_of_the_movement_assignment(self):
+        # modes recorded from seed A do not reconstruct under seed B: there is no other seed to fall back on
+        with tempfile.TemporaryDirectory() as d:
+            self.session(d, 0x0123456789ABCDEF, 0.5, range(300))
+            with open(os.path.join(d, "session_manifest.json")) as f:
+                m = json.load(f)
+            m["rng"]["effective_master_seed"] = "8123456789abcdef"      # differs only in the top bit
+            with open(os.path.join(d, "session_manifest.json"), "w") as f:
+                json.dump(m, f)
+            rec = mix.summarize(d)["movement_mode_reconstruction"]
+            self.assertEqual(rec["checked"], 300)
+            self.assertGreater(rec["mismatches"], 50, "the high bits participate in the derivation")
+
+    def test_unsupported_historical_manifests_are_reported_not_reconstructed_and_never_converted(self):
+        for version in (1, 2):
+            with tempfile.TemporaryDirectory() as d:
+                self.session(d, 31415, 0.5, range(50), version=version)
+                if version == 2:       # version 2 without the version-3 contract
+                    with open(os.path.join(d, "session_manifest.json")) as f:
+                        m = json.load(f)
+                    del m["rng"]["master_seed_representation"]
+                    with open(os.path.join(d, "session_manifest.json"), "w") as f:
+                        json.dump(m, f)
+                r = mix.summarize(d)
+                self.assertTrue(r["rng_recorded"])
+                self.assertFalse(r["rng_reconstructable"], version)
+                self.assertEqual(r["rng_config_version"], version)
+                self.assertIn("unsupported RNG manifest format", r["rng_reconstruction_note"])
+                self.assertIsNone(r["rng_effective_master_seed"], "an old seed is not reinterpreted as a current one")
+                self.assertIsNone(r["movement_mode_reconstruction"])
+
+    def test_an_unreadable_seed_representation_is_reported_not_reconstructable(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.session(d, 5, 0.5, range(10))
+            with open(os.path.join(d, "session_manifest.json")) as f:
+                m = json.load(f)
+            m["rng"]["effective_master_seed"] = 12345          # a number where the current format has a hex string
+            with open(os.path.join(d, "session_manifest.json"), "w") as f:
+                json.dump(m, f)
+            r = mix.summarize(d)
+            self.assertFalse(r["rng_reconstructable"])
+            self.assertIsNone(r["rng_effective_master_seed"])
+            self.assertIsNone(r["movement_mode_reconstruction"])
+
+    def test_a_tampered_row_is_reported_as_a_mismatch(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.session(d, 5, 0.5, range(50), corrupt=(3, 9))
+            rec = mix.summarize(d)["movement_mode_reconstruction"]
+            self.assertEqual((rec["checked"], rec["mismatches"], rec["mismatch_ids"]), (50, 2, ["L3", "L9"]))
+
+    def test_directed_movement_off_has_nothing_to_reconstruct(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.session(d, 5, 0.5, range(10), directed=False)
+            self.assertIsNone(mix.summarize(d)["movement_mode_reconstruction"])
+
+    def test_sessions_before_the_experiment_rng_are_not_reconstructed(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_session(d, [("Part3", A, "P", "", "1")], [entry(mix.PROBABILITY_KEY, 0.5)])
+            r = mix.summarize(d)
+            self.assertFalse(r["rng_recorded"])
+            self.assertIsNone(r["rng_effective_master_seed"])
+            self.assertFalse(r["rng_reconstructable"])
+            self.assertIsNone(r["movement_mode_reconstruction"])
 
 
 class AccessoryDistributionTests(unittest.TestCase):

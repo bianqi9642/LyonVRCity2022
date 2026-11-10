@@ -19,14 +19,15 @@ public class AgentFactory : MonoBehaviour
     /// accessory selection, exactly as before.</param>
     /// <param name="accessoryWeightScale">Part 2 only: the effective Part 3 attractor probability used to adjust the accessory weights (AccessoryWeightAdjuster). 1 (default) =
     /// the profile's own weights.</param>
-    public void ApplyProfileToInstance(GameObject go, AgentProfile profile, bool suppressAccessory = false, float accessoryWeightScale = 1f)
+    /// <param name="rng">The NPC's experiment-RNG streams (Appearance for the look, MovementAttributes for speed multiplier and uncertain roll). null = the shared unassigned set.</param>
+    public void ApplyProfileToInstance(GameObject go, AgentProfile profile, bool suppressAccessory = false, float accessoryWeightScale = 1f, NpcRngSet rng = null)
     {
         if (go == null || profile == null) return;
+        NpcRngSet streams = rng ?? ExperimentRngManager.UnassignedNpcRng;
         var app = go.GetComponent<AppearanceController>();
         if (app != null)
         {
-            if (suppressAccessory || accessoryWeightScale < 1f) app.ApplyProfile(profile, suppressAccessory, accessoryWeightScale);
-            else app.ApplyProfile(profile);
+            app.ApplyProfile(profile, suppressAccessory, accessoryWeightScale, streams.Appearance);
         }
 
         var nav = go.GetComponent<NavMeshAgent>();
@@ -38,7 +39,7 @@ public class AgentFactory : MonoBehaviour
         float speedMultiplier = 1f;   // recorded for data capture only
         if (profile.speedOptions != null && profile.speedOptions.Length > 0)
         {
-            float mult = profile.ChooseWeightedSpeedMultiplier();
+            float mult = profile.ChooseWeightedSpeedMultiplier(streams.MovementAttributes);
             speedMultiplier = mult;
             appliedSpeed *= mult;
         }
@@ -72,7 +73,7 @@ public class AgentFactory : MonoBehaviour
         if (uncertain != null)
         {
             // configure UncertainBehavior: either force, probabilistic, or off
-            uncertain.enabled = profile.forceUncertain || Random.value < profile.uncertainProbability;
+            uncertain.enabled = profile.forceUncertain || streams.MovementAttributes.NextFloat() < profile.uncertainProbability;
         }
 
         // Data capture (observation only): remember what was actually applied to this NPC so the recorder can write it once per lifetime.

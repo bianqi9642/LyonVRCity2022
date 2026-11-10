@@ -5,6 +5,7 @@
   "part2GroupIndex": 0,
   "part3GroupIndex": 1,
   "autoStart": true,
+  "experimentRngMasterSeed": "0000000000000000",
   "timing": {
     "part1Duration": 15,
     "part2FirstDuration": 15,

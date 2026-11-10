@@ -290,7 +290,8 @@ public class MoveToTarget : MonoBehaviour
                 Vector3 dir = (originalDesiredTarget - transform.position);
                 if (dir.sqrMagnitude < 1e-4f)
                 {
-                    Vector2 rnd = UnityEngine.Random.insideUnitCircle.normalized;
+                    float rcx, rcy; NudgeRng().InsideUnitCircle(out rcx, out rcy);
+                    Vector2 rnd = new Vector2(rcx, rcy).normalized;
                     tryPos = transform.position + new Vector3(rnd.x, 0f, rnd.y) * k_NudgeDistance * attempt;
                 }
                 else
@@ -433,6 +434,15 @@ public class MoveToTarget : MonoBehaviour
         // ensure mover's moving flag is set so Update monitors agent properly
         moving = true;
         arrived = false;
+    }
+
+    // The NPC's own NavigationNudge stream of the experiment RNG (see ExperimentRng.cs); the shared unassigned set when this mover is not on a spawned NPC.
+    PedestrianAgent nudgeOwner;
+    bool nudgeOwnerLooked;
+    Pcg32 NudgeRng()
+    {
+        if (!nudgeOwnerLooked) { nudgeOwner = GetComponent<PedestrianAgent>(); nudgeOwnerLooked = true; }
+        return (nudgeOwner != null ? nudgeOwner.Rng : ExperimentRngManager.UnassignedNpcRng).NavigationNudge;
     }
 
     void Update()

@@ -229,14 +229,24 @@ public class AccessoryAppearanceTests
         Assert.AreEqual(-2, Get<int>(LastAccessories(), "optionIndex"));
     }
 
+    // The experiment RNG counts every 32-bit value drawn per (Part, stream): a suppressed lifetime takes NO accessory value from the NPC's Appearance stream, so the number of
+    // Appearance draws does not depend on the profile's accessory options, and a normal application of a bracelet profile takes more (option choice + material choice).
     [Test]
-    public void Suppression_DrawsNothingForTheAccessory_SoTheOtherAppearanceDrawsAreIndependentOfProfileShare()
+    public void Suppression_DrawsNothingForTheAccessory_SoTheAppearanceStreamDoesNotDependOnTheProfileShare()
     {
-        // With the accessory suppressed, no random value is consumed for it: the next UnityEngine.Random value does not depend on the profile's accessory options.
+        Type counters = Type.GetType("ExperimentRngCounters, Assembly-CSharp");
+        object appearance = Enum.Parse(Type.GetType("RngStream, Assembly-CSharp"), "Appearance");
+        Func<long> total = () => (long)counters.GetMethod("Total").Invoke(null, new[] { appearance });
+        long c0;
+
         SetOptions(Bracelet(meshL, 1f), None(1f));
-        UnityEngine.Random.InitState(5); ApplySuppressed(); float a = UnityEngine.Random.value;
+        c0 = total(); ApplySuppressed(); long suppressedWithBracelets = total() - c0;
         SetOptions(None(1f));
-        UnityEngine.Random.InitState(5); ApplySuppressed(); float b = UnityEngine.Random.value;
-        Assert.AreEqual(a, b);
+        c0 = total(); ApplySuppressed(); long suppressedWithoutBracelets = total() - c0;
+        Assert.AreEqual(suppressedWithBracelets, suppressedWithoutBracelets, "no accessory value is drawn for a suppressed lifetime");
+
+        SetOptions(Bracelet(meshL, 1f));
+        c0 = total(); Apply(); long normalWithBracelet = total() - c0;
+        Assert.AreEqual(suppressedWithBracelets + 2, normalWithBracelet, "a normal bracelet draws exactly two values for the accessory: the option and the colour");
     }
 }

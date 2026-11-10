@@ -176,3 +176,29 @@ sealed class Csv
         return rows;
     }
 }
+
+/// <summary>Installs the ExperimentRngManager test seams (ConfigurationOverride / EntropyOverride) through reflection; the production types are not referenceable from this assembly.</summary>
+static class RngSeams
+{
+    static Type Mgr => Reflect.T("ExperimentRngManager");
+    static Type Cfg => Reflect.T("RngSeedConfiguration");
+
+    /// <summary>The configuration the manager will resolve (replaces the scene lookup).</summary>
+    public static void SetConfig(ulong seed, string source = "TEST")
+    {
+        object cfg = Activator.CreateInstance(Cfg, seed, source);
+        var del = System.Linq.Expressions.Expression.Lambda(typeof(Func<>).MakeGenericType(Cfg), System.Linq.Expressions.Expression.Constant(cfg, Cfg)).Compile();
+        Mgr.GetField("ConfigurationOverride").SetValue(null, del);
+    }
+
+    /// <summary>The configuration lookup throws (an unreadable / invalid configuration).</summary>
+    public static void SetConfigThrowing(Exception ex)
+    {
+        var del = System.Linq.Expressions.Expression.Lambda(typeof(Func<>).MakeGenericType(Cfg), System.Linq.Expressions.Expression.Throw(System.Linq.Expressions.Expression.Constant(ex), Cfg)).Compile();
+        Mgr.GetField("ConfigurationOverride").SetValue(null, del);
+    }
+
+    /// <summary>Replaces the OS entropy source: fill receives the 8-byte buffer (throw to simulate an entropy failure).</summary>
+    public static void SetEntropy(Action<byte[]> fill) { Mgr.GetField("EntropyOverride").SetValue(null, fill); }
+
+}

@@ -128,21 +128,24 @@ public class AgentProfile : ScriptableObject
     public float agentHeight = 1.8f;
 
     /// <summary>
-    /// Roll a gender for one NPC. Called once per NPC by AppearanceController.ApplyProfile.
-    /// Uses the same (unseeded) UnityEngine.Random source as the rest of the appearance system.
+    /// Roll a gender for one NPC. Called once per NPC by AppearanceController.ApplyProfile with the NPC's own Appearance stream (experiment RNG, see ExperimentRng.cs).
+    /// This overload without a stream draws from the shared "unassigned" Appearance stream: still deterministic and recorded, never UnityEngine.Random.
     /// </summary>
-    public AgentGender ChooseGender()
+    public AgentGender ChooseGender() { return ChooseGender(ExperimentRngManager.UnassignedNpcRng.Appearance); }
+
+    /// <summary>Gender roll from the given stream: Female with probability femaleProbability (one draw).</summary>
+    public AgentGender ChooseGender(Pcg32 rng)
     {
-        return (Random.value < femaleProbability) ? AgentGender.Female : AgentGender.Male;
+        return rng.NextFloat() < femaleProbability ? AgentGender.Female : AgentGender.Male;
     }
 
     /// <summary>
     /// Choose one PartOption from an array using weights. Returns null if none available.
-    /// Unchanged public behaviour: no gender filtering (equivalent to every option being Unisex).
+    /// Unchanged public behaviour: no gender filtering (equivalent to every option being Unisex). Draws from the shared unassigned Appearance stream.
     /// </summary>
     public PartOption ChooseWeightedOption(PartOption[] options)
     {
-        return ChooseWeightedOptionInternal(options, null);
+        return ChooseWeightedOptionInternal(options, null, ExperimentRngManager.UnassignedNpcRng.Appearance);
     }
 
     /// <summary>
@@ -153,87 +156,89 @@ public class AgentProfile : ScriptableObject
     /// </summary>
     public PartOption ChooseWeightedOption(PartOption[] options, AgentGender gender)
     {
-        return ChooseWeightedOptionInternal(options, gender);
+        return ChooseWeightedOptionInternal(options, gender, ExperimentRngManager.UnassignedNpcRng.Appearance);
+    }
+
+    /// <summary>The gender-filtered weighted choice drawing from the given stream (the NPC's Appearance stream).</summary>
+    public PartOption ChooseWeightedOption(PartOption[] options, AgentGender gender, Pcg32 rng)
+    {
+        return ChooseWeightedOptionInternal(options, gender, rng);
     }
 
     /// <summary>
-    /// Shared weighted-random implementation. When genderFilter is null, every non-null option
-    /// is eligible (original behaviour). When set, only options with AvailableTo(gender) == true
-    /// contribute to the weight sum and can be picked.
+    /// Shared weighted-random implementation: ONE stream value per call. When genderFilter is null, every non-null option is eligible; when set, only options with
+    /// AvailableTo(gender) == true contribute to the weight sum and can be picked. Options with weight 0 (or negative / non-finite) are NEVER returned: the value is
+    /// compared with the cumulative weight using r &lt; acc over positive weights only, and the rounding fallback is the last positive-weight option.
     /// </summary>
-    private PartOption ChooseWeightedOptionInternal(PartOption[] options, AgentGender? genderFilter)
+    private PartOption ChooseWeightedOptionInternal(PartOption[] options, AgentGender? genderFilter, Pcg32 rng)
     {
         if (options == null || options.Length == 0) return null;
 
         float total = 0f;
+        int lastPositive = -1;
         for (int i = 0; i < options.Length; i++)
         {
             var o = options[i];
             if (o == null) continue;
             if (genderFilter.HasValue && !o.AvailableTo(genderFilter.Value)) continue;
-            total += Mathf.Max(0f, o.weight);
+            if (!(o.weight > 0f) || float.IsInfinity(o.weight)) continue;
+            total += o.weight;
+            lastPositive = i;
         }
 
-        if (total <= 0f) return null;
+        if (lastPositive < 0 || !(total > 0f)) return null;
 
-        float r = Random.value * total;
+        float r = rng.NextFloat() * total;   // [0, total)
         float acc = 0f;
         for (int i = 0; i < options.Length; i++)
         {
             var o = options[i];
             if (o == null) continue;
             if (genderFilter.HasValue && !o.AvailableTo(genderFilter.Value)) continue;
-            acc += Mathf.Max(0f, o.weight);
-            if (r <= acc) return o;
+            if (!(o.weight > 0f) || float.IsInfinity(o.weight)) continue;
+            acc += o.weight;
+            if (r < acc) return o;
         }
 
-        // fallback: return last eligible non-null option
-        for (int i = options.Length - 1; i >= 0; i--)
-        {
-            var o = options[i];
-            if (o == null) continue;
-            if (genderFilter.HasValue && !o.AvailableTo(genderFilter.Value)) continue;
-            return o;
-        }
-
-        return null;
+        return options[lastPositive];   // float rounding only: still an eligible positive-weight option
     }
 
     /// <summary>
     /// Choose a speed multiplier from speedOptions using weights.
     /// Returns 1.0 if no options available or total weight <= 0.
     /// </summary>
-    public float ChooseWeightedSpeedMultiplier()
+    public float ChooseWeightedSpeedMultiplier() { return ChooseWeightedSpeedMultiplier(ExperimentRngManager.UnassignedNpcRng.MovementAttributes); }
+
+    /// <summary>Speed multiplier drawn from the given stream (the NPC's MovementAttributes stream): ONE value, zero-weight options never chosen.</summary>
+    public float ChooseWeightedSpeedMultiplier(Pcg32 rng)
     {
         if (speedOptions == null || speedOptions.Length == 0) return 1f;
 
         float total = 0f;
+        int lastPositive = -1;
         for (int i = 0; i < speedOptions.Length; i++)
         {
             var s = speedOptions[i];
-            if (s != null) total += Mathf.Max(0f, s.weight);
+            if (s != null && s.weight > 0f && !float.IsInfinity(s.weight)) { total += s.weight; lastPositive = i; }
         }
 
-        if (total <= 0f) return 1f;
+        if (lastPositive < 0 || !(total > 0f)) return 1f;
 
-        float r = Random.value * total;
+        float r = rng.NextFloat() * total;
         float acc = 0f;
         for (int i = 0; i < speedOptions.Length; i++)
         {
             var s = speedOptions[i];
-            if (s == null) continue;
-            acc += Mathf.Max(0f, s.weight);
-            if (r <= acc)
+            if (s == null || !(s.weight > 0f) || float.IsInfinity(s.weight)) continue;
+            acc += s.weight;
+            if (r < acc)
             {
                 // ensure multiplier is a valid finite value
                 return float.IsFinite(s.multiplier) ? s.multiplier : 1f;
             }
         }
 
-        // fallback: last valid multiplier
-        for (int i = speedOptions.Length - 1; i >= 0; i--)
-            if (speedOptions[i] != null && float.IsFinite(speedOptions[i].multiplier)) return speedOptions[i].multiplier;
-
-        return 1f;
+        // rounding only: the last positive-weight option
+        return float.IsFinite(speedOptions[lastPositive].multiplier) ? speedOptions[lastPositive].multiplier : 1f;
     }
 }

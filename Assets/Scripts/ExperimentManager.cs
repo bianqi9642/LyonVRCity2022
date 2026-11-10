@@ -309,6 +309,14 @@ public class ExperimentManager : MonoBehaviour
              "Presence of NPCs is still controlled by 'Npc Enabled' in the Part configuration.")]
     public float npcWarmupDuration = 30f;
 
+    [Header("Experiment RNG")]
+    [Tooltip("Master Seed of the experiment's random numbers (ExperimentRngManager): an UNSIGNED 64-BIT value written as EXACTLY 16 hexadecimal digits (0-9, a-f; upper case is accepted), e.g. " +
+             "0123456789abcdef. Stored as text because Unity's Inspector and scene YAML do not reliably carry unsigned 64-bit integers. Any non-zero value = this exact seed: every participant given " +
+             "the same value gets the same derived random streams (controlled comparison). 0000000000000000 = AUTOMATIC: one new 64-bit seed is generated per session from the OS entropy source and " +
+             "recorded (independent sessions). Anything that is not 16 hex digits is REJECTED and no Part starts (it never becomes an automatic seed). Participant ID, session ID and the clock " +
+             "are never mixed in. An 'experimentRngMasterSeed' key in session_config.json overrides this value. Fixed once, before the first random draw; never changed by a Part start.")]
+    public string experimentRngMasterSeed = "0000000000000000";
+
     [Header("NPC preparation (pool -> behaviour warm-up -> Start-gated pause)")]
     [Tooltip("If true (default), spawning STOPS and the NPC simulation is PAUSED when the NPC generation duration ('Npc Warmup Duration') ends: every NPC stays visible and raycastable but stationary while the participant " +
              "reads the Start panel, and the Start click resumes them in the same transition that opens the trial. If false, NPCs keep walking while the Start panel is read (previous behaviour). " +
@@ -375,6 +383,120 @@ public class ExperimentManager : MonoBehaviour
     {
         public Transform[] startPositions;
         public Transform[] teleportPositions;
+    }
+
+    // ---- group-controlled spatial conditions + the participant-specific target building (resolved and validated BEFORE a Part starts; recorded in the manifest) ----
+
+    /// <summary>The Part 2 spatial condition designated by the group index. Not random: the group designates exactly one start point and one teleport point.</summary>
+    public sealed class Part2AssignmentInfo
+    {
+        public int GroupIndex;
+        public Transform StartPoint, TeleportPoint;
+        public string StartPointId, TeleportPointId;
+    }
+
+    /// <summary>One Part 3 destination: its group-assigned region and the participant-specific selection inside it.</summary>
+    public sealed class Part3DestinationInfo
+    {
+        public string RegionId;
+        public string[] CandidateIds;
+        public string CandidateFingerprint;
+        public string SelectedId;
+        public GameObject Building;
+        public ulong DerivedSeed;
+        public string DerivedSeedHex => DerivedSeed.ToString("x16", System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>The Part 3 spatial condition designated by the group index (start zone / point, destination regions) and the participant's building draw per destination.</summary>
+    public sealed class Part3AssignmentInfo
+    {
+        public int GroupIndex;
+        public string ParticipantId;
+        public string StartZone;
+        public Transform StartPoint;
+        public string StartPointId;
+        public Part3DestinationInfo Destination1, Destination2;
+    }
+
+    /// <summary>The Part 2 assignment of this run (null until Part 2 has been resolved). Read by the manifest.</summary>
+    public Part2AssignmentInfo Part2Assignment { get; private set; }
+    /// <summary>The Part 3 assignment of this run (null until Part 3 has been resolved). Read by the manifest.</summary>
+    public Part3AssignmentInfo Part3Assignment { get; private set; }
+
+    private static bool TrySingle(Transform[] array, string what, int groupIndex, out Transform t, out string error)
+    {
+        t = null; error = null;
+        if (array == null || array.Length == 0) { error = "Part 2 group " + groupIndex + " has no " + what + " assigned"; return false; }
+        if (array.Length != 1) { error = "Part 2 group " + groupIndex + " has " + array.Length + " " + what + ": the group index must designate exactly ONE point (random selection among several is not used; fix the scene)"; return false; }
+        if (array[0] == null) { error = "Part 2 group " + groupIndex + " " + what + " entry is empty"; return false; }
+        t = array[0];
+        return true;
+    }
+
+    /// <summary>
+    /// Part 2: the group index (the only input) designates the start and the teleport point. No Master Seed, participant ID or NPC state is involved, and there is no random or
+    /// fallback choice: a missing / out-of-range group or an ambiguous point list is an error and the Part does not start.
+    /// </summary>
+    private bool TryResolvePart2Assignment(int groupIndex, out Part2AssignmentInfo info, out string error)
+    {
+        info = null; error = null;
+        if (part2Groups == null || part2Groups.Length == 0) { error = "no Part 2 groups are configured in the scene"; return false; }
+        if (groupIndex < 0 || groupIndex >= part2Groups.Length) { error = "part2GroupIndex " + groupIndex + " is outside 0.." + (part2Groups.Length - 1) + " (the scene has " + part2Groups.Length + " Part 2 groups)"; return false; }
+        Part2Group g = part2Groups[groupIndex];
+        if (g == null) { error = "Part 2 group " + groupIndex + " is not defined"; return false; }
+        Transform start, teleport;
+        if (!TrySingle(g.startPositions, "start positions", groupIndex, out start, out error)) return false;
+        if (!TrySingle(g.teleportPositions, "teleport positions", groupIndex, out teleport, out error)) return false;
+        info = new Part2AssignmentInfo { GroupIndex = groupIndex, StartPoint = start, TeleportPoint = teleport, StartPointId = start.name, TeleportPointId = teleport.name };
+        return true;
+    }
+
+    private bool TryResolvePart3Destination(int groupIndex, string participantId, Part3Zone zone, string label, out Part3DestinationInfo dest, out string error)
+    {
+        dest = null; error = null;
+        Part3ZoneTargets targets = ResolvePart3ZoneTargets(zone);
+        if (targets == null) { error = label + " region " + zone + " is not configured"; return false; }
+        var byId = new Dictionary<string, GameObject>(StringComparer.Ordinal);
+        var ids = new List<string>(2);
+        foreach (GameObject candidate in new[] { targets.buildingA, targets.buildingB })
+        {
+            if (candidate == null) continue;               // an unassigned slot is simply not a candidate
+            string id = GetAssignedTargetId(candidate);
+            if (string.IsNullOrWhiteSpace(id)) { error = label + " region " + zone + ": candidate '" + candidate.name + "' has no TargetSelectable id"; return false; }
+            if (byId.ContainsKey(id)) { error = label + " region " + zone + ": two candidates share the id '" + id + "'"; return false; }
+            byId[id] = candidate; ids.Add(id);
+        }
+        Part3TargetSelection.Result sel;
+        if (!Part3TargetSelection.TrySelect(participantId, groupIndex, zone.ToString(), ids, out sel, out error)) { error = label + ": " + error; return false; }
+        dest = new Part3DestinationInfo
+        {
+            RegionId = sel.RegionId, CandidateIds = sel.CandidateIds, CandidateFingerprint = sel.CandidateFingerprint, SelectedId = sel.SelectedId, Building = byId[sel.SelectedId], DerivedSeed = sel.DerivedSeed,
+        };
+        return true;
+    }
+
+    /// <summary>
+    /// Part 3: the group index (a fixed table row) designates the start zone / point and the two destination regions. Inside each region ONE eligible building is drawn from the
+    /// participant-specific stream (Part3TargetSelection). No region, start point or building is ever chosen at random or taken from another region; any gap is an error.
+    /// </summary>
+    private bool TryResolvePart3Assignment(int groupIndex, string participantId, out Part3AssignmentInfo info, out string error)
+    {
+        info = null; error = null;
+        if (groupIndex < 0 || groupIndex >= Part3GroupTable.Length) { error = "part3GroupIndex " + groupIndex + " is outside 0.." + (Part3GroupTable.Length - 1); return false; }
+        if (string.IsNullOrWhiteSpace(participantId)) { error = "the participant ID is missing: the participant-specific target-building selection cannot run"; return false; }
+        Part3GroupDef def = Part3GroupTable[groupIndex];
+        if (def.Destination1Zone == def.Destination2Zone) { error = "group " + groupIndex + " assigns the same region to both destinations"; return false; }
+        Transform start = ResolvePart3Start(def.StartZone);
+        if (start == null) { error = "the Part 3 start point of zone " + def.StartZone + " (group " + groupIndex + ") is not assigned in the scene"; return false; }
+        Part3DestinationInfo d1, d2;
+        if (!TryResolvePart3Destination(groupIndex, participantId, def.Destination1Zone, "Destination 1", out d1, out error)) return false;
+        if (!TryResolvePart3Destination(groupIndex, participantId, def.Destination2Zone, "Destination 2", out d2, out error)) return false;
+        if (d1.SelectedId == d2.SelectedId) { error = "Destinations 1 and 2 resolve to the same building id '" + d1.SelectedId + "'"; return false; }
+        info = new Part3AssignmentInfo
+        {
+            GroupIndex = groupIndex, ParticipantId = participantId, StartZone = def.StartZone.ToString(), StartPoint = start, StartPointId = start.name, Destination1 = d1, Destination2 = d2,
+        };
+        return true;
     }
 
     /// <summary>One row of the fixed 12-group Phase 3 assignment table.</summary>
@@ -473,6 +595,51 @@ public class ExperimentManager : MonoBehaviour
     private readonly PartCaptureConfig[] _frozenPartConfigs = new PartCaptureConfig[3];
     private bool _configDependencyErrorLogged;
 
+    /// <summary>
+    /// The configured Master Seed for ExperimentRngManager, with the exact precedence: a valid session_config.json `experimentRngMasterSeed` wins; an absent key uses the serialized
+    /// Inspector value `experimentRngMasterSeed`. The external configuration is loaded here if that has not happened yet (idempotent). When the EXTERNAL source is in use and the
+    /// configuration is invalid (missing file, malformed JSON, a wrong-type / out-of-range / null / mistyped seed key ...) this returns false with the reason: the seed is uncertain, so
+    /// nothing is frozen and nothing falls back to the Inspector value or to an automatic seed. An INVALID Inspector string (not exactly 16 hex digits) also returns false. 0000000000000000 = automatic.
+    /// Read-only and free of side effects (does not freeze the effective settings), so it can run before anything else. source = EXTERNAL_JSON / SCENE_INHERITED (external source,
+    /// key absent) / INSPECTOR (Inspector source).
+    /// </summary>
+    public bool TryGetRngMasterSeedConfiguration(out ulong configuredSeed, out string source, out string error)
+    {
+        configuredSeed = 0; source = ""; error = "";
+        ExternalSessionController c = Controller;
+        if (c == null) { error = "no ExternalSessionController: the session configuration (and with it the Master Seed) cannot be resolved"; return false; }
+        SessionConfigSnapshot r = c.Resolved;
+        if (r == null) { error = "the session configuration could not be resolved"; return false; }
+        bool external = r.Source == SessionConfigCore.SourceExternal;
+        if (external && !r.IsValid) { error = "the external session configuration is invalid, so the Master Seed is uncertain: " + (r.Identity.message ?? ""); return false; }
+        if (external && r.Overrides != null && r.Overrides.ExperimentRngMasterSeed.HasValue)
+        {
+            configuredSeed = r.Overrides.ExperimentRngMasterSeed.Value; source = SettingSource.ExternalJson;
+            return true;
+        }
+        // Absent JSON key (or Inspector source): the serialized Inspector string. It is validated here; an invalid string is an explicit error and never becomes an automatic seed.
+        string why;
+        if (!MasterSeedFormat.TryParseHex(experimentRngMasterSeed, out configuredSeed, out why))
+        {
+            configuredSeed = 0;
+            error = "ExperimentManager.experimentRngMasterSeed (Inspector / scene value) is invalid: " + why + ". Expected exactly 16 hexadecimal digits such as \"0123456789abcdef\" (\"0000000000000000\" = automatic). " +
+                    "Got \"" + (experimentRngMasterSeed ?? "null") + "\".";
+            return false;
+        }
+        source = external ? SettingSource.SceneInherited : SettingSource.Inspector;
+        return true;
+    }
+
+#if UNITY_EDITOR
+    // Editor feedback only: an invalid Master Seed text is reported when it is edited. The value is not changed here; the runtime validation refuses to start a session with it.
+    private void OnValidate()
+    {
+        ulong v; string why;
+        if (!MasterSeedFormat.TryParseHex(experimentRngMasterSeed, out v, out why))
+            Debug.LogWarning("[ExperimentManager] experimentRngMasterSeed must be exactly 16 hexadecimal digits (e.g. 0123456789abcdef; 0000000000000000 = automatic): " + why + ". The session will be refused until it is fixed.", this);
+    }
+#endif
+
     /// <summary>The session's controller: the Inspector reference, else the scene's single ExternalSessionController. Null = no configuration source exists.</summary>
     private ExternalSessionController Controller
     {
@@ -566,7 +733,19 @@ public class ExperimentManager : MonoBehaviour
             ss.SpawnerMaxAgents = sp.maxAgents; ss.SpawnerPoolPrewarm = sp.poolPrewarm; ss.SpawnerSpawnInterval = sp.spawnInterval;
             ss.SpawnerDwellTimeMin = sp.dwellTimeSec.x; ss.SpawnerDwellTimeMax = sp.dwellTimeSec.y;
             ss.SpawnerPart3AttractorProbability = sp.Part3AttractorMovementProbability;
-            ss.SpawnerPart3MovementSeed = sp.Part3MovementAssignmentSeedEffective;
+        }
+        // Experiment RNG: the Master Seed is fixed here at the latest (and normally earlier, by the first draw of any component): configured value + the one in force.
+        ulong sceneSeed; string sceneSeedWhy;
+        ss.ExperimentRngMasterSeed = MasterSeedFormat.TryParseHex(experimentRngMasterSeed, out sceneSeed, out sceneSeedWhy) ? sceneSeed : 0UL;   // invalid text: reported by TryGetRngMasterSeedConfiguration, which blocks the session
+        try
+        {
+            ss.ExperimentRngEffectiveSeed = ExperimentRngManager.EffectiveMasterSeed;
+            ss.ExperimentRngSeedWasGenerated = ExperimentRngManager.SeedSource == ExperimentRngManager.SeedSourceAuto;
+        }
+        catch (InvalidOperationException)
+        {
+            // The RNG is Failed (invalid configuration / entropy failure): the reason is already logged and IdentityAllowsStart refuses every Part. 0 = no effective seed exists.
+            ss.ExperimentRngEffectiveSeed = 0UL; ss.ExperimentRngSeedWasGenerated = false;
         }
         // The profile the NPC system will actually use: RunNpcWarmup assigns currentProfile to the spawner when a Part with NPCs starts.
         AgentProfile prof = currentProfile != null ? currentProfile : (sp != null ? sp.defaultProfile : null);
@@ -642,6 +821,13 @@ public class ExperimentManager : MonoBehaviour
         if (!r.IsValid)
         {
             Debug.LogError($"ExperimentManager: {what} refused - invalid session identity/configuration ({r.status}): {r.message}");
+            return false;
+        }
+        // The experiment RNG must be Ready (validated Master Seed frozen) before any Part runs: an invalid seed configuration or a failed entropy source stops the session here.
+        try { ExperimentRngManager.EnsureInitialized(); }
+        catch (InvalidOperationException ex)
+        {
+            Debug.LogError($"ExperimentManager: {what} refused - the experiment RNG is not available: {ex.Message}");
             return false;
         }
         if (!EnsureSessionOverridesApplied())
@@ -1401,14 +1587,17 @@ public class ExperimentManager : MonoBehaviour
     {
         if (!EnsureSessionOverridesApplied()) { Debug.LogError("ExperimentManager.RunPart2 refused: the effective session settings are not available."); yield break; }
 
-        // The group index comes from the resolved (validated) session configuration and is NEVER clamped: an index outside the configured groups would silently
-        // run a different experimental condition, so the Part is refused before anything starts. Part 2 Group Number == Group Index (0..part2Groups.Length-1).
+        // The group index comes from the resolved (validated) session configuration and is NEVER clamped or replaced: it designates the start and the teleport point (no random
+        // choice, no Master Seed, no participant ID). An index outside the configured groups, or a group without exactly one designated point, refuses the Part before anything starts.
         int gIdx = Controller.ActivePart2GroupIndex;
-        if (part2Groups != null && part2Groups.Length > 0 && (gIdx < 0 || gIdx >= part2Groups.Length))
+        Part2AssignmentInfo p2;
+        string p2Error;
+        if (!TryResolvePart2Assignment(gIdx, out p2, out p2Error))
         {
-            Debug.LogError($"ExperimentManager.RunPart2 refused: part2GroupIndex {gIdx} is outside 0..{part2Groups.Length - 1} (the scene has {part2Groups.Length} Part 2 groups). Fix the session configuration.");
+            Debug.LogError("ExperimentManager.RunPart2 refused: " + p2Error + ". Fix the session configuration / scene.");
             yield break;
         }
+        Part2Assignment = p2;
 
         currentRunningPart = RunningPart.Part2;
         CurrentPartConfig = _frozenPartConfigs[1];
@@ -1417,15 +1606,9 @@ public class ExperimentManager : MonoBehaviour
         endPanelVisibleRealtime = double.NaN;
         RaiseEvt("part_start", "Part2");
 
-        if (part2Groups == null || part2Groups.Length == 0)
-        {
-            Debug.LogError("ExperimentManager.RunPart2: No Part2 groups configured in inspector.");
-            yield break;
-        }
         Part2Group group = part2Groups[gIdx];
-
-        Transform chosenStart = ChooseRandomFromArray(group.startPositions);
-        Transform chosenTeleport = ChooseRandomFromArray(group.teleportPositions);
+        Transform chosenStart = p2.StartPoint;        // designated by the group index
+        Transform chosenTeleport = p2.TeleportPoint;  // designated by the group index
 
         TeleportPlayerTo(chosenStart);
         FaceTrackingBegin();   // schema v17: see Part 3
@@ -1501,6 +1684,17 @@ public class ExperimentManager : MonoBehaviour
             yield break;
         }
 
+        // The spatial condition (start point, destination regions) comes from the group index; the target building inside each region from the participant-specific stream. Everything is
+        // resolved and validated BEFORE the Part starts: a gap (missing participant ID, unassigned start point, region without eligible buildings ...) refuses the Part, never falls back.
+        Part3AssignmentInfo p3;
+        string p3Error;
+        if (!TryResolvePart3Assignment(groupIndex, Controller.ActiveParticipantId, out p3, out p3Error))
+        {
+            Debug.LogError("[ExperimentManager] RunPart3 refused: " + p3Error + ". Fix the session configuration / scene.");
+            yield break;
+        }
+        Part3Assignment = p3;
+
         currentRunningPart = RunningPart.Part3;
         CurrentPartConfig = _frozenPartConfigs[2];
         EndPanelActive = false;
@@ -1520,18 +1714,13 @@ public class ExperimentManager : MonoBehaviour
         Part3GroupDef def = Part3GroupTable[groupIndex];
 
         // --- 2. Resolve the fixed start point and the two destination zones. ---
-        Transform startPoint = ResolvePart3Start(def.StartZone);
+        Transform startPoint = p3.StartPoint;
         Part3ZoneTargets d1ZoneTargets = ResolvePart3ZoneTargets(def.Destination1Zone);
         Part3ZoneTargets d2ZoneTargets = ResolvePart3ZoneTargets(def.Destination2Zone);
 
-        if (startPoint == null)
-        {
-            Debug.LogError($"[ExperimentManager] Part3 start point for zone {def.StartZone} is not assigned in the inspector. The participant will NOT be moved for this session.");
-        }
-
-        // --- 3. Independently pick ONE building from each destination zone. Fixed for the whole session. ---
-        GameObject destination1Building = ChoosePart3Building(d1ZoneTargets);
-        GameObject destination2Building = ChoosePart3Building(d2ZoneTargets);
+        // --- 3. ONE building per destination region, drawn from the participant-specific stream (already resolved above). Fixed for the whole session. ---
+        GameObject destination1Building = p3.Destination1.Building;
+        GameObject destination2Building = p3.Destination2.Building;
 
         if (destination1Building == null)
             Debug.LogError($"[ExperimentManager] Part3 Destination 1 zone {def.Destination1Zone} has no candidate buildings assigned.");
@@ -1918,13 +2107,6 @@ public class ExperimentManager : MonoBehaviour
         playerRig.rotation = dest.rotation;
     }
 
-    private Transform ChooseRandomFromArray(Transform[] arr)
-    {
-        if (arr == null || arr.Length == 0) return null;
-        int idx = UnityEngine.Random.Range(0, arr.Length);
-        return arr[idx];
-    }
-
     // ---- Part 3 helpers ------------------------------------------------------------------------
 
     private Transform ResolvePart3Start(Part3Zone zone)
@@ -1949,21 +2131,6 @@ public class ExperimentManager : MonoBehaviour
             case Part3Zone.OU: return part3ZoneOU;
             default: return null;
         }
-    }
-
-    /// <summary>Randomly and independently pick one of the two candidate buildings in a zone.</summary>
-    private GameObject ChoosePart3Building(Part3ZoneTargets zone)
-    {
-        if (zone == null) return null;
-
-        bool hasA = zone.buildingA != null;
-        bool hasB = zone.buildingB != null;
-
-        if (hasA && hasB)
-            return (UnityEngine.Random.Range(0, 2) == 0) ? zone.buildingA : zone.buildingB;
-        if (hasA) return zone.buildingA;
-        if (hasB) return zone.buildingB;
-        return null;
     }
 
     /// <summary>

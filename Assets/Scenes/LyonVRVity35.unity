@@ -290081,7 +290081,7 @@ MonoBehaviour:
   minAttractorsPerAgent: 1
   maxAttractorsPerAgent: 8
   dwellTimeSec: {x: 30, y: 60}
-  part3AttractorMovementProbability: 0.6
+  part3AttractorMovementProbability: 0.8
   wanderingPoints:
   - {fileID: 204195053}
   - {fileID: 1017432391}
@@ -320821,7 +320821,7 @@ MonoBehaviour:
   participantId: 1
   selectedPart: 3
   part2GroupIndex: 0
-  part3GroupIndex: 2
+  part3GroupIndex: 3
   autoStart: 1
   useExternalJson: 0
   externalFileName: session_config.json

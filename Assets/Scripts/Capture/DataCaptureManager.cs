@@ -547,14 +547,18 @@ public class DataCaptureManager : MonoBehaviour
             if (!_experimentManager.EnsureSessionOverridesApplied()) { BlockRecording("the effective experiment settings could not be frozen (see the ExperimentManager / ExternalSessionController log)"); return; }
         }
 
-        // ---- unique session: the run GUID, not the participant ID, makes the folder name; an existing directory is never reused ----
+        // ---- unique session: the run GUID, not the participant ID, makes the folder name unique (the name also shows participant + Part); an existing directory is never reused ----
         string root = string.IsNullOrEmpty(outputRootOverride) ? Application.persistentDataPath : outputRootOverride;
         string folder = null;
         for (int attempt = 0; attempt < 5 && folder == null; attempt++)
         {
             string guid = (runGuidSource != null ? runGuidSource() : null) ?? Guid.NewGuid().ToString("N");
-            string id = SessionIdentity.BuildSessionId(utcNowSource != null ? utcNowSource() : DateTime.UtcNow, guid);
-            string cand = Path.Combine(root, id);
+            DateTime nowUtc = utcNowSource != null ? utcNowSource() : DateTime.UtcNow;
+            string id = SessionIdentity.BuildSessionId(nowUtc, guid);   // the session_id is unchanged; only the folder name also carries participant + Part
+            string folderName;
+            try { folderName = SessionIdentity.BuildSessionFolderName(nowUtc, guid, ParticipantId, (int)_sessionController.ActivePart); }
+            catch (ArgumentException e) { BlockRecording(e.Message); return; }
+            string cand = Path.Combine(root, folderName);
             if (Directory.Exists(cand) || File.Exists(cand)) continue;       // collision: draw again
             try
             {

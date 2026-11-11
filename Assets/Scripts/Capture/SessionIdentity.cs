@@ -8,8 +8,12 @@
 // stand-ins; any all-zero ID (0, 00, P000, p0000 ...) is a placeholder too.
 //
 // Session ID: independent of the participant. "<UTC yyyyMMddTHHmmssZ>_<first 12 hex of the run GUID>". The run GUID (32 hex) is generated once per recording
-// session and stored in the manifest; the session_id (= output folder name) is derived from it, so two sessions - even in the same second, even for the same
+// session and stored in the manifest; the session_id is derived from it, so two sessions - even in the same second, even for the same
 // participant, even for participant strings that would sanitise to the same text - can never share a folder name.
+//
+// Session folder name (display only): "<UTC yyyyMMddTHHmmssZ>_P<participantId>_Part<selectedPart>_<first 12 hex of the run GUID>". It is the session_id with the
+// participant and Part inserted after the timestamp, so a folder can be recognised without opening it. The session_id itself (manifest, CSV columns, audio
+// recording ids) is NOT changed and is no longer identical to the folder name; the manifest's participant_id stays the exact, unsanitised ID.
 // All comments in English per project convention.
 
 using System;
@@ -76,4 +80,30 @@ public static class SessionIdentity
     /// <summary>Session id / folder name from a UTC time and a 32-hex run GUID.</summary>
     public static string BuildSessionId(DateTime utc, string runGuidN)
         => utc.ToString("yyyyMMdd'T'HHmmss'Z'", System.Globalization.CultureInfo.InvariantCulture) + "_" + (runGuidN ?? "").Substring(0, 12);
+
+    /// <summary>
+    /// File-system-safe form of a participant ID for a FOLDER NAME ONLY (never stored in data): letters, digits, '.', '-' and '_' are kept exactly (so leading zeros and
+    /// prefixes survive); every other character becomes '_'. Uniqueness does not depend on it - the run GUID in the folder name does.
+    /// </summary>
+    public static string SanitizeParticipantForFolder(string participantId)
+    {
+        var sb = new System.Text.StringBuilder(participantId.Length);
+        foreach (char c in participantId)
+            sb.Append((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_' ? c : '_');
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Output folder name "&lt;timestamp&gt;_P&lt;participantId&gt;_Part&lt;n&gt;_&lt;guid12&gt;" (the timestamp and guid12 are exactly those of <see cref="BuildSessionId"/>).
+    /// Throws ArgumentException with a diagnostic when the participant ID is invalid/placeholder or the Part is not 1, 2 or 3: a misleading folder name is never produced.
+    /// </summary>
+    public static string BuildSessionFolderName(DateTime utc, string runGuidN, string participantId, int partNumber)
+    {
+        Result idr = ValidateParticipantId(participantId);
+        if (!idr.IsValid) throw new ArgumentException("Cannot name the session folder: participant ID rejected (" + idr.status + "): " + idr.message);
+        if (partNumber < 1 || partNumber > 3) throw new ArgumentException("Cannot name the session folder: selected Part must be 1, 2 or 3, got " + partNumber + ".");
+        string id = BuildSessionId(utc, runGuidN);           // "<timestamp>_<guid12>"
+        int us = id.IndexOf('_');
+        return id.Substring(0, us) + "_P" + SanitizeParticipantForFolder(idr.participantId) + "_Part" + partNumber + id.Substring(us);
+    }
 }

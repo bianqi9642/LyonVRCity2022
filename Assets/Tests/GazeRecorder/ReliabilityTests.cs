@@ -358,13 +358,13 @@ public partial class NpcLifecycleTests
     sealed class IdRig { public Component sc, dcm, em; public string root; }
 
     // A minimal session: controller (+ optional ExperimentManager, DataCaptureManager) created INACTIVE, configured, then activated - like a serialized scene.
-    IdRig MakeIdRig(string participant, bool useJson = false, string jsonName = null, bool autoStart = false, bool withEm = false, bool withDcm = true, string root = null)
+    IdRig MakeIdRig(string participant, bool useJson = false, string jsonName = null, bool autoStart = false, bool withEm = false, bool withDcm = true, string root = null, string part = "Part3")
     {
         var r = new IdRig { root = root ?? Path.Combine(_root, "out_" + Guid.NewGuid().ToString("N").Substring(0, 6)) };
         Directory.CreateDirectory(r.root);
         var scGo = Make("IdController", active: false); r.sc = scGo.AddComponent(T("ExternalSessionController"));
         Set(r.sc, "participantId", participant); Set(r.sc, "autoStart", autoStart);
-        Set(r.sc, "selectedPart", Enum.Parse(T("ExternalSessionController").GetNestedType("ExperimentPart"), "Part3"));
+        Set(r.sc, "selectedPart", Enum.Parse(T("ExternalSessionController").GetNestedType("ExperimentPart"), part));
         if (useJson) { Set(r.sc, "useExternalJson", true); Set(r.sc, "externalFileName", jsonName); }
         if (withEm)
         {
@@ -516,6 +516,93 @@ public partial class NpcLifecycleTests
         Assert.AreEqual(0, Directory.GetFiles(Get<string>(dA, "SessionFolder"), "*.tmp").Length);
     }
     sealed class Rig_ { public Component dcm; public Rig_(IdRig r) { dcm = r.dcm; } }
+
+    // ====================================================================================== session folder name: <timestamp>_P<participant>_Part<n>_<guid12>
+
+    static string FolderName(DateTime utc, string guid, string pid, int part)
+    {
+        try { return (string)T("SessionIdentity").GetMethod("BuildSessionFolderName").Invoke(null, new object[] { utc, guid, pid, part }); }
+        catch (System.Reflection.TargetInvocationException e) { throw e.InnerException; }
+    }
+
+    [Test]
+    public void FolderName_Format_PreservesTimestampAndGuid_AndDistinguishesParticipantAndPart()
+    {
+        var now = new DateTime(2026, 11, 10, 14, 47, 40, DateTimeKind.Utc); string g = "edb106789bf1aaaaaaaaaaaaaaaaaaaa";
+        string sid = (string)T("SessionIdentity").GetMethod("BuildSessionId").Invoke(null, new object[] { now, g });
+        Assert.AreEqual("20261110T144740Z_edb106789bf1", sid, "the session id format is unchanged");
+        Assert.AreEqual("20261110T144740Z_P4_Part3_edb106789bf1", FolderName(now, g, "4", 3));
+        Assert.AreEqual("20261110T144740Z_P4_Part2_edb106789bf1", FolderName(now, g, "4", 2), "a different Part is distinguishable");
+        Assert.AreEqual("20261110T144740Z_P5_Part3_edb106789bf1", FolderName(now, g, "5", 3), "a different participant is distinguishable");
+        Assert.AreNotEqual(FolderName(now, g, "4", 3), FolderName(now, g, "4", 1));
+        // leading zeros and prefixes are kept verbatim after the literal "P"
+        Assert.AreEqual("20261110T144740Z_P007_Part1_edb106789bf1", FolderName(now, g, "007", 1));
+        Assert.AreEqual("20261110T144740Z_PP012_Part1_edb106789bf1", FolderName(now, g, "P012", 1));
+        Assert.AreEqual("20261110T144740Z_PA-07_Part1_edb106789bf1", FolderName(now, g, "A-07", 1));
+        Assert.AreEqual("20261110T144740Z_P2024.17_Part1_edb106789bf1", FolderName(now, g, "2024.17", 1));
+        Assert.AreEqual("20261110T144740Z_P12_Part1_edb106789bf1", FolderName(now, g, "  12  ", 1), "surrounding whitespace is trimmed like the stored ID");
+        // folder-only sanitising of characters that are valid IDs but awkward in a folder name; the id itself is not touched
+        Assert.AreEqual("20261110T144740Z_PS_3_Part1_edb106789bf1", FolderName(now, g, "S 3", 1));
+        Assert.AreEqual("20261110T144740Z_P__Part1_edb106789bf1", FolderName(now, g, "\u00e9", 1), "non-ASCII text becomes '_' in the folder name only");
+    }
+
+    [Test]
+    public void FolderName_InvalidParticipantOrPart_IsRejectedWithDiagnostic()
+    {
+        var now = new DateTime(2026, 11, 10, 14, 47, 40, DateTimeKind.Utc); string g = "edb106789bf1aaaaaaaaaaaaaaaaaaaa";
+        foreach (var bad in new[] { null, "", "   ", "0", "P000", "UNKNOWN", "a/b", "a:b", new string('x', 65) })
+        {
+            var e = Assert.Throws<ArgumentException>(() => FolderName(now, g, bad, 3), "'" + bad + "'");
+            StringAssert.Contains("participant ID rejected", e.Message);
+        }
+        foreach (int part in new[] { 0, 4, -1, 99 })
+            StringAssert.Contains("selected Part must be 1, 2 or 3", Assert.Throws<ArgumentException>(() => FolderName(now, g, "4", part)).Message);
+    }
+
+    [UnityTest]
+    public IEnumerator FolderName_RealSession_UsesResolvedParticipantAndPart_KeepsSessionIdAndWritesEverythingInside()
+    {
+        string root = Path.Combine(_root, "named_out");
+        var a = MakeIdRig("007", root: root, part: "Part3");
+        var b = MakeIdRig("007", root: root, part: "Part2");          // same participant, other Part
+        var c = MakeIdRig("A-07", root: root, part: "Part3");         // other participant, same Part
+        var d = MakeIdRig("P 1", root: root, part: "Part1");          // folder-unsafe-ish text: folder sanitised, manifest exact
+        yield return null; yield return null;
+        var all = new[] { (a, "007", "Part3", "P007_Part3"), (b, "007", "Part2", "P007_Part2"), (c, "A-07", "Part3", "PA-07_Part3"), (d, "P 1", "Part1", "PP_1_Part1") };
+        var names = new List<string>();
+        foreach (var (rig, pid, part, tag) in all)
+        {
+            Assert.IsFalse(Get<bool>(rig.dcm, "RecordingBlocked"), pid + " " + part);
+            string folder = Get<string>(rig.dcm, "SessionFolder"), sid = Get<string>(rig.dcm, "SessionId"); string name = Path.GetFileName(folder);
+            names.Add(name);
+            Assert.AreEqual(root, Path.GetDirectoryName(folder));
+            StringAssert.IsMatch(@"^\d{8}T\d{6}Z_" + Regex.Escape(tag) + @"_[0-9a-f]{12}$", name);
+            // the session id (manifest / CSV key) keeps its original <timestamp>_<guid12> form and is the folder name minus "_P<participant>_Part<n>"
+            StringAssert.IsMatch(@"^\d{8}T\d{6}Z_[0-9a-f]{12}$", sid);
+            Assert.AreEqual(sid, name.Substring(0, 16) + name.Substring(name.Length - 13), "timestamp and guid12 preserved");
+            var man = JsonUtility.FromJson<IdManifest>(File.ReadAllText(Path.Combine(folder, "session_manifest.json")));
+            Assert.AreEqual(sid, man.session_id); Assert.AreEqual(pid, man.participant_id, "the stored participant ID is exact, never the folder text"); Assert.AreEqual(part, man.selected_part);
+            StringAssert.EndsWith(man.run_guid.Substring(0, 12), name);
+            foreach (string f in new[] { "session_manifest.json", "session_config.used.json", "events.csv" })
+                Assert.IsTrue(File.Exists(Path.Combine(folder, f)), f + " is written inside " + name);
+        }
+        CollectionAssert.AllItemsAreUnique(names);
+        Assert.AreEqual(4, Directory.GetDirectories(root).Length); Assert.AreEqual(0, Directory.GetFiles(root).Length, "nothing is written next to the session folders");
+        TearDownRigObjects(); yield return null; yield return null;
+
+        // identical participant + Part + second: the run GUID still keeps the folders apart, and an existing folder is never reused
+        string root2 = Path.Combine(_root, "named_collide"); Directory.CreateDirectory(root2);
+        var fixedNow = new DateTime(2026, 11, 10, 14, 47, 40, DateTimeKind.Utc); string g1 = "0123456789abcdef0123456789abcdef", g2 = "fedcba9876543210fedcba9876543210";
+        var first = MakeIdRig("4", root: root2, withDcm: false, part: "Part3");
+        Component NewDcm(string n, string guid) { var g = Make(n, active: false); var dd = g.AddComponent(DcmType); Set(dd, "outputRootOverride", root2); Set(dd, "enableDebugLogs", false); Set(dd, "runGuidSource", (Func<string>)(() => guid)); Set(dd, "utcNowSource", (Func<DateTime>)(() => fixedNow)); Set(dd, "_sessionController", first.sc); g.SetActive(true); return dd; }
+        var d1 = NewDcm("N1", g1); yield return null; var d2 = NewDcm("N2", g2); yield return null;
+        Assert.AreEqual("20261110T144740Z_P4_Part3_0123456789ab", Path.GetFileName(Get<string>(d1, "SessionFolder")));
+        Assert.AreEqual("20261110T144740Z_P4_Part3_fedcba987654", Path.GetFileName(Get<string>(d2, "SessionFolder")));
+        LogAssert.Expect(LogType.Error, new Regex("RECORDING BLOCKED.*unique session folder"));
+        var d3 = NewDcm("N3", g1); yield return null;
+        Assert.IsTrue(Get<bool>(d3, "RecordingBlocked"), "the same timestamp/participant/Part/GUID can never overwrite the first session");
+        Assert.AreEqual(2, Directory.GetDirectories(root2).Length);
+    }
 
     [UnityTest]
     public IEnumerator Identity_ValidSession_ReplaysEarlyPrewarmEvents_UnderTheValidatedIdentity()

@@ -309,3 +309,9 @@ Of the 143 v16 columns: 60 stay in gaze.csv, 75 move to gaze_diagnostics.csv und
 | `eyes_closed_right_recovered` | kept in gaze.csv | same name, same meaning | - |
 | `face_sample_frame` | moved to gaze_diagnostics.csv | same name, same meaning | face diagnostics |
 | `face_data_source` | moved to gaze_diagnostics.csv | same name, same meaning | face diagnostics (now live per row) |
+
+## 4. Optional companion file: gaze_ui_hits.csv (Canvas UI gaze path)
+
+Not part of schema v17 and **not** counted in the 61 / 85 columns above: an optional third stream with its own schema version (`GazeRecorder.GazeUiHitsSchemaVersion` = 1, 30 columns, one row per gaze row, keys `session_id` + `frame_index` + `t_abs`).
+It records which Canvas Graphic the same gaze ray hit (World Space / Screen Space - Camera), the raw physical-hit facts of that ray and the resolved primary target. No `gaze.csv` / `gaze_diagnostics.csv` column changed meaning, name or order; `hit_semantic_class` still describes the
+**collider** hit only (it never reports a Canvas element, because panels have no collider). Full column dictionary, mechanism, priority policy and limits: `docs/gaze_ui_detection.md`. Historical sessions simply have no such file.

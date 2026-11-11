@@ -121,3 +121,8 @@ Face tracking runs (it does not record) from the start of Part 2 / 3 until the s
 ## Still requires a hardware session (Quest Pro over Quest Link)
 
 Audio index finalisation and the `Closed` session state with a real microphone; first-row Visual face tracking readiness and the real wait time; independent left / right eyelid response (controlled closure sequence); terrain classification and ground-height coverage on the real route (and the AutoGroundAlign effect above); the v17 files from a real session; a full session reaching `Closed`.
+
+## Addendum: optional gaze_ui_hits.csv (Canvas UI gaze detection)
+
+Session `schema_version` stays **17**. `gaze.csv` (61 columns), `gaze_diagnostics.csv` (85 columns) and the Physics raycast are unchanged. A new OPTIONAL stream `gaze_ui_hits.csv` (own version 1, 30 columns, keys `session_id` + `frame_index` + `t_abs`) is written next to them while
+`GazeRecorder.enableUiGaze` is on (default); it is listed in the manifest `file_list`, verified at finalisation (`capture_streams_closed` / `_failed`) and summarised in the manifest blocks `gaze_ui_hits` and `health_gaze_ui_hits`. See `docs/gaze_ui_detection.md`.

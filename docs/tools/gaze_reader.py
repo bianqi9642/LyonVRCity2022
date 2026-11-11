@@ -17,6 +17,11 @@ WHY: schema v17 split the old 143-column gaze.csv into a 61-column analysis tabl
 
 Missing values stay '' (blank = not measured); 0 / 0.0000 is a value. Nothing is interpolated.
 
+OPTIONAL Canvas UI companion file (gaze_ui_hits.csv, schema v1; see docs/gaze_ui_detection.md):
+  read_gaze_ui_hits(path)        the companion file alone (header validated against UI_COLUMNS_V1; extra trailing columns of a later version are kept)
+  read_gaze_with_ui(path)        read_gaze() plus the companion columns joined on (session_id, frame_index, t_abs). Historical sessions (v11-v17 without the file) are returned unchanged with
+                                 table.ui_missing = True and a warning - never an error, never invented values. ui_hit is BLANK when the UI path was not evaluated for that row (ui_ray_evaluated = 0).
+
 Usage:   python3 -I gaze_reader.py <session_dir | gaze.csv>      prints a one-line summary
          from gaze_reader import read_gaze
 """
@@ -26,6 +31,18 @@ import os
 import sys
 
 DIAG_SUFFIX = "_diagnostics"
+UI_SUFFIX = "_ui_hits"
+# gaze_ui_hits.csv schema v1 (GazeRecorder.UiHitColumns), in file order
+UI_COLUMNS_V1 = [
+    "t_abs", "frame_index", "session_id",
+    "ui_ray_evaluated", "ui_ray_skip_reason", "ui_hit",
+    "ui_canvas_id", "ui_canvas_name", "ui_canvas_render_mode", "ui_canvas_sorting_order",
+    "ui_element_id", "ui_element_name", "ui_element_category", "ui_roi_label", "ui_element_has_gaze_component", "ui_interactable",
+    "ui_hit_point_x", "ui_hit_point_y", "ui_hit_point_z", "ui_hit_distance", "ui_graphics_under_ray",
+    "world_hit", "world_hit_distance", "world_hit_instance_id", "world_hit_semantic_class", "world_occluder_established",
+    "primary_target_class", "primary_target_basis", "primary_target_id", "primary_target_roi",
+]
+PRIMARY_CLASSES = ("NoHit", "WorldObject", "CanvasUI", "Uncertain")
 
 
 class GazeAlignmentError(ValueError):
@@ -77,6 +94,12 @@ def diagnostics_path(gaze_path):
     d, n = os.path.split(gaze_path)
     stem, ext = os.path.splitext(n)
     return os.path.join(d, stem + DIAG_SUFFIX + ext)
+
+
+def ui_hits_path(gaze_path):
+    d, n = os.path.split(gaze_path)
+    stem, ext = os.path.splitext(n)
+    return os.path.join(d, stem + UI_SUFFIX + ext)
 
 
 def _quat_forward(x, y, z, w):
@@ -166,6 +189,51 @@ def read_gaze(path, strict=True):
     if unrecorded:
         warnings.append("%d head-fallback row(s): the cast ray was not recorded, ray_origin_* / ray_dir_* are blank" % unrecorded)
     return GazeTable(out_header, out_rows, "v17", merged=True, warnings=warnings)
+
+
+def read_gaze_ui_hits(path):
+    """The companion file gaze_ui_hits.csv alone (schema v1). `path` = the session dir, gaze.csv or gaze_ui_hits.csv. A file with only a header (no UI hit and no row) is valid and returns zero rows."""
+    if os.path.isdir(path):
+        path = os.path.join(path, "gaze_ui_hits.csv")
+    elif os.path.basename(path) == "gaze.csv":
+        path = ui_hits_path(path)
+    header, rows = _read(path)
+    if header[:len(UI_COLUMNS_V1)] != UI_COLUMNS_V1:
+        missing = [c for c in UI_COLUMNS_V1 if c not in header]
+        raise GazeAlignmentError("gaze_ui_hits.csv is not schema v1: %s" % ("missing column(s) " + ", ".join(missing) if missing else "the first %d columns differ in order" % len(UI_COLUMNS_V1)))
+    _keys(header, rows, "gaze_ui_hits.csv")
+    return GazeTable(header, rows, "ui_v1")
+
+
+def read_gaze_with_ui(path, strict=True):
+    """read_gaze() plus the companion columns (everything of gaze_ui_hits.csv except the three keys), joined on (session_id, frame_index, t_abs). See the module docstring for the missing-file contract."""
+    t = read_gaze(path, strict=strict)
+    gpath = os.path.join(path, "gaze.csv") if os.path.isdir(path) else path
+    upath = ui_hits_path(gpath)
+    t.ui_missing = not os.path.exists(upath)
+    if t.ui_missing:
+        t.warnings.append("gaze_ui_hits.csv is missing (a session recorded without the Canvas UI path): no UI columns were added, nothing is inferred")
+        return t
+    u = read_gaze_ui_hits(upath)
+    pkeys = _keys(t.header, t.rows, "gaze.csv")
+    ukeys = _keys(u.header, u.rows, "gaze_ui_hits.csv")
+    umap = dict(zip(ukeys, range(len(u.rows))))
+    missing = [k for k in pkeys if k not in umap]
+    extra = [k for k in ukeys if k not in set(pkeys)]
+    if missing or extra or len(u.rows) != len(t.rows):
+        msg = "gaze.csv has %d rows, gaze_ui_hits.csv has %d; %d gaze row(s) without a UI row (e.g. %s), %d UI row(s) without a gaze row (e.g. %s)" % (
+            len(t.rows), len(u.rows), len(missing), missing[0] if missing else "-", len(extra), extra[0] if extra else "-")
+        if strict:
+            raise GazeAlignmentError(msg)
+        t.warnings.append(msg)
+    cols = [k for k, n in enumerate(u.header) if n not in t.header]
+    blank = [""] * len(cols)
+    for row, key in zip(t.rows, pkeys):
+        j = umap.get(key)
+        row.extend([u.rows[j][k] for k in cols] if j is not None else blank)
+    t.header = t.header + [u.header[k] for k in cols]
+    t._idx = {n: i for i, n in enumerate(t.header)}
+    return t
 
 
 def summarize(t):

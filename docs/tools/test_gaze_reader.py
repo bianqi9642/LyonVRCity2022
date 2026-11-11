@@ -242,5 +242,110 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual(t.warnings, [])
 
 
+UI = parse_columns("UiHitColumns")
+# the newest real v17 session available read-only (skipped when absent); it has NO gaze_ui_hits.csv: the historical-data contract
+REAL_V17_SESSIONS = ["/Users/qiaoy/Downloads/20261109T132341Z_acbec6ea9a74", "/Users/qiaoy/Downloads/20261109T125407Z_82e817202fc8", "/Users/qiaoy/Downloads/20261109T125106Z_d9b46d699d22"]
+
+
+class UiSchemaDefinitionTests(unittest.TestCase):
+    def test_reader_constant_equals_the_columns_the_recorder_writes(self):
+        self.assertEqual(UI, gr.UI_COLUMNS_V1, "gaze_ui_hits.csv v1: GazeRecorder.UiHitColumns and gaze_reader.UI_COLUMNS_V1 must list the same columns in the same order")
+        self.assertEqual(len(UI), 30); self.assertEqual(len(set(UI)), 30)
+        for k in gr.KEYS:
+            self.assertIn(k, UI)
+        for k in UI:
+            self.assertNotIn(k, [c for c in PRIMARY if c not in gr.KEYS], k + " must not collide with a gaze.csv column")
+            self.assertNotIn(k, [c for c in DIAG if c not in gr.KEYS], k + " must not collide with a gaze_diagnostics.csv column")
+
+    def test_doc_lists_exactly_the_written_columns_in_order(self):
+        doc = slurp(os.path.join(REPO, "docs", "gaze_ui_detection.md"))
+        a = doc.index("## Data: gaze_ui_hits.csv"); b = doc.index("\n## ", a + 5)
+        self.assertEqual(re.findall(r"^\| \d+ \| `([a-z_0-9]+)` \|", doc[a:b], re.M), UI)
+
+    def test_manifest_and_session_schema_decision_is_documented(self):
+        src = slurp(os.path.join(REPO, "Assets", "Scripts", "GazeRecorder.cs"))
+        self.assertIn("GazeUiHitsSchemaVersion = 1", src)
+        self.assertIn("SchemaVersion   = 17", slurp(os.path.join(REPO, "Assets", "Scripts", "Capture", "CaptureConstants.cs")), "the session schema stays 17: the new file is optional and versioned on its own")
+
+
+class UiReaderTests(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.g = os.path.join(self.d, "gaze.csv"); self.dg = os.path.join(self.d, "gaze_diagnostics.csv"); self.u = os.path.join(self.d, "gaze_ui_hits.csv")
+        self.prim = [row(PRIMARY, t_abs="1.0000", frame_index="10", session_id="S1", combined_valid="1"), row(PRIMARY, t_abs="1.0500", frame_index="11", session_id="S1", combined_valid="0"),
+                     row(PRIMARY, t_abs="1.1000", frame_index="12", session_id="S1", combined_valid="1")]
+        write(self.g, PRIMARY, self.prim)
+        write(self.dg, DIAG, [row(DIAG, t_abs=p[PRIMARY.index("t_abs")], frame_index=p[PRIMARY.index("frame_index")], session_id="S1") for p in self.prim])
+
+    def ui_rows(self):
+        hit = row(UI, t_abs="1.0000", frame_index="10", session_id="S1", ui_ray_evaluated="1", ui_hit="1", ui_canvas_id="Panel", ui_element_id="Panel/Btn", ui_element_category="button", ui_roi_label="UI_BUTTON",
+                  ui_hit_distance="3.000", world_hit="1", world_hit_distance="9.000", primary_target_class="CanvasUI", primary_target_basis="ui_in_front", primary_target_id="Panel/Btn", primary_target_roi="UI_BUTTON")
+        skipped = row(UI, t_abs="1.0500", frame_index="11", session_id="S1", ui_ray_evaluated="0", ui_ray_skip_reason="head_fallback_ray", world_hit="1", primary_target_class="WorldObject", primary_target_basis="ui_not_evaluated")
+        nohit = row(UI, t_abs="1.1000", frame_index="12", session_id="S1", ui_ray_evaluated="1", ui_hit="0", world_hit="0", primary_target_class="NoHit", primary_target_basis="no_hit")
+        return [hit, skipped, nohit]
+
+    def test_join_adds_the_ui_columns_row_by_row_and_keeps_gaze_untouched(self):
+        write(self.u, UI, self.ui_rows())
+        t = gr.read_gaze_with_ui(self.d)
+        self.assertFalse(t.ui_missing); self.assertEqual(len(t.rows), 3); self.assertEqual(t.schema, "v17")
+        for n in UI:
+            self.assertTrue(t.has(n), n)
+        self.assertEqual([t.get(r, "ui_hit") for r in t.rows], ["1", "", "0"], "blank = not evaluated, 0 = evaluated and nothing hit")
+        self.assertEqual(t.get(t.rows[0], "primary_target_id"), "Panel/Btn"); self.assertEqual(t.get(t.rows[1], "ui_ray_skip_reason"), "head_fallback_ray")
+        base = gr.read_gaze(self.d)
+        for n in base.header:
+            self.assertEqual([t.get(r, n) for r in t.rows], [base.get(r, n) for r in base.rows], "column " + n + " unchanged by the UI join")
+
+    def test_file_with_no_ui_hit_and_header_only_are_readable(self):
+        rows = [r for r in self.ui_rows()]
+        for r in rows:
+            for c in ("ui_canvas_id", "ui_element_id", "ui_element_category", "ui_roi_label", "ui_hit_distance"):
+                r[UI.index(c)] = ""
+            r[UI.index("ui_hit")] = "0"
+        write(self.u, UI, rows)
+        t = gr.read_gaze_with_ui(self.d); self.assertTrue(all(t.get(r, "ui_hit") == "0" for r in t.rows))
+        write(self.u, UI, [])
+        u = gr.read_gaze_ui_hits(self.u); self.assertEqual(u.rows, []); self.assertEqual(u.header, UI)
+
+    def test_missing_companion_file_is_the_historical_case_not_an_error(self):
+        t = gr.read_gaze_with_ui(self.d)
+        self.assertTrue(t.ui_missing); self.assertEqual(len(t.rows), 3); self.assertFalse(t.has("ui_hit")); self.assertTrue(any("gaze_ui_hits.csv is missing" in w for w in t.warnings))
+        base = gr.read_gaze(self.d); self.assertEqual(t.header, base.header)
+
+    def test_misalignment_is_an_error_strict_and_a_warning_with_a_left_join_otherwise(self):
+        write(self.u, UI, self.ui_rows()[:2])
+        with self.assertRaises(gr.GazeAlignmentError):
+            gr.read_gaze_with_ui(self.d)
+        t = gr.read_gaze_with_ui(self.d, strict=False)
+        self.assertEqual(len(t.rows), 3); self.assertEqual(t.get(t.rows[2], "ui_hit"), ""); self.assertTrue(any("without a UI row" in w for w in t.warnings))
+
+    def test_wrong_schema_header_is_rejected(self):
+        write(self.u, UI[1:], [r[1:] for r in self.ui_rows()])
+        with self.assertRaises(gr.GazeAlignmentError):
+            gr.read_gaze_ui_hits(self.u)
+
+    def test_a_later_version_may_append_columns(self):
+        write(self.u, UI + ["future_column"], [r + ["x"] for r in self.ui_rows()])
+        t = gr.read_gaze_with_ui(self.d); self.assertTrue(t.has("future_column"))
+
+    def test_v11_to_v16_files_have_no_companion_and_stay_unchanged(self):
+        header = ["time_since_start_s", "left_confidence"]
+        write(self.g, header, [["0.1", "0.9"]]); os.remove(self.dg)
+        t = gr.read_gaze_with_ui(self.d); self.assertEqual(t.schema, "v11-v16"); self.assertTrue(t.ui_missing); self.assertEqual(t.header, header); self.assertEqual(t.rows, [["0.1", "0.9"]])
+
+    def test_real_v17_sessions_without_the_companion_read_unchanged(self):
+        for sdir in REAL_V17_SESSIONS:
+            if not os.path.exists(os.path.join(sdir, "gaze.csv")):
+                continue
+            before = os.stat(os.path.join(sdir, "gaze.csv")).st_mtime_ns
+            t = gr.read_gaze_with_ui(sdir)
+            self.assertTrue(t.ui_missing); self.assertEqual(t.schema, "v17")
+            plain = gr.read_gaze(sdir); self.assertEqual(t.header, plain.header); self.assertEqual(len(t.rows), len(plain.rows))
+            self.assertEqual(os.stat(os.path.join(sdir, "gaze.csv")).st_mtime_ns, before, "the historical file is never modified")
+            self.assertFalse(os.path.exists(os.path.join(sdir, "gaze_ui_hits.csv")), "the reader never creates the companion file")
+            return
+        self.skipTest("no real v17 session present")
+
+
 if __name__ == "__main__":
     unittest.main()

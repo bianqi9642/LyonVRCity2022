@@ -730,6 +730,7 @@ public class DataCaptureManager : MonoBehaviour
         }
         if (_gazeRecorder != null && _gazeRecorder.Writer != null) One("gaze", _gazeRecorder.Writer);   // closed by GazeRecorder.CloseForSession; verified here so its failure is not lost
         if (_gazeRecorder != null && _gazeRecorder.DiagnosticsWriter != null) One("gaze_diagnostics", _gazeRecorder.DiagnosticsWriter);
+        if (_gazeRecorder != null && _gazeRecorder.UiHitsWriter != null) One("gaze_ui_hits", _gazeRecorder.UiHitsWriter);   // optional companion stream (schema v1)
         lock (_gate) { _captureStreamsClosed = closed.ToArray(); _captureStreamsFailed = failed.ToArray(); }
     }
 
@@ -742,7 +743,7 @@ public class DataCaptureManager : MonoBehaviour
         {
             UpdateManifestEvidence("capture_closed");
             _fileList.Clear();
-            foreach (string f in new[] { "session_manifest.json", "events.csv", "gaze.csv", CaptureConstants.GazeDiagnosticsFile, "trajectory.csv", "building_registry.csv", "npc_state.csv", "npc_events.csv", "npc_lifetimes.csv", "npc_profiles.csv" }) AddIfExists(f);
+            foreach (string f in new[] { "session_manifest.json", "events.csv", "gaze.csv", CaptureConstants.GazeDiagnosticsFile, CaptureConstants.GazeUiHitsFile, "trajectory.csv", "building_registry.csv", "npc_state.csv", "npc_events.csv", "npc_lifetimes.csv", "npc_profiles.csv" }) AddIfExists(f);
             AddAudioFiles();
             _manifest.file_list = _fileList.ToArray();
             _finalManifestWriting = true;
@@ -2025,6 +2026,25 @@ public class DataCaptureManager : MonoBehaviour
     }
 
     /// <summary>
+    /// Manifest block of the OPTIONAL companion file gaze_ui_hits.csv (Canvas UI gaze detection). schema_version is the version of THAT file (GazeRecorder.GazeUiHitsSchemaVersion), independent of the session schema_version.
+    /// status: not_enabled (UI gaze off or no recorder) | configured_no_rows | ok | write_error | recovered (same vocabulary as the writer health blocks). The counters say what the UI path did; they never
+    /// describe the participant's looking behaviour by themselves.
+    /// </summary>
+    [Serializable]
+    public class GazeUiManifest
+    {
+        public int schema_version;
+        public string file = "", status = "not_enabled", ray_scope = "", render_mode_support = "", primary_target_policy = "";
+        public bool enabled;
+        public string[] columns = new string[0];
+        public long rows_written, rows_ui_hit, rows_ui_not_evaluated, rows_ui_behind_world_hit;
+        public long primary_canvas_ui, primary_world_object, primary_uncertain, primary_no_hit;
+        public int canvases_registered, scene_scans;
+        public long ui_raycast_calls, canvases_tested, graphics_tested, canvases_skipped_overlay_unsupported, canvases_skipped_no_event_camera, canvases_skipped_no_graphic_raycaster,
+                    canvases_skipped_layer_not_rendered, canvases_skipped_inactive, canvases_skipped_screen_space_camera_disabled, projection_failures;
+    }
+
+    /// <summary>
     /// Evidence about one data stream, built from the writer's own counters (never from a component's existence). status:
     /// not_configured (no checkpoint ever saw it enabled) | disabled_by_master_switch (NPC streams, npcCaptureEnabled=false) | configured_no_rows | ok | write_error.
     /// Numeric "none yet" values are -1 (first/last_row_t_abs). History is cumulative over the session; configured_now is the state at the last update.
@@ -2126,6 +2146,9 @@ public class DataCaptureManager : MonoBehaviour
                             health_npc_state = new StreamHealth(), health_npc_events = new StreamHealth(), health_npc_lifetimes = new StreamHealth(),
                             health_npc_profiles = new StreamHealth();
         public RateSummary rate_gaze = new RateSummary(), rate_trajectory = new RateSummary();
+        // optional companion stream gaze_ui_hits.csv (Canvas UI gaze detection, own schema version): writer health + what the UI path did. Sessions without it (older builds, enableUiGaze off) keep the defaults.
+        public StreamHealth health_gaze_ui_hits = new StreamHealth();
+        public GazeUiManifest gaze_ui_hits = new GazeUiManifest();
         public bool gaze_recorder_present;
         public long gaze_rows_valid_eye, gaze_rows_fallback, gaze_rows_left_valid, gaze_rows_right_valid;
         public float gaze_valid_eye_fraction = -1, gaze_valid_eye_rate_hz = -1;
@@ -2420,6 +2443,7 @@ public class DataCaptureManager : MonoBehaviour
         AddIfExists("events.csv");
         AddIfExists("gaze.csv");
         AddIfExists(CaptureConstants.GazeDiagnosticsFile);
+        AddIfExists(CaptureConstants.GazeUiHitsFile);
         AddIfExists("trajectory.csv");
         AddIfExists("building_registry.csv");
         AddIfExists("npc_state.csv");
@@ -2444,7 +2468,7 @@ public class DataCaptureManager : MonoBehaviour
         FillNpcRateManifest();
         UpdateManifestEvidence(reason);
         _fileList.Clear();
-        foreach (string f in new[] { "session_manifest.json", "events.csv", "gaze.csv", CaptureConstants.GazeDiagnosticsFile, "trajectory.csv", "building_registry.csv", "npc_state.csv", "npc_events.csv", "npc_lifetimes.csv", "npc_profiles.csv" }) AddIfExists(f);
+        foreach (string f in new[] { "session_manifest.json", "events.csv", "gaze.csv", CaptureConstants.GazeDiagnosticsFile, CaptureConstants.GazeUiHitsFile, "trajectory.csv", "building_registry.csv", "npc_state.csv", "npc_events.csv", "npc_lifetimes.csv", "npc_profiles.csv" }) AddIfExists(f);
         AddAudioFiles();
         _manifest.file_list = _fileList.ToArray();
         WriteManifest();
@@ -2485,6 +2509,7 @@ public class DataCaptureManager : MonoBehaviour
         gh.status = StatusOf(gh, false);
         FillRate(_manifest.rate_trajectory, _trajStats, _frameStats, _trajScheduler, _traj != null ? _traj.RowsDroppedAfterFailure : 0);
         FillFrameTiming(_manifest.frame_timing);
+        FillGazeUi(gazeCfg);
         FillEyeTracking(gh);
         FillNpcPreparation();
         if (_audio != null) _audio.FillManifest(_manifest.audio_capture); else { _manifest.audio_capture.enabled = false; _manifest.audio_capture.status = "not_enabled"; }
@@ -2508,6 +2533,32 @@ public class DataCaptureManager : MonoBehaviour
     }
 
     static bool OkOrNotExpected(StreamHealth h) => h.status == "ok" || h.status == "not_configured" || h.status == "disabled_by_master_switch";
+
+    bool _everConfiguredGazeUi;
+
+    // Companion stream gaze_ui_hits.csv: writer health through the same machinery as every stream, plus the counters of the UI path (GazeUiRaycaster) and the resolved-target tallies.
+    void FillGazeUi(bool gazeCfg)
+    {
+        GazeUiManifest m = _manifest.gaze_ui_hits;
+        GazeRecorder g = _gazeRecorder;
+        bool enabled = g != null && g.enableUiGaze;
+        bool cfgNow = enabled && gazeCfg; _everConfiguredGazeUi |= cfgNow;
+        m.schema_version = GazeRecorder.GazeUiHitsSchemaVersion; m.file = CaptureConstants.GazeUiHitsFile; m.enabled = enabled;
+        m.columns = GazeRecorder.UiHitColumns;
+        m.ray_scope = CaptureConstants.GazeUiRayScopeText; m.render_mode_support = CaptureConstants.GazeUiRenderModeText; m.primary_target_policy = CaptureConstants.GazeUiPolicyText;
+        FillWriterHealth(_manifest.health_gaze_ui_hits, g != null ? g.UiHitsWriter : null, cfgNow, _everConfiguredGazeUi, false);
+        bool noStream = g == null || (!enabled && g.UiRowsWritten == 0);   // switched off (and never wrote): "not_enabled" whatever an earlier checkpoint saw
+        m.status = noStream || _manifest.health_gaze_ui_hits.status == "not_configured" ? "not_enabled" : _manifest.health_gaze_ui_hits.status;
+        if (g == null) return;
+        m.rows_written = g.UiRowsWritten; m.rows_ui_hit = g.UiRowsWithHit; m.rows_ui_not_evaluated = g.UiRowsNotEvaluated; m.rows_ui_behind_world_hit = g.UiRowsBehindWorldHit;
+        m.primary_canvas_ui = g.UiPrimaryCanvasUi; m.primary_world_object = g.UiPrimaryWorldObject; m.primary_uncertain = g.UiPrimaryUncertain; m.primary_no_hit = g.UiPrimaryNoHit;
+        m.canvases_registered = GazeUiRegistry.Count; m.scene_scans = GazeUiRegistry.SceneScans;
+        GazeUiRaycaster r = g.UiRaycaster;
+        m.ui_raycast_calls = r.Calls; m.canvases_tested = r.CanvasesTested; m.graphics_tested = r.GraphicsTested;
+        m.canvases_skipped_overlay_unsupported = r.CanvasesSkippedOverlay; m.canvases_skipped_no_event_camera = r.CanvasesSkippedNoEventCamera; m.canvases_skipped_no_graphic_raycaster = r.CanvasesSkippedNoGraphicRaycaster;
+        m.canvases_skipped_layer_not_rendered = r.CanvasesSkippedLayerNotRendered; m.canvases_skipped_inactive = r.CanvasesSkippedInactive; m.canvases_skipped_screen_space_camera_disabled = r.CanvasesSkippedScreenSpaceCameraDisabled;
+        m.projection_failures = r.ProjectionFailures;
+    }
 
     void FillWriterHealth(StreamHealth h, CaptureCsvWriter w, bool configuredNow, bool everConfigured, bool npcStream)
     {

@@ -20,6 +20,10 @@
 // panel-reading phases are NOT current: they keep the candidate / building class and hit_is_current_target = 0 (hit_assigned_destination still names D1/D2).
 //
 // building_id is always GameObject.name (frozen decision). targetId is never used as identity.
+// UI (Canvas) gaze targets (gaze_ui_hits.csv, see GazeUiRaycaster): the SAME ROI vocabulary is extended, not duplicated - semantic class "UI" (the class priority 7 already used for colliders under a Canvas),
+// and an ROI label per Canvas element: GazeUIElement.roiLabel when set, else "UI_<CATEGORY>" (UiRoiLabel). PrimaryRoi() names the ROI of the resolved primary target (UI label or the physical
+// semantic class). The physical classification above is unchanged.
+//
 // A one-entry collider cache skips hierarchy re-resolution during a fixation; it holds only target-INDEPENDENT facts (base class, owner object).
 // All comments in English per project convention.
 
@@ -63,6 +67,17 @@ public static class AoiClassifier
 
     /// <summary>Resets the diagnostic counter (tests).</summary>
     public static void ResetDiagnostics() { UnresolvedNpcHits = 0; s_col = null; }
+
+    /// <summary>Semantic class of a Canvas element hit by the gaze UI path (same value as the collider class of priority 7).</summary>
+    public const string UiSemanticClass = "UI";
+
+    /// <summary>ROI label of a Canvas element: the explicit GazeUIElement label, else "UI_" + the category in upper case (UI_BUTTON, UI_TARGET_PREVIEW, ...).</summary>
+    public static string UiRoiLabel(string category, string explicitLabel)
+        => !string.IsNullOrEmpty(explicitLabel) ? explicitLabel : "UI_" + (string.IsNullOrEmpty(category) ? "OTHER" : category.ToUpperInvariant());
+
+    /// <summary>ROI of the resolved primary target: the UI ROI label for CanvasUI, the physical semantic class (BUILDING, NPC, TARGET_BUILDING, ...) for WorldObject, blank otherwise.</summary>
+    public static string PrimaryRoi(string primaryClass, string uiRoiLabel, string worldSemanticClass)
+        => primaryClass == "CanvasUI" ? (uiRoiLabel ?? "") : (primaryClass == "WorldObject" ? (worldSemanticClass ?? "") : "");
 
     static readonly Regex s_batiRe = new Regex(@"^\d{5}[A-Z]{2}\d+$", RegexOptions.Compiled);
 

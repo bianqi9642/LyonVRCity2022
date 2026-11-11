@@ -240,6 +240,11 @@ public static class CaptureConstants
     //    Manifest: eye_tracking.blink gains startup_* and the blink-detection honesty fields; audio_capture gains time_mapping*, index_* classification fields. Readers of v11-v16 files are unchanged.
     public const int    SchemaVersion   = 17;
     public const string GazeDiagnosticsFile = "gaze_diagnostics.csv";
+    // Optional companion stream of the Canvas UI gaze path (own schema version, GazeRecorder.GazeUiHitsSchemaVersion; the session SchemaVersion above is unchanged).
+    public const string GazeUiHitsFile = "gaze_ui_hits.csv";
+    public const string GazeUiRayScopeText = "the combined gaze ray (same origin / direction / length as the physical raycast) is tested against registered Canvases only for rows with a real eye-gaze ray (combined_valid = 1) unless uiRaycastOnHeadFallback; one row per gaze row, blank ui_hit = not evaluated";
+    public const string GazeUiRenderModeText = "WorldSpace: supported; ScreenSpaceCamera with an assigned camera: supported; ScreenSpaceOverlay: NOT supported (no world position, not composited into the headset image) - skipped and counted";
+    public const string GazeUiPolicyText = "UI at or in front of the physical hit wins (ui_in_front); physical hit in front of the UI wins only when it is an established opaque occluder (world_occludes_ui), otherwise primary is Uncertain (occlusion_not_established); both raw channels are always recorded";
     public const string NpcIdScheme     = "agent-lifetime-v1: npc_id=AgentID (stable pooled GameObject); npc_spawn_instance_id=<AgentID>-S<n> (n = per-AgentID lifetime index, from 1)";
     public const string NpcCaptureModeText =
         "master_switch: npc_state.csv holds every active NPC lifetime of a Part whose npcCaptureEnabled is true, from the moment NPCs exist (warm-up, " +

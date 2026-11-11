@@ -44,6 +44,11 @@
 //  docs/gaze_schema_v17_dictionary.md. The face signal is read LIVE per row from one GetFaceState2 state (started, source, validity, provider time, weights); the readiness gate (BeginFaceTrackingStartup /
 //  AwaitFaceTrackingReady) starts face tracking before the first row and records nothing. No gaze origin / direction / ViewFrame / sampling-rate logic changed. See docs/schema_v17_changes.md.
 //
+// Revision 6 (Canvas UI gaze detection, gaze_ui_hits.csv schema v1) - ADDITIVE: gaze.csv (v17, 61 columns) and gaze_diagnostics.csv (85 columns) and the Physics.Raycast above are UNCHANGED. With enableUiGaze the
+//  same combined gaze ray is also tested against the registered Canvases (GazeUiRaycaster: World Space and Screen Space - Camera; Overlay is unsupported) and ONE companion row per gaze row is written to
+//  gaze_ui_hits.csv (UiHitColumns; keys t_abs + frame_index + session_id): the raw UI hit, the raw world hit facts, and the resolved primary target (GazeTargetResolver). The UI test runs only for rows
+//  that carry a real eye-gaze ray (combined_valid = 1) unless uiRaycastOnHeadFallback is set. See docs/gaze_ui_detection.md.
+//
 // All comments in English per project convention.
 
 using System;
@@ -231,6 +236,29 @@ public class GazeRecorder : MonoBehaviour
     [Tooltip("Maximum raycast distance (metres) for ROI/AOI detection.")]
     public float roiMaxDistance = 50f;
 
+    [Header("UI (Canvas) gaze detection - gaze_ui_hits.csv (schema v1)")]
+    [Tooltip("If true, the same gaze ray is also tested against the registered World Space / Screen Space - Camera Canvases (GazeUiRaycaster) and one row per gaze row is written to gaze_ui_hits.csv. " +
+             "The physical raycast and gaze.csv are not affected either way. Screen Space - Overlay Canvases are not supported (never rendered into the headset image).")]
+    public bool enableUiGaze = true;
+
+    [Tooltip("Maximum distance (metres) of the UI ray. 0 = use roiMaxDistance, so both channels share one ray length.")]
+    public float uiMaxDistance = 0f;
+
+    [Tooltip("If false (default), the UI test runs only for rows with a real eye-gaze ray (combined_valid = 1). A head-forward fallback ray is not gaze; its row is still written with ui_ray_evaluated = 0.")]
+    public bool uiRaycastOnHeadFallback = false;
+
+    [Tooltip("If true (default), a Canvas needs an enabled GraphicRaycaster to be tested (the project's definition of a UI Canvas that takes part in interaction).")]
+    public bool uiRequireGraphicRaycaster = true;
+
+    [Tooltip("If true (default), Screen Space - Camera Canvases with a camera assigned are tested like World Space ones. Screen Space - Overlay is never tested.")]
+    public bool uiSupportScreenSpaceCamera = true;
+
+    [Tooltip("A Graphic whose effective alpha (Graphic colour x CanvasRenderer alpha x CanvasGroup alpha) is below this is invisible and never returned as a gaze target (exception: the transparent hit area of a control that has something visible under it).")]
+    [Range(0f, 1f)] public float uiMinVisibleAlpha = 0.01f;
+
+    [Tooltip("Optional event camera for World Space Canvases that have no Canvas.worldCamera. Empty = Camera.main (the camera GraphicRaycaster itself falls back to).")]
+    public Camera uiEventCamera;
+
     [Header("Debug")]
     [Tooltip("Gates start/stop/warning logs; per-sample data is never logged regardless.")]
     public bool enableDebugLogs = true;
@@ -285,6 +313,21 @@ public class GazeRecorder : MonoBehaviour
     CaptureCsvWriter gazeWriter, diagWriter;
     /// <summary>The gaze_diagnostics.csv writer (schema v17); null until the first StartRecording or when recordDiagnostics is off.</summary>
     public CaptureCsvWriter DiagnosticsWriter => diagWriter;
+    CaptureCsvWriter uiWriter;
+    /// <summary>The gaze_ui_hits.csv writer (companion file, schema v1); null until the first StartRecording or when enableUiGaze is off.</summary>
+    public CaptureCsvWriter UiHitsWriter => uiWriter;
+    /// <summary>The UI raycaster (counters of tested / skipped canvases go to the manifest).</summary>
+    public GazeUiRaycaster UiRaycaster { get; } = new GazeUiRaycaster();
+    /// <summary>Companion-file evidence: rows with a UI hit, rows where the UI path was not evaluated, primary-target class counts.</summary>
+    public long UiRowsWritten { get; private set; }
+    public long UiRowsWithHit { get; private set; }
+    public long UiRowsNotEvaluated { get; private set; }
+    public long UiPrimaryCanvasUi { get; private set; }
+    public long UiPrimaryWorldObject { get; private set; }
+    public long UiPrimaryUncertain { get; private set; }
+    public long UiPrimaryNoHit { get; private set; }
+    /// <summary>Rows where BOTH channels hit and the UI lay behind the physical hit (occlusion policy applied).</summary>
+    public long UiRowsBehindWorldHit { get; private set; }
     public long WriteErrors => gazeWriter != null ? gazeWriter.WriteErrors : 0;
     public string LastWriteError => gazeWriter != null ? gazeWriter.LastError : "";
     public double FirstRowT { get; private set; } = double.NaN;
@@ -535,6 +578,16 @@ public class GazeRecorder : MonoBehaviour
                 if (dataCapture != null) diagWriter.Transition += dataCapture.OnWriterTransition;
             }
         }
+        if (enableUiGaze)
+        {
+            string upath = UiHitsPathFor(fullPath);
+            if (uiWriter == null || uiWriter.Path != upath)
+            {
+                uiWriter = new CaptureCsvWriter(upath, GetUiHitsHeader(), "gaze_ui_hits");
+                if (dataCapture != null) uiWriter.Transition += dataCapture.OnWriterTransition;
+            }
+            GazeUiRegistry.RescanScene();   // ONE scene scan per recording start (a safety net for Canvases created outside UIManager); never per frame
+        }
         recordingStartRealtime = CaptureClock.TAbs;
         isRecording = true;
         RecordingStarts++;
@@ -641,8 +694,34 @@ public class GazeRecorder : MonoBehaviour
         // the ray that was actually cast when combined_valid = 0 (head-forward fallback); blank on eye-gaze rows (there the cast ray is combined_origin / combined_dir). Keeps every hit reconstructible even without a resolved view frame.
         Xyz("fallback_ray_origin"), Xyz("fallback_ray_dir"));
 
+    /// <summary>Schema version of the OPTIONAL companion file gaze_ui_hits.csv (independent of the session schema_version, which stays 17). Bumped only when UiHitColumns changes.</summary>
+    public const int GazeUiHitsSchemaVersion = 1;
+    public const string GazeUiHitsFileName = "gaze_ui_hits.csv";
+
+    /// <summary>The gaze_ui_hits.csv v1 header, in file order. One row per gaze row; the keys (t_abs, frame_index, session_id) are the same values as in gaze.csv.</summary>
+    public static readonly string[] UiHitColumns = Cat(
+        "t_abs", "frame_index", "session_id",
+        // was the UI path run for this row (blank ui_hit = not evaluated, never "looked and found nothing")
+        "ui_ray_evaluated", "ui_ray_skip_reason", "ui_hit",
+        // the Canvas and the specific Graphic that was hit
+        "ui_canvas_id", "ui_canvas_name", "ui_canvas_render_mode", "ui_canvas_sorting_order",
+        "ui_element_id", "ui_element_name", "ui_element_category", "ui_roi_label", "ui_element_has_gaze_component", "ui_interactable",
+        Xyz("ui_hit_point"), "ui_hit_distance", "ui_graphics_under_ray",
+        // the raw physical result of the same ray (independent of the UI result)
+        "world_hit", "world_hit_distance", "world_hit_instance_id", "world_hit_semantic_class", "world_occluder_established",
+        // the resolved primary target
+        "primary_target_class", "primary_target_basis", "primary_target_id", "primary_target_roi");
+
     string GetCsvHeader() => string.Join(",", PrimaryColumns);
     string GetDiagnosticsHeader() => string.Join(",", DiagnosticColumns);
+    string GetUiHitsHeader() => string.Join(",", UiHitColumns);
+
+    /// <summary>gaze.csv -> gaze_ui_hits.csv (same folder); any other name gets "_ui_hits" before the extension.</summary>
+    public static string UiHitsPathFor(string gazePath)
+    {
+        string dir = Path.GetDirectoryName(gazePath) ?? "", name = Path.GetFileNameWithoutExtension(gazePath);
+        return Path.Combine(dir, (name == "gaze" ? "gaze" : name) + "_ui_hits.csv");
+    }
 
     struct EyeSample
     {
@@ -1231,6 +1310,26 @@ public class GazeRecorder : MonoBehaviour
             AoiClassifier.HitInfo aoi = AoiClassifier.Classify(
                 didHit, didHit ? hit.collider : null, experimentManager, dataCapture);
 
+            // UI (Canvas) gaze channel: a SEPARATE test of the same ray against the registered Canvases. The physical result above is not touched by it. Runs only for eye-gaze rows (see uiRaycastOnHeadFallback);
+            // a failure here can never stop the primary stream.
+            GazeUiHit uiHit = default; bool uiEvaluated = false;
+            if (enableUiGaze && (combinedValid || uiRaycastOnHeadFallback))
+            {
+                uiEvaluated = true;
+                try
+                {
+                    var uo = GazeUiRaycaster.Options.Default;
+                    uo.maxDistance = uiMaxDistance > 0f ? uiMaxDistance : roiMaxDistance; uo.minVisibleAlpha = uiMinVisibleAlpha;
+                    uo.requireGraphicRaycaster = uiRequireGraphicRaycaster; uo.supportScreenSpaceCamera = uiSupportScreenSpaceCamera; uo.fallbackCamera = uiEventCamera;
+                    UiRaycaster.Raycast(combinedOrigin, combinedDirection, in uo, out uiHit);
+                }
+                catch (Exception e)
+                {
+                    uiHit = default;
+                    if (!_uiErrorLogged) { _uiErrorLogged = true; Debug.LogWarning("[GazeRecorder] UI gaze raycast failed (no UI hit recorded; physical gaze is unaffected): " + e.Message); }
+                }
+            }
+
             Vector3 headPos = headTransform != null ? headTransform.position : Vector3.zero;
             Quaternion headRot = headTransform != null ? headTransform.rotation : Quaternion.identity;
 
@@ -1321,9 +1420,26 @@ public class GazeRecorder : MonoBehaviour
                 combinedValid ? ",," : V3(true, combinedOrigin), combinedValid ? ",," : V3(true, combinedDirection)
             }) : null;
 
+            string uiRow = null; string uiPrimaryClass = null; bool uiBehindWorld = false;
+            if (enableUiGaze && uiWriter != null)
+                uiRow = BuildUiRow(tAbs, sessionId, uiEvaluated, in uiHit, didHit, didHit ? hit.distance : 0f, didHit ? hit.collider : null, in aoi, out uiPrimaryClass, out uiBehindWorld);
+
             if (WriteRow(row))
             {
                 if (diagRow != null) WriteDiagRow(diagRow);
+                if (uiRow != null && WriteUiRow(uiRow))
+                {
+                    UiRowsWritten++;
+                    if (!uiEvaluated) UiRowsNotEvaluated++; else if (uiHit.hit) UiRowsWithHit++;
+                    if (uiBehindWorld) UiRowsBehindWorldHit++;
+                    switch (uiPrimaryClass)
+                    {
+                        case GazeTargetResolver.ClsUi: UiPrimaryCanvasUi++; break;
+                        case GazeTargetResolver.ClsWorld: UiPrimaryWorldObject++; break;
+                        case GazeTargetResolver.ClsUncertain: UiPrimaryUncertain++; break;
+                        default: UiPrimaryNoHit++; break;
+                    }
+                }
                 RowsWritten++;
                 if (double.IsNaN(FirstRowT)) FirstRowT = tAbs;
                 LastRowT = tAbs;
@@ -1351,6 +1467,40 @@ public class GazeRecorder : MonoBehaviour
             // Absolute deadline grid: the overshoot of one sample shortens the next wait, so the long-run rate converges to the nominal one when the frame rate allows it.
             yield return new WaitForSecondsRealtime((float)Scheduler.WaitAfterSample(CaptureClock.TAbs));
         }
+    }
+
+    bool _uiErrorLogged;
+
+    // The gaze_ui_hits.csv row of one gaze row (UiHitColumns). Raw UI hit and raw world-hit facts are recorded independently; the primary target is the GazeTargetResolver policy applied to them.
+    string BuildUiRow(double tAbs, string sessionId, bool uiEvaluated, in GazeUiHit ui, bool worldHit, float worldDistance, Collider worldCollider, in AoiClassifier.HitInfo aoi, out string primaryClass, out bool uiBehindWorld)
+    {
+        bool uiHit = uiEvaluated && ui.hit;
+        // the occlusion question only exists when both channels hit and the physical surface lies in FRONT of the UI element (nearer to the eye by more than the coplanar tolerance)
+        bool occluderChecked = uiHit && worldHit && ui.distance > worldDistance + GazeTargetResolver.CoplanarEpsilon;
+        bool occluder = occluderChecked && GazeTargetResolver.IsEstablishedOccluder(worldCollider);
+        GazeTargetResolver.Primary pr = GazeTargetResolver.Resolve(uiEvaluated, uiHit, ui.distance, worldHit, worldDistance, occluder);
+        primaryClass = pr.cls; uiBehindWorld = occluderChecked;
+        string primaryId = pr.cls == GazeTargetResolver.ClsUi ? ui.elementId
+            : (pr.cls == GazeTargetResolver.ClsWorld ? (!string.IsNullOrEmpty(aoi.buildingId) ? aoi.buildingId : (!string.IsNullOrEmpty(aoi.npcId) ? aoi.npcId : aoi.objectName)) : "");
+        return string.Join(",", new string[]
+        {
+            F4(tAbs), Inv(Time.frameCount), SafeCsvField(sessionId),
+            uiEvaluated ? "1" : "0", uiEvaluated ? "" : "head_fallback_ray", uiEvaluated ? (ui.hit ? "1" : "0") : "",
+            uiHit ? SafeCsvField(ui.canvasId) : "", uiHit ? SafeCsvField(ui.canvasName) : "", uiHit ? ui.renderMode : "", uiHit ? Inv(ui.canvasSortingOrder) : "",
+            uiHit ? SafeCsvField(ui.elementId) : "", uiHit ? SafeCsvField(ui.elementName) : "", uiHit ? ui.category : "", uiHit ? SafeCsvField(ui.roiLabel) : "", uiHit ? (ui.hasGazeElement ? "1" : "0") : "", uiHit ? ui.interactable : "",
+            V3(uiHit, ui.point), uiHit ? F3(ui.distance) : "", uiHit ? Inv(ui.graphicsUnderRay) : "",
+            worldHit ? "1" : "0", worldHit ? F3(worldDistance) : "", worldHit ? Inv(aoi.instanceId) : "", worldHit ? aoi.semanticClass : "", occluderChecked ? (occluder ? "1" : "0") : "",
+            pr.cls, pr.basis, SafeCsvField(primaryId), AoiClassifier.PrimaryRoi(pr.cls, ui.roiLabel, aoi.semanticClass)
+        });
+    }
+
+    // The companion row of an accepted gaze row (one-to-one). A failure here never stops the primary stream; it is counted by the writer and reported in the manifest.
+    bool WriteUiRow(string row)
+    {
+        if (uiWriter == null || _closedForSession) return false;
+        long before = uiWriter.RowsWritten;
+        uiWriter.WriteLine(row);
+        return uiWriter.RowsWritten > before;
     }
 
     // Blank when the vector is invalid / unavailable; otherwise three fixed-4 components (zeros are valid values).
@@ -1385,6 +1535,7 @@ public class GazeRecorder : MonoBehaviour
         _closedForSession = true;
         if (gazeWriter != null) gazeWriter.Close();
         if (diagWriter != null) diagWriter.Close();
+        if (uiWriter != null) uiWriter.Close();
     }
 
     // F-02: every number in gaze.csv is formatted with the invariant culture. The row is comma-joined without quoting, so a

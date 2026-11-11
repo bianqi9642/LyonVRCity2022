@@ -514,6 +514,7 @@ public class UIManager : MonoBehaviour
         // Instantiate a copy under this transform for organization.
         GameObject instance = Instantiate(template, this.transform);
         instance.SetActive(true); // ensure active (templates might be deactivated in scene)
+        GazeUiRegistry.RegisterHierarchy(instance);   // gaze UI path: make the new panel's Canvases known (additive; no effect on the panel)
         return instance;
     }
 
@@ -544,6 +545,7 @@ public class UIManager : MonoBehaviour
         // Instantiate under UIManager first (HeadLockedPanel.Configure detaches it right away).
         GameObject instance = Instantiate(shrunkTemplate, this.transform);
         instance.SetActive(true);
+        GazeUiRegistry.RegisterHierarchy(instance);   // gaze UI path: make the new panel's Canvases known (additive; no effect on the panel)
 
         // Offset (lateral, height, horizontal distance) for the chosen corner, computed BEFORE any component can touch the transform.
         Vector3 localPos;

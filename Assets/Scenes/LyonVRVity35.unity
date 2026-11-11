@@ -183168,7 +183168,7 @@ MonoBehaviour:
   npcHz: 10
   writeFullBatiRegistry: 1
   registryScanChunk: 500
-  npcStateSamplingIntervalSeconds: 0.1
+  npcStateSamplingIntervalSeconds: 0.2
   npcStateDataBudgetMBPerMinute: 0
   npcStateMaxIntervalSeconds: 2
   npcStateBatchedLineOfSight: 1

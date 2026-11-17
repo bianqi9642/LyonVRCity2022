@@ -971,6 +971,17 @@ public class ExperimentManager : MonoBehaviour
         RaiseEvt("teleport_rejected", label: sourceLabel, stringValue: reason, fromPos: rigPos, toPos: attemptedPos);
     }
 
+    /// <summary>
+    /// GroundFallRecovery restored the participant rig after a fall (additive API, mirrors ReportParticipantTeleportRejected). Raised as a distinct "ground_recovery"
+    /// event (label = reason, value_num = vertical velocity at detection, value_str = key=value detail, from/to = rig position before/after) so a recovery can never be
+    /// mistaken for a participant teleport. It deliberately does NOT bump the capture teleport epoch (teleport_epoch keeps meaning "teleports only"); analysis marks the
+    /// position discontinuity from this event instead (see docs/ground_fall_recovery.md).
+    /// </summary>
+    public void ReportParticipantFallRecovery(string reason, Vector3 rigBefore, Vector3 rigAfter, double verticalVelocity, string detail)
+    {
+        RaiseEvt("ground_recovery", label: reason, stringValue: detail, numValue: verticalVelocity, fromPos: rigBefore, toPos: rigAfter);
+    }
+
     #endregion
 
     #region Session lifecycle helpers

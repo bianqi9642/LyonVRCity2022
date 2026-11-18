@@ -721,6 +721,10 @@ public class DataCaptureManager : MonoBehaviour
             try { w.Close(); }
             catch (Exception ex) { failed.Add(name); errors.Add(name + ": " + ex.GetType().Name + ": " + ex.Message); return; }
             if (w.ClosedCleanly) closed.Add(name); else { failed.Add(name); errors.Add(name + ": " + (w.CloseError ?? "not closed")); }
+            // a resilient stream that could not store its queued rows at Close(): the loss is recorded in capture_errors.csv (no manifest re-entry here; the final manifest carries rows_lost_at_close)
+            if (w.RowsLostAtClose > 0)
+                AppendCaptureError(new WriterTransition { Stream = w.Name, TAbs = CaptureClock.TAbs, Utc = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture), Operation = "close", ErrorType = w.LastErrorType, ErrorMessage = (w.RowsLostAtClose + " queued row(s) could not be written at close; " + w.LastError).Replace(",", " "),
+                    RowsWrittenBefore = w.RowsWritten, RowsDropped = w.RowsLost, Status = "lost_at_close", RecoveryAttempt = w.RecoveryAttempts });
         }
         One("events", _events); One("trajectory", _traj); One("npc_state", _npcState); One("npc_events", _npcEvents);
         One("npc_lifetimes", _npcLifetimes); One("npc_profiles", _npcProfiles); One("building_registry", _registry);
@@ -2064,6 +2068,19 @@ public class DataCaptureManager : MonoBehaviour
         public string last_error_operation = "", last_error_type = "";
         public int recovery_attempts;
         public bool partial_output_possible;
+        // schema v17 follow-up (writer reliability; optional - older manifests simply lack these keys, they default to the values below). Recording-I/O status ONLY: it says whether rows reached the file,
+        // never whether the measurements are valid.
+        public bool resilient_writer;                       // true when the stream uses the retry queue (gaze_diagnostics only by default)
+        public string retry_policy = "";                    // human-readable policy of a resilient writer
+        public long rows_pending;                           // rows waiting in the retry queue at the time of the manifest (0 after a clean close)
+        public long rows_recovered_from_buffer;             // rows written after waiting in the queue (each exactly once, in order)
+        public long rows_lost;                              // rows that could never be stored (dropped after failure + failed batches of unknown persistence); 0 = nothing lost
+        public long rows_overflow_dropped, rows_lost_at_close;   // lost rows because the bounded queue was full / because the final attempt at Close() failed
+        public int outage_episodes;                         // number of distinct failure episodes
+        public double longest_outage_s = -1, recovered_t_abs = -1;   // longest first-failure-to-recovery span; t_abs of the latest recovery (-1 = none)
+        public string last_error_kind = "";                 // SharingViolation | TransientIo | PathOrDirectory | Permission | DiskFull | Disposed | DuplicateWriter | Unknown
+        public int partial_tails_repaired;                  // partial tails of a failed append cut off before the batch was re-sent (prevents duplicates / malformed rows)
+        public long max_pending_rows_seen;
     }
 
     /// <summary>
@@ -2148,6 +2165,8 @@ public class DataCaptureManager : MonoBehaviour
         public RateSummary rate_gaze = new RateSummary(), rate_trajectory = new RateSummary();
         // optional companion stream gaze_ui_hits.csv (Canvas UI gaze detection, own schema version): writer health + what the UI path did. Sessions without it (older builds, enableUiGaze off) keep the defaults.
         public StreamHealth health_gaze_ui_hits = new StreamHealth();
+        // optional supplementary stream gaze_diagnostics.csv: its OWN writer health, independent of health_gaze (a diagnostics failure never marks gaze.csv failed, and vice versa).
+        public StreamHealth health_gaze_diagnostics = new StreamHealth();
         public GazeUiManifest gaze_ui_hits = new GazeUiManifest();
         public bool gaze_recorder_present;
         public long gaze_rows_valid_eye, gaze_rows_fallback, gaze_rows_left_valid, gaze_rows_right_valid;
@@ -2174,6 +2193,9 @@ public class DataCaptureManager : MonoBehaviour
         public double capture_closed_t_abs = -1;   // CaptureClock.TAbs (the t_abs clock of every row) at which every session stream had been closed; -1 until then (and for ever when closing failed)
         // M2 (v11 follow-up): which streams closed cleanly, which did not, and why the state is not Closed. capture_lifecycle_state is Closed ONLY when every stream closed without error.
         public string[] capture_streams_closed = new string[0], capture_streams_failed = new string[0];
+        // WRITE health (new, optional; capture_streams_failed above keeps its meaning = streams whose Close() failed): streams that had at least one write error (incl. recovered ones, history is kept) and the subset
+        // that is failed for good or lost rows. A stream is listed per stream name; one stream never implies another.
+        public string[] capture_streams_write_degraded = new string[0], capture_streams_write_failed = new string[0];
         public string capture_finalization_error = "";
         public long late_events_rejected, late_npc_records_rejected, late_gaze_rows_rejected, npc_event_buffer_high_water;
         public string npc_random_sources = "";
@@ -2510,6 +2532,7 @@ public class DataCaptureManager : MonoBehaviour
         FillRate(_manifest.rate_trajectory, _trajStats, _frameStats, _trajScheduler, _traj != null ? _traj.RowsDroppedAfterFailure : 0);
         FillFrameTiming(_manifest.frame_timing);
         FillGazeUi(gazeCfg);
+        FillGazeDiagnostics(gazeCfg);
         FillEyeTracking(gh);
         FillNpcPreparation();
         if (_audio != null) _audio.FillManifest(_manifest.audio_capture); else { _manifest.audio_capture.enabled = false; _manifest.audio_capture.status = "not_enabled"; }
@@ -2537,6 +2560,31 @@ public class DataCaptureManager : MonoBehaviour
     bool _everConfiguredGazeUi;
 
     // Companion stream gaze_ui_hits.csv: writer health through the same machinery as every stream, plus the counters of the UI path (GazeUiRaycaster) and the resolved-target tallies.
+    bool _everConfiguredGazeDiag;
+    // gaze_diagnostics.csv has its own health block (own writer, own failure state). Nothing here touches health_gaze / gaze_ok.
+    void FillGazeDiagnostics(bool gazeCfg)
+    {
+        GazeRecorder g = _gazeRecorder;
+        bool cfgNow = g != null && g.recordDiagnostics && gazeCfg; _everConfiguredGazeDiag |= cfgNow;
+        FillWriterHealth(_manifest.health_gaze_diagnostics, g != null ? g.DiagnosticsWriter : null, cfgNow, _everConfiguredGazeDiag, false);
+    }
+
+    // Per-stream write health summary for the manifest: degraded = any write error happened (history kept), failed = failed for good or rows were lost.
+    void FillWriteHealthLists()
+    {
+        var degraded = new List<string>(); var failed = new List<string>();
+        void Check(string name, CaptureCsvWriter w)
+        {
+            if (w == null || w.IsDisabled || w.WriteErrors == 0) return;
+            degraded.Add(name);
+            if (w.PermanentlyFailed || w.State == WriterState.Failed || w.RowsLost > 0) failed.Add(name);
+        }
+        Check("events", _events); Check("trajectory", _traj); Check("npc_state", _npcState); Check("npc_events", _npcEvents);
+        Check("npc_lifetimes", _npcLifetimes); Check("npc_profiles", _npcProfiles); Check("building_registry", _registry);
+        if (_gazeRecorder != null) { Check("gaze", _gazeRecorder.Writer); Check("gaze_diagnostics", _gazeRecorder.DiagnosticsWriter); Check("gaze_ui_hits", _gazeRecorder.UiHitsWriter); }
+        _manifest.capture_streams_write_degraded = degraded.ToArray(); _manifest.capture_streams_write_failed = failed.ToArray();
+    }
+
     void FillGazeUi(bool gazeCfg)
     {
         GazeUiManifest m = _manifest.gaze_ui_hits;
@@ -2577,6 +2625,11 @@ public class DataCaptureManager : MonoBehaviour
         h.first_error_t_abs = double.IsNaN(w.FirstErrorT) ? -1 : w.FirstErrorT; h.last_error_t_abs = double.IsNaN(w.LastErrorT) ? -1 : w.LastErrorT;
         h.last_error = w.LastError ?? ""; h.last_error_operation = w.LastErrorOperation ?? ""; h.last_error_type = w.LastErrorType ?? "";
         h.recovery_attempts = w.RecoveryAttempts; h.partial_output_possible = w.PartialOutputPossible;
+        h.resilient_writer = w.Resilient; h.retry_policy = w.Policy != null ? w.Policy.Describe() : "";
+        h.rows_pending = w.PendingRows; h.rows_recovered_from_buffer = w.RowsRecoveredFromBuffer; h.rows_lost = w.RowsLost;
+        h.rows_overflow_dropped = w.RowsOverflowDropped; h.rows_lost_at_close = w.RowsLostAtClose; h.outage_episodes = w.OutageEpisodes;
+        h.longest_outage_s = w.OutageEpisodes > 0 ? w.LongestOutageSeconds : -1; h.recovered_t_abs = double.IsNaN(w.RecoveredT) ? -1 : w.RecoveredT;
+        h.last_error_kind = w.LastErrorKind == WriterFailureKind.None ? "" : w.LastErrorKind.ToString(); h.partial_tails_repaired = w.PartialTailsRepaired; h.max_pending_rows_seen = w.MaxPendingRowsSeen;
         h.writer_state = w.State == WriterState.Failed ? (w.PermanentlyFailed ? "permanently_failed" : "failed") : (w.State == WriterState.Recovered ? "recovered" : "operational");
     }
 
@@ -2708,6 +2761,7 @@ public class DataCaptureManager : MonoBehaviour
         DeriveEyeTrackingAliases(et);
         _manifest.capture_lifecycle_state = CaptureState.ToString(); _manifest.capture_closed_t_abs = _captureClosedTAbs;
         _manifest.capture_streams_closed = _captureStreamsClosed; _manifest.capture_streams_failed = _captureStreamsFailed; _manifest.capture_finalization_error = _captureFinalizationError;
+        FillWriteHealthLists();
         _manifest.late_events_rejected = LateEventsRejected; _manifest.late_npc_records_rejected = LateNpcRecordsRejected; _manifest.npc_event_buffer_high_water = _npcEventBufHighWater;
         if (_gazeRecorder != null)
         {

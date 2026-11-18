@@ -108,6 +108,28 @@ public static class CaptureIO
     static byte[] s_encBuf = new byte[1 << 16];   // main-thread only (every capture write runs on the Unity main thread)
     static readonly char[] s_charBuf = new char[1 << 14];
 
+    /// <summary>Length of the file in bytes, or -1 when it does not exist (an I/O error while asking is raised as step "open").</summary>
+    public static long FileLength(string path)
+    {
+        long len = -1;
+        Step(path, "open", () => { len = File.Exists(path) ? new FileInfo(path).Length : -1; });
+        return len;
+    }
+
+    /// <summary>Cuts the file back to exactly <paramref name="length"/> bytes (step "truncate"). Used only by a resilient writer to remove the partial tail of ITS OWN failed append before it re-sends the whole batch,
+    /// so a retried batch can never leave a duplicated half row. Never grows a file.</summary>
+    public static void TruncateTo(string path, long length)
+    {
+        Step(path, "truncate", () =>
+        {
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.Read))
+            {
+                if (fs.Length > length) fs.SetLength(length);
+                fs.Flush(false);
+            }
+        });
+    }
+
     /// <summary>True when the file is non-empty and its last byte is a line feed (or the file does not exist / is empty).</summary>
     public static bool EndsWithNewlineOrEmpty(string path)
     {

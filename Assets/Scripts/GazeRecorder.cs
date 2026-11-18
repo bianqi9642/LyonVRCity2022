@@ -102,6 +102,13 @@ public class GazeRecorder : MonoBehaviour
     [Tooltip("Write gaze_diagnostics.csv next to gaze.csv: provider pipeline, validity / confidence, legacy head anchor, view anchors, raw face weights, face source / validity and the uncalibrated blink state, one row per gaze row. Off = the main gaze.csv alone.")]
     public bool recordDiagnostics = true;
 
+    [Tooltip("Reliability of gaze_diagnostics.csv ONLY (reliability of the file I/O, not a measurement setting). ON: a failed write (for example a file-sharing lock) keeps the failed row and every later row in an ordered, bounded in-memory queue and retries with a back-off (no sleeping, no main-thread blocking) until the file is writable again, then writes the queued rows once, in order. OFF: the legacy policy (rows dropped while failed, 3 recovery attempts, then permanent failure). gaze.csv and gaze_ui_hits.csv keep the legacy policy either way.")]
+    public bool diagnosticsResilientWriter = true;
+    [Tooltip("Longest outage (seconds since the first failure) a temporary write failure of gaze_diagnostics.csv is retried for before the stream is declared permanently failed. The observed lock was 6.17 s; the default 600 s needs about 7 MB of queued rows at 20 Hz.")]
+    [Min(1f)] public float diagnosticsRetryMaxSeconds = 600f;
+    [Tooltip("Capacity of the diagnostics retry queue in rows (about 0.6 KB per row). Rows offered beyond it are dropped, counted (rows_overflow_dropped) and reported - never silently.")]
+    [Min(100)] public int diagnosticsMaxPendingRows = 20000;
+
     [Tooltip("Both eyes' closure weight (0..1) at or above this starts a blink. UNCALIBRATED default - calibrate on a Quest Pro before analysing blink durations.")]
     [Range(0.05f, 1f)] public float blinkCloseThreshold = 0.7f;
     [Tooltip("Both eyes' closure weight at or below this ends the blink (hysteresis: must be below the close threshold).")]
@@ -442,14 +449,14 @@ public class GazeRecorder : MonoBehaviour
     void OnApplicationPause(bool pauseStatus)
     {
         if (pauseStatus) SuspendSampling();
-        else ResumeSampling();
+        else { ResumeSampling(); diagWriter?.Pump(); }
     }
 
     // Some devices deliver focus gain without a matching pause(false) (or in the opposite order). Resuming is idempotent and only
     // acts on a session suspended by a pause, so handling it here cannot create a second loop or start a recording on its own.
     void OnApplicationFocus(bool hasFocus)
     {
-        if (hasFocus) ResumeSampling();
+        if (hasFocus) { ResumeSampling(); diagWriter?.Pump(); }   // a waiting diagnostics retry gets a chance as soon as focus returns (no I/O unless its back-off is due)
     }
 
     void OnApplicationQuit()
@@ -575,6 +582,8 @@ public class GazeRecorder : MonoBehaviour
             if (diagWriter == null || diagWriter.Path != dpath)
             {
                 diagWriter = new CaptureCsvWriter(dpath, GetDiagnosticsHeader(), "gaze_diagnostics");
+                if (diagnosticsResilientWriter)
+                    diagWriter.EnableResilience(new WriterRetryPolicy { MaxRecoveryDurationSeconds = diagnosticsRetryMaxSeconds, MaxPendingRows = diagnosticsMaxPendingRows });
                 if (dataCapture != null) diagWriter.Transition += dataCapture.OnWriterTransition;
             }
         }

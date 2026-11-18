@@ -376,22 +376,75 @@ public class GroundFallRecovery : MonoBehaviour
         return new Vector3(c.x, p.y, c.z);
     }
 
+    // Seam tolerance. The city's Ground colliders are separate TIN tiles; their edges leave open slits of 7-10 cm (measured in the real scene along the P3 street). A single zero-width
+    // ray that falls into a slit finds no ground although the capsule (radius 0.1 m) stands on it, and path B then undid valid teleports (P3 Part 3: 23 of 246).
+    // The footprint is therefore sampled at the centre and at four points supportProbeSpread away. The centre decides as before. If it fails, the footprint counts as supported only when
+    // the side samples BRIDGE it: two samples on opposite sides of the centre (+/-x or +/-z) both find walkable ground within the vertical window at heights that differ by at most the
+    // step offset. A slit between two tiles is bridged; an edge or a wall is not (all its hits lie on one side), so the support test does not reach beyond an edge.
+    // requireBridgeForSideSamples=false accepts any single side hit (first review prototype), multiPointSupport=false is the unchanged single-ray behaviour.
+    [Header("Seam tolerance")]
+    [Tooltip("Sample the footprint at 5 points (centre + 4 at supportProbeSpread) when the centre ray finds no support, so a slit between two Ground colliders is not read as 'no ground'.")]
+    public bool multiPointSupport = true;
+    [Tooltip("Distance (m) of the four extra samples from the footprint centre. Must exceed the widest slit to bridge and stay at or below the capsule radius plus skin (0.18 m).")]
+    [Range(0f, 0.5f)] public float supportProbeSpread = 0.15f;
+    [Tooltip("true: side samples count only as a pair on opposite sides of the centre (a bridged slit); false: any single supported side sample counts.")]
+    public bool requireBridgeForSideSamples = true;
+    static readonly Vector2[] s_probeOffsets = { Vector2.zero, new Vector2(1f, 0f), new Vector2(-1f, 0f), new Vector2(0f, 1f), new Vector2(0f, -1f) };
+    static readonly bool[] s_sideOk = new bool[5];
+    static readonly float[] s_sideY = new float[5];
+    static readonly float[] s_sideDy = new float[5];
+    static readonly RaycastHit[] s_sideHit = new RaycastHit[5];
+    static readonly bool[] s_sideWalk = new bool[5];
+
+    // One support sample: a valid hit on walkable ground inside the vertical window. No string is built here (the support test runs every frame); the diagnostic text of the decisive sample
+    // is built afterwards by HitInfo(). surfaceY / dy are set whenever a finite hit exists.
+    bool SampleSupport(Vector3 o, Vector3 p, out RaycastHit h, out float surfaceY, out float dy, out bool hit, out bool walkable)
+    {
+        surfaceY = p.y; dy = 0f; hit = false; walkable = false;
+        if (!Physics.Raycast(o + Vector3.up * supportRayStart, Vector3.down, out h, supportRayStart + supportBelow, groundMask, QueryTriggerInteraction.Ignore)) return false;
+        hit = true;
+        if (!IsFinite(h.point) || !IsFinite(h.normal)) return false;
+        surfaceY = h.point.y; dy = h.point.y - p.y;   // + = surface above the base
+        walkable = h.normal.y >= Mathf.Cos(SlopeLimit() * Mathf.Deg2Rad);
+        return walkable && dy <= supportAbove && dy >= -supportBelow;
+    }
+
+    string HitInfo(RaycastHit h, float dy, bool walkable)
+    {
+        if (!IsFinite(h.point) || !IsFinite(h.normal)) return "invalid_hit";
+        string info = "hit=" + HierPath(h.collider.transform) + ";layer=" + h.collider.gameObject.layer + ";enabled=" + h.collider.enabled + ";mesh=" + MeshName(h.collider) + ";dy=" + dy.ToString("F3", CultureInfo.InvariantCulture) + ";normal_y=" + h.normal.y.ToString("F3", CultureInfo.InvariantCulture);
+        return walkable ? info : info + ";not_walkable";
+    }
+
     bool HasSupport(Vector3 p, out float groundY)
     {
         groundY = p.y;
         Vector3 f = Footprint(p);
-        if (!Physics.Raycast(f + Vector3.up * supportRayStart, Vector3.down, out RaycastHit hit, supportRayStart + supportBelow, groundMask, QueryTriggerInteraction.Ignore))
+        // the centre decides first (one ray, exactly the previous behaviour, including the diagnostic text)
+        bool centreOk = SampleSupport(f, p, out RaycastHit ch, out float cy, out float cdy, out bool centreHit, out bool cwalk);
+        if (centreHit) groundY = cy;
+        lastHitInfo = centreHit ? HitInfo(ch, cdy, cwalk) : "no_hit";
+        if (centreOk) return true;
+        if (!multiPointSupport || supportProbeSpread <= 0f) return false;
+        for (int i = 1; i < s_probeOffsets.Length; i++)
         {
-            lastHitInfo = "no_hit";
-            return false;
+            Vector3 o = f + new Vector3(s_probeOffsets[i].x * supportProbeSpread, 0f, s_probeOffsets[i].y * supportProbeSpread);
+            s_sideOk[i] = SampleSupport(o, p, out s_sideHit[i], out s_sideY[i], out s_sideDy[i], out bool h, out s_sideWalk[i]);
         }
-        if (!IsFinite(hit.point) || !IsFinite(hit.normal)) { lastHitInfo = "invalid_hit"; return false; }
-        groundY = hit.point.y;
-        float dy = hit.point.y - p.y;   // + = surface above the base
-        bool walkable = hit.normal.y >= Mathf.Cos(SlopeLimit() * Mathf.Deg2Rad);
-        lastHitInfo = "hit=" + HierPath(hit.collider.transform) + ";layer=" + hit.collider.gameObject.layer + ";enabled=" + hit.collider.enabled + ";mesh=" + MeshName(hit.collider) + ";dy=" + dy.ToString("F3", CultureInfo.InvariantCulture) + ";normal_y=" + hit.normal.y.ToString("F3", CultureInfo.InvariantCulture);
-        if (!walkable) { lastHitInfo += ";not_walkable"; return false; }
-        return dy <= supportAbove && dy >= -supportBelow;
+        int pick = -1;
+        if (!requireBridgeForSideSamples)
+        {
+            for (int i = 1; i < s_probeOffsets.Length; i++) if (s_sideOk[i]) { pick = i; break; }
+        }
+        else
+        {
+            float tol = StepOffset(); float best = float.MaxValue;
+            if (s_sideOk[1] && s_sideOk[2] && Mathf.Abs(s_sideY[1] - s_sideY[2]) <= tol) { best = Mathf.Min(Mathf.Abs(s_sideDy[1]), Mathf.Abs(s_sideDy[2])); pick = Mathf.Abs(s_sideDy[1]) <= Mathf.Abs(s_sideDy[2]) ? 1 : 2; }
+            if (s_sideOk[3] && s_sideOk[4] && Mathf.Abs(s_sideY[3] - s_sideY[4]) <= tol) { float b = Mathf.Min(Mathf.Abs(s_sideDy[3]), Mathf.Abs(s_sideDy[4])); if (b < best) pick = Mathf.Abs(s_sideDy[3]) <= Mathf.Abs(s_sideDy[4]) ? 3 : 4; }
+        }
+        if (pick < 0) return false;
+        groundY = s_sideY[pick]; lastHitInfo = HitInfo(s_sideHit[pick], s_sideDy[pick], s_sideWalk[pick]) + ";probe=" + pick;
+        return true;
     }
 
     // ---------------------------------------------------------------- recovery

@@ -105010,15 +105010,15 @@ PrefabInstance:
     m_Modifications:
     - target: {fileID: 4086534348240863044, guid: b4ffde217659b4d31a081ba62d8edda5, type: 3}
       propertyPath: m_LocalPosition.x
-      value: -89.0741
+      value: -92.07275
       objectReference: {fileID: 0}
     - target: {fileID: 4086534348240863044, guid: b4ffde217659b4d31a081ba62d8edda5, type: 3}
       propertyPath: m_LocalPosition.y
-      value: 177.94595
+      value: 180.18984
       objectReference: {fileID: 0}
     - target: {fileID: 4086534348240863044, guid: b4ffde217659b4d31a081ba62d8edda5, type: 3}
       propertyPath: m_LocalPosition.z
-      value: -91.811646
+      value: -91.80703
       objectReference: {fileID: 0}
     - target: {fileID: 4086534348240863044, guid: b4ffde217659b4d31a081ba62d8edda5, type: 3}
       propertyPath: m_LocalRotation.w
@@ -172972,6 +172972,9 @@ MonoBehaviour:
   faceExpressions: {fileID: 0}
   autoCreateFaceExpressions: 1
   recordDiagnostics: 1
+  diagnosticsResilientWriter: 1
+  diagnosticsRetryMaxSeconds: 600
+  diagnosticsMaxPendingRows: 20000
   blinkCloseThreshold: 0.7
   blinkOpenThreshold: 0.5
   HeightMin: NaN
@@ -243444,6 +243447,13 @@ MonoBehaviour:
     m_Bits: 8
   smoothSpeed: 10
   heightOffset: 0
+  useControllerFootprint: 1
+  controller: {fileID: 0}
+  enableContinuityGuard: 1
+  maxVerticalCorrectionSpeed: 2.5
+  continuityEpsilon: 0.1
+  teleportResetMeters: 2.5
+  enableDebugLogs: 0
 --- !u!4 &1625669939 stripped
 Transform:
   m_CorrespondingSourceObject: {fileID: 7696548424635294051, guid: 895f6f3c2d334633b5800312285058d2, type: 3}
@@ -243478,8 +243488,23 @@ MonoBehaviour:
   voidDisplacementSeconds: 0.5
   cooldownSeconds: 2
   restoreLift: 0.05
+  useControllerFootprint: 1
+  enableContinuityGuard: 1
+  stableSupportSeconds: 1
+  hardFloorMeters: 20
+  fallVelocityThreshold: 4
+  verifyWithinSeconds: 1
+  maxAttemptsPerIncident: 4
+  landingProbeMeters: 15
+  maxAirborneSeconds: 3
+  safeRingSpacing: 2
+  recoverAbruptDropLanding: 1
+  fastFallOverridesCooldown: 1
   enableDebugLogs: 0
   writeDiagnosticsFile: 1
+  multiPointSupport: 1
+  supportProbeSpread: 0.15
+  requireBridgeForSideSamples: 1
 --- !u!1001 &1626427306
 PrefabInstance:
   m_ObjectHideFlags: 0
